@@ -11,6 +11,7 @@ export type {
 	RpcCommand,
 	RpcExtensionUIRequest,
 	RpcExtensionUIResponse,
+	RpcModelInfo,
 	RpcResponse,
 	RpcSessionState,
 } from "./rpc/rpc-types.ts";

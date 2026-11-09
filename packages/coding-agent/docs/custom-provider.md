@@ -146,7 +146,7 @@ Every model needs an ID, display name, input capabilities, and cost metadata. Ch
 
 Set `promptCache.short` or `promptCache.long` to the provider's best-effort cache lifetime in seconds when Pi should keep an idle prompt cache warm. Leave them unset to disable cache warming for that retention tier.
 
-Compatibility flags describe verified differences in an otherwise supported API. Do not enable them based only on an endpoint claiming compatibility.
+Compatibility flags describe verified differences in an otherwise supported API. Do not enable them based only on an endpoint claiming compatibility. phi adds its own flags, such as `sendReasoningEffortOff` (send `thinkingLevelMap.off` as `reasoning_effort` when thinking is off; default `false`, which omits the field); see [phi compatibility flags](models.md#phi-compatibility-flags).
 
 Confirm the request fields and response behavior against the actual server.
 

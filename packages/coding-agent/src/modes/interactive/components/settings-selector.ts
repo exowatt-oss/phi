@@ -1,5 +1,5 @@
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
-import { getSupportedThinkingLevels, type Model, type Transport } from "@earendil-works/pi-ai";
+import { getSupportedThinkingLevels, type Model, type ServiceTier, type Transport } from "@earendil-works/pi-ai";
 import {
 	type Component,
 	Container,
@@ -75,6 +75,7 @@ export interface SettingsConfig {
 	httpIdleTimeoutMs: number;
 	cacheWarmingMode: CacheWarmingMode;
 	thinkingLevel: ThinkingLevel;
+	serviceTier: ServiceTier;
 	availableThinkingLevels: ThinkingLevel[];
 	modelThinkingLevels: Record<string, ThinkingLevel>;
 	currentTheme: string;
@@ -84,12 +85,14 @@ export interface SettingsConfig {
 	mermaidRenderingMode: MermaidRenderingMode;
 	showCacheMissNotices: boolean;
 	collapseChangelog: boolean;
+	autoUpdate: boolean;
 	enableInstallTelemetry: boolean;
 	doubleEscapeAction: "fork" | "tree" | "none";
 	treeFilterMode: "default" | "no-tools" | "user-only" | "labeled-only" | "all";
 	showHardwareCursor: boolean;
 	editorPaddingX: number;
 	outputPad: 0 | 1;
+	toolDisplay: "minimal" | "compact" | "full";
 	autocompleteMaxVisible: number;
 	quietStartup: QuietStartup;
 	defaultProjectTrust: DefaultProjectTrust;
@@ -115,6 +118,7 @@ export interface SettingsCallbacks {
 	onTransportChange: (transport: Transport) => void;
 	onSessionShareDestinationChange: (destination: SessionShareDestination) => void;
 	onHttpIdleTimeoutMsChange: (timeoutMs: number) => void;
+	onServiceTierChange: (tier: ServiceTier) => void;
 	onCacheWarmingModeChange: (mode: CacheWarmingMode) => void;
 	onModelThinkingLevelChange: (provider: string, modelId: string, level: ThinkingLevel) => void;
 	onModelThinkingLevelRemove: (provider: string, modelId: string) => void;
@@ -124,12 +128,14 @@ export interface SettingsCallbacks {
 	onMermaidRenderingModeChange: (mode: MermaidRenderingMode) => void;
 	onShowCacheMissNoticesChange: (shown: boolean) => void;
 	onCollapseChangelogChange: (collapsed: boolean) => void;
+	onAutoUpdateChange: (enabled: boolean) => void;
 	onEnableInstallTelemetryChange: (enabled: boolean) => void;
 	onDoubleEscapeActionChange: (action: "fork" | "tree" | "none") => void;
 	onTreeFilterModeChange: (mode: "default" | "no-tools" | "user-only" | "labeled-only" | "all") => void;
 	onShowHardwareCursorChange: (enabled: boolean) => void;
 	onEditorPaddingXChange: (padding: number) => void;
 	onOutputPadChange: (padding: 0 | 1) => void;
+	onToolDisplayChange: (mode: "minimal" | "compact" | "full") => void;
 	onAutocompleteMaxVisibleChange: (maxVisible: number) => void;
 	onQuietStartupChange: (quiet: QuietStartup) => void;
 	onDefaultProjectTrustChange: (defaultProjectTrust: DefaultProjectTrust) => void;
@@ -484,6 +490,14 @@ export class SettingsSelectorComponent extends Container {
 
 		const items: SettingItem[] = [
 			{
+				id: "auto-update",
+				label: `Auto-update ${theme.fg("accent", "NEW")}`,
+				description:
+					"Install new phi releases automatically when one is published, so you never need /upgrade. Restart phi to use the new release.",
+				currentValue: config.autoUpdate ? "true" : "false",
+				values: ["true", "false"],
+			},
+			{
 				id: "autocompact",
 				label: "Auto-compact",
 				description: "Automatically compact context when it gets too large",
@@ -613,6 +627,14 @@ export class SettingsSelectorComponent extends Container {
 						},
 						() => done(),
 					),
+			},
+			{
+				id: "service-tier",
+				label: "Service tier",
+				description:
+					"Default processing tier for new sessions; Fast (OpenAI fast tier / Anthropic fast mode) costs ~2x, Flex may wait longer, UltraFast is Bedrock-only (GPT-6 Astra, 6x). /fast toggles one session",
+				currentValue: config.serviceTier,
+				values: ["default", "fast", "flex", "ultrafast"],
 			},
 			{
 				id: "model-thinking",
@@ -790,7 +812,7 @@ export class SettingsSelectorComponent extends Container {
 		items.splice(supportsImages ? 3 : 1, 0, {
 			id: "auto-resize-images",
 			label: "Auto-resize images",
-			description: "Resize large images to 2000x2000 max for better model compatibility",
+			description: "Fit large images to Claude's native resolution (2576px long edge) before sending",
 			currentValue: config.autoResizeImages ? "true" : "false",
 			values: ["true", "false"],
 		});
@@ -845,9 +867,20 @@ export class SettingsSelectorComponent extends Container {
 			values: ["0", "1"],
 		});
 
-		// Autocomplete max visible toggle (insert after output-padding)
+		// Tool display mode (insert after output-padding)
 		const outputPaddingIndex = items.findIndex((item) => item.id === "output-padding");
 		items.splice(outputPaddingIndex + 1, 0, {
+			id: "tool-display",
+			label: "Tool display",
+			description:
+				"Collapsed tool calls: minimal (intent + one-line summary), compact (short previews), full (start expanded)",
+			currentValue: config.toolDisplay,
+			values: ["minimal", "compact", "full"],
+		});
+
+		// Autocomplete max visible toggle (insert after tool-display)
+		const toolDisplayIndex = items.findIndex((item) => item.id === "tool-display");
+		items.splice(toolDisplayIndex + 1, 0, {
 			id: "autocomplete-max-visible",
 			label: "Autocomplete max items",
 			description: "Max visible items in autocomplete dropdown (3-20)",
@@ -921,6 +954,9 @@ export class SettingsSelectorComponent extends Container {
 						}
 						break;
 					}
+					case "service-tier":
+						callbacks.onServiceTierChange(newValue as ServiceTier);
+						break;
 					case "cache-warming-mode":
 						callbacks.onCacheWarmingModeChange(newValue as CacheWarmingMode);
 						break;
@@ -935,6 +971,9 @@ export class SettingsSelectorComponent extends Container {
 						break;
 					case "collapse-changelog":
 						callbacks.onCollapseChangelogChange(newValue === "true");
+						break;
+					case "auto-update":
+						callbacks.onAutoUpdateChange(newValue === "true");
 						break;
 					case "quiet-startup":
 						callbacks.onQuietStartupChange(newValue === "header" ? "header" : newValue === "true");
@@ -965,6 +1004,9 @@ export class SettingsSelectorComponent extends Container {
 						break;
 					case "output-padding":
 						callbacks.onOutputPadChange(newValue === "0" ? 0 : 1);
+						break;
+					case "tool-display":
+						callbacks.onToolDisplayChange(newValue as "minimal" | "compact" | "full");
 						break;
 					case "autocomplete-max-visible":
 						callbacks.onAutocompleteMaxVisibleChange(parseInt(newValue, 10));

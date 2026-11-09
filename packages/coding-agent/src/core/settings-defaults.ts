@@ -1,4 +1,5 @@
 import { DEFAULT_MAX_AGENT_RETRY_DELAY_MS } from "@earendil-works/pi-ai/utils/retry";
+import { DEFAULT_STREAM_IDLE_TIMEOUT_MS } from "@earendil-works/pi-ai/utils/stream-idle-guard";
 
 /** Runtime defaults shared by settings accessors and the published JSON Schema. */
 export const SETTINGS_DEFAULTS = {
@@ -29,7 +30,10 @@ export const SETTINGS_DEFAULTS = {
 	quietStartup: false,
 	defaultProjectTrust: "ask",
 	collapseChangelog: false,
-	enableInstallTelemetry: true,
+	// Updates are opt-in and require a configured release feed.
+	autoUpdate: false,
+	// Install telemetry is off unless PI_TELEMETRY=1 explicitly opts in.
+	enableInstallTelemetry: false,
 	enableAnalytics: false,
 	enableSkillCommands: true,
 	terminal: {
@@ -64,4 +68,43 @@ export const SETTINGS_DEFAULTS = {
 	fullscreenScrollbar: "auto",
 	fullscreenCopyOnSelect: true,
 	fullscreenWheelScrollLines: "auto",
+} as const;
+
+/** phi's own settings defaults, shared by the settings accessors and the published JSON Schema. */
+export const PHI_SETTINGS_DEFAULTS = {
+	serviceTier: "default",
+	compaction: {
+		softCeilingTokens: 300_000,
+	},
+	agentMail: {
+		enabled: true,
+	},
+	refusalFallback: {
+		enabled: true,
+		sticky: true,
+	},
+	errorFallback: {
+		enabled: false,
+		// Configure fallback models explicitly in settings.json for your own provider.
+		chain: [],
+		sticky: false,
+	},
+	toolOutputLines: 5,
+	toolDisplay: "minimal",
+	streamIdleTimeoutMs: DEFAULT_STREAM_IDLE_TIMEOUT_MS,
+	btw: {
+		persist: true,
+		maxHistory: 20,
+	},
+	loop: {
+		maxIterations: 12,
+		maxWallTimeMs: 7_200_000,
+		checkTimeoutMs: 600_000,
+		evaluatorConfidence: 0.85,
+		maxCheckOutputBytes: 65_536,
+	},
+	sessionState: {
+		classifier: "heuristic",
+		model: "",
+	},
 } as const;

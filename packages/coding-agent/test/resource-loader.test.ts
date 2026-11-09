@@ -5,7 +5,11 @@ import { pathToFileURL } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AuthStorage } from "../src/core/auth-storage.ts";
 import { ExtensionRunner } from "../src/core/extensions/runner.ts";
-import { DefaultResourceLoader, loadProjectContextFiles } from "../src/core/resource-loader.ts";
+import {
+	DefaultResourceLoader,
+	isLegacyMcpBridgeExtensionPath,
+	loadProjectContextFiles,
+} from "../src/core/resource-loader.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
 import type { Skill } from "../src/core/skills.ts";
@@ -98,6 +102,95 @@ describe("DefaultResourceLoader", () => {
 			});
 
 			await expect(loader.reload()).rejects.toThrow(SyntaxError);
+		});
+
+		it("should suppress legacy MCP bridge copies while retaining native and unrelated extensions", async () => {
+			const userBridgePath = join(agentDir, "extensions", "mcp-bridge");
+			const hubBridgePath = join(agentDir, "hub", "bundles", "owner", "bundle", "v1", "extensions", "mcp-bridge");
+			const unrelatedBridgePath = join(tempDir, "unrelated", "mcp-bridge");
+			for (const path of [userBridgePath, hubBridgePath, unrelatedBridgePath]) {
+				mkdirSync(path, { recursive: true });
+			}
+			for (const path of [userBridgePath, hubBridgePath, unrelatedBridgePath]) {
+				writeFileSync(
+					join(path, "index.ts"),
+					`export default function(pi) { pi.registerCommand(${JSON.stringify(path)}, { description: "test", handler: async () => {} }); }`,
+				);
+			}
+
+			const loader = new DefaultResourceLoader({
+				cwd,
+				agentDir,
+				settingsManager: SettingsManager.inMemory({
+					packages: [join(agentDir, "hub", "bundles", "owner", "bundle", "v1")],
+				}),
+				additionalExtensionPaths: [userBridgePath, unrelatedBridgePath],
+				extensionFactories: [{ name: "native-mcp", factory: () => {}, hidden: true }],
+			});
+			await loader.reload();
+
+			expect(loader.getExtensions().extensions.map((extension) => extension.path)).toEqual([
+				unrelatedBridgePath,
+				"<inline:native-mcp>",
+			]);
+			expect(isLegacyMcpBridgeExtensionPath(userBridgePath, agentDir)).toBe(true);
+			expect(isLegacyMcpBridgeExtensionPath(join(userBridgePath, "index.ts"), agentDir)).toBe(true);
+			expect(isLegacyMcpBridgeExtensionPath(hubBridgePath, agentDir)).toBe(true);
+			expect(isLegacyMcpBridgeExtensionPath(join(hubBridgePath, "index.ts"), agentDir)).toBe(true);
+			expect(isLegacyMcpBridgeExtensionPath(join(unrelatedBridgePath, "index.ts"), agentDir)).toBe(false);
+		});
+
+		it("should not reintroduce the MCP bridge during trust resolution or reload", async () => {
+			const userBridgePath = join(agentDir, "extensions", "mcp-bridge");
+			const hubBundlePath = join(agentDir, "hub", "bundles", "owner", "bundle", "v1");
+			const projectExtensionPath = join(cwd, ".pi", "extensions", "project.ts");
+			const explicitBridgePath = join(agentDir, "extensions", "mcp-bridge", "index.ts");
+			mkdirSync(userBridgePath, { recursive: true });
+			mkdirSync(join(hubBundlePath, "extensions", "mcp-bridge"), { recursive: true });
+			mkdirSync(join(cwd, ".pi", "extensions"), { recursive: true });
+			for (const path of [
+				join(userBridgePath, "index.ts"),
+				join(hubBundlePath, "extensions", "mcp-bridge", "index.ts"),
+			]) {
+				writeFileSync(path, "export default () => {};\n");
+			}
+			writeFileSync(projectExtensionPath, "export default () => {};\n");
+
+			const settingsManager = SettingsManager.create(cwd, agentDir);
+			settingsManager.setProjectExtensionPaths([projectExtensionPath]);
+			await settingsManager.flush();
+			const loader = new DefaultResourceLoader({
+				cwd,
+				agentDir,
+				settingsManager,
+				additionalExtensionPaths: [explicitBridgePath],
+				// Stand in for the built-in native extension without depending on its implementation.
+				extensionFactories: [{ name: "native-mcp", factory: () => {}, hidden: true }],
+			});
+
+			let preTrustPaths: string[] | undefined;
+			await loader.reload({
+				resolveProjectTrust: async ({ extensionsResult }) => {
+					preTrustPaths = extensionsResult.extensions.map((extension) => extension.path);
+					return true;
+				},
+			});
+			expect(preTrustPaths).toEqual(["<inline:native-mcp>"]);
+			expect(loader.getExtensions().extensions.map((extension) => extension.path)).toEqual([
+				projectExtensionPath,
+				"<inline:native-mcp>",
+			]);
+
+			await loader.reload({
+				resolveProjectTrust: async ({ extensionsResult }) => {
+					expect(extensionsResult.extensions.map((extension) => extension.path)).toEqual(["<inline:native-mcp>"]);
+					return true;
+				},
+			});
+			expect(loader.getExtensions().extensions.map((extension) => extension.path)).toEqual([
+				projectExtensionPath,
+				"<inline:native-mcp>",
+			]);
 		});
 
 		it("should discover skills from agentDir", async () => {

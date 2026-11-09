@@ -12,6 +12,7 @@ export function wrapToolDefinition<TDetails = unknown>(
 	return {
 		name: definition.name,
 		label: definition.label,
+		autoActivateOnCall: definition.autoActivateOnCall,
 		description: definition.description,
 		parameters: definition.parameters,
 		outputSchema: definition.outputSchema,
@@ -47,6 +48,7 @@ export function createToolDefinitionFromAgentTool(tool: AgentTool<any>): ToolDef
 	return {
 		name: tool.name,
 		label: tool.label,
+		autoActivateOnCall: tool.autoActivateOnCall,
 		description: tool.description,
 		parameters: tool.parameters as any,
 		outputSchema: tool.outputSchema,

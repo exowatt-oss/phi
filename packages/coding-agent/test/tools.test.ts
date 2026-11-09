@@ -2,6 +2,7 @@ import { applyPatch } from "diff";
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
+import { Value } from "typebox/value";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { executeBashWithOperations } from "../src/core/bash-executor.ts";
 import type { ExtensionToolContext } from "../src/core/extensions/types.ts";
@@ -275,6 +276,44 @@ describe("Coding Agent Tools", () => {
 			const result = await writeTool.execute("test-call-4", { path: testFile, content });
 
 			expect(getTextOutput(result)).toContain("Successfully wrote");
+		});
+
+		it("should append to existing files", async () => {
+			const testFile = join(testDir, "append-test.txt");
+			writeFileSync(testFile, "first\n");
+
+			await writeTool.execute("test-call-append-existing", {
+				path: testFile,
+				content: "second\n",
+				mode: "append",
+			});
+
+			expect(readFileSync(testFile, "utf-8")).toBe("first\nsecond\n");
+		});
+
+		it("should create missing files and parent directories in append mode", async () => {
+			const testFile = join(testDir, "nested", "append", "append-test.txt");
+
+			await writeTool.execute("test-call-append-missing", {
+				path: testFile,
+				content: "created\n",
+				mode: "append",
+			});
+
+			expect(readFileSync(testFile, "utf-8")).toBe("created\n");
+		});
+
+		it("should overwrite existing files when mode is omitted", async () => {
+			const testFile = join(testDir, "overwrite-test.txt");
+			writeFileSync(testFile, "old\n");
+
+			await writeTool.execute("test-call-overwrite-default", { path: testFile, content: "new\n" });
+
+			expect(readFileSync(testFile, "utf-8")).toBe("new\n");
+		});
+
+		it("should accept write arguments without mode", () => {
+			expect(Value.Check(writeTool.parameters, { path: "file.txt", content: "content" })).toBe(true);
 		});
 	});
 

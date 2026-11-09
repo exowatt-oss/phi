@@ -1,4 +1,5 @@
 import type { Api, CredentialInfo, Model } from "@earendil-works/pi-ai";
+import { APP_NAME } from "../config.ts";
 import { resolveCliModel, resolveModelReference } from "../core/model-resolver.ts";
 import type { ModelRuntime } from "../core/model-runtime.ts";
 import type { Args } from "./args.ts";
@@ -7,6 +8,28 @@ import { AuthCommandError, type AuthCommandKind, getAuthCredential, validateAuth
 const DEFAULT_BEARER_TOKEN_MIN_EXPIRY_MS = 30 * 60_000;
 
 type CredentialPrintKind = Exclude<AuthCommandKind, "check">;
+
+/**
+ * phi's `auth` help: upstream's auth-command surface (print-*, check) plus phi's
+ * `auth token` gateway-key export, with the display name taken from APP_NAME.
+ */
+export function printCredentialPrintHelp(): void {
+	console.log(`Usage:
+  ${APP_NAME} auth token [--json] [--force]
+  ${APP_NAME} auth print-api-key [--provider <provider>] [--model <model>]
+  ${APP_NAME} auth print-bearer-token [--provider <provider>] [--model <model>] [--min-expiry <duration>]
+  ${APP_NAME} auth check [--provider <provider>] [--model <model>] [--json] [--credentials] [--no-refresh]
+
+"auth token" exports the configured gateway key without starting phi; its detailed
+help is available with "${APP_NAME} auth token --help". The print and check
+commands require at least one of --provider or --model; provider inference uses
+configured credentials. Bearer tokens have a 30-minute minimum expiry by default;
+--min-expiry accepts ms, s, m, or h (for example, 30m). Checks refresh expired
+OAuth credentials by default; --no-refresh prevents this. --credentials emits the
+credential, or includes it in JSON output.
+
+Use "${APP_NAME} auth --help" to show this help without starting phi.`);
+}
 
 /**
  * Resolve one configured provider credential.

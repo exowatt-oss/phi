@@ -97,7 +97,13 @@ describe("AgentSession retry", () => {
 		const authStorage = AuthStorage.create(join(tempDir, "auth.json"));
 		const modelRegistry = await createModelRegistry(authStorage, tempDir);
 		await authStorage.modify("anthropic", async () => ({ type: "api_key", key: "test-key" }));
-		settingsManager.applyOverrides({ retry: { enabled: true, maxRetries, baseDelayMs: 1, maxAgentDelayMs } });
+		settingsManager.applyOverrides({
+			retry: { enabled: true, maxRetries, baseDelayMs: 1, maxAgentDelayMs },
+			// This suite exercises same-model retry only. The shipped error-fallback
+			// chain is a separate recovery policy and resolves against this test's
+			// Anthropic registry, so leave it off to keep maxRetries deterministic.
+			errorFallback: { enabled: false, chain: [] },
+		});
 
 		session = new AgentSession({
 			agent,

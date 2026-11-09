@@ -156,6 +156,8 @@ The `entry` value uses a persisted [session entry type](session-format.md#entry-
 
 If compaction was aborted, `result` is absent and `aborted` is true. If it failed, `result` is absent, `aborted` is false, and `errorMessage` describes the failure. Successful overflow recovery sets `willRetry` to true before Pi retries the prompt.
 
+`compaction_end` may include `pendingMessages`: live inputs not yet persisted while request preparation finishes. A UI rebuilding from session entries should render these after the new boundary or summary.
+
 See [Compaction and Branch Summaries](compaction.md) for result semantics.
 
 ## Retry events

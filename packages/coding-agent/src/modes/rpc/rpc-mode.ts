@@ -19,12 +19,14 @@ import type {
 	ExtensionWidgetOptions,
 	WorkingIndicatorOptions,
 } from "../../core/extensions/index.ts";
+import { resolveModelScope } from "../../core/model-resolver.ts";
 import {
 	flushRawStdout,
 	takeOverStdout,
 	waitForRawStdoutBackpressure,
 	writeRawStdout,
 } from "../../core/output-guard.ts";
+import { getSupportedServiceTiers } from "../../core/service-tier.ts";
 import { killTrackedDetachedChildren } from "../../utils/shell.ts";
 import { type Theme, theme } from "../interactive/theme/theme.ts";
 import { toJsonEvent } from "../json-event.ts";
@@ -37,12 +39,14 @@ import type {
 	RpcSessionState,
 	RpcSlashCommand,
 } from "./rpc-types.ts";
+import { toRpcModelInfo } from "./rpc-types.ts";
 
 // Re-export types for consumers
 export type {
 	RpcCommand,
 	RpcExtensionUIRequest,
 	RpcExtensionUIResponse,
+	RpcModelInfo,
 	RpcResponse,
 	RpcSessionState,
 } from "./rpc-types.ts";
@@ -316,6 +320,10 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 
 	const rebindSession = async (): Promise<void> => {
 		session = runtimeHost.session;
+		// The RPC host owns the model picker, so phi must not switch models behind
+		// its back on a provider outage unless the settings file asks for it. Set on
+		// every rebind: a reload or session switch brings a fresh SettingsManager.
+		session.settingsManager.setHostManagedModelSelection(true);
 		await session.bindExtensions({
 			uiContext: createExtensionUIContext(),
 			mode: "rpc",
@@ -408,7 +416,17 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 					.catch((e) => {
 						if (!preflightSucceeded) {
 							output(error(id, "prompt", e.message));
+							return;
 						}
+						// The prompt was already acknowledged (before pre-prompt compaction and
+						// before_agent_start hooks); a failure after that point must still reach
+						// the client rather than vanish, so report it as an extension error event.
+						output({
+							type: "extension_error",
+							extensionPath: "prompt",
+							event: "prompt",
+							error: e instanceof Error ? e.message : String(e),
+						});
 					});
 				return undefined;
 			}
@@ -449,6 +467,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 				const state: RpcSessionState = {
 					model: session.model,
 					thinkingLevel: session.thinkingLevel,
+					serviceTier: session.serviceTier ?? "default",
 					isStreaming: session.isStreaming,
 					isCompacting: session.isCompacting,
 					steeringMode: session.steeringMode,
@@ -468,12 +487,15 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 			// =================================================================
 
 			case "set_model": {
+				if (command.persist !== undefined && typeof command.persist !== "boolean") {
+					return error(id, "set_model", "Invalid persist: expected a boolean");
+				}
 				const models = session.modelRuntime.getAvailableSnapshot();
 				const model = models.find((m) => m.provider === command.provider && m.id === command.modelId);
 				if (!model) {
 					return error(id, "set_model", `Model not found: ${command.provider}/${command.modelId}`);
 				}
-				await session.setModel(model);
+				await session.setModel(model, { persist: command.persist ?? true });
 				return success(id, "set_model", model);
 			}
 
@@ -486,8 +508,29 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 			}
 
 			case "get_available_models": {
-				const models = session.modelRuntime.getAvailableSnapshot();
-				return success(id, "get_available_models", { models });
+				if (command.scope !== undefined && command.scope !== "configured" && command.scope !== "all") {
+					return error(id, "get_available_models", "Invalid scope: expected configured or all");
+				}
+				const patterns =
+					session.scopedModels.length > 0
+						? session.scopedModels.map(({ model }) => `${model.provider}/${model.id}`)
+						: session.settingsManager.getEnabledModels();
+				const models =
+					command.scope !== "all" && patterns && patterns.length > 0
+						? (await resolveModelScope(patterns, session.modelRuntime)).map(({ model }) => model)
+						: session.modelRuntime.getAvailableSnapshot();
+				// Decorated with the resolved level list rather than leaving every host to
+				// reimplement `thinkingLevelMap` semantics; a host that did not reimplement
+				// them offered every level in its picker, including ones the provider rejects.
+				return success(id, "get_available_models", { models: models.map(toRpcModelInfo) });
+			}
+
+			case "set_service_tier": {
+				if (!session.model || !getSupportedServiceTiers(session.model).includes(command.tier)) {
+					return error(id, "set_service_tier", `Service tier is not supported by this model: ${command.tier}`);
+				}
+				session.setServiceTier(command.tier);
+				return success(id, "set_service_tier", { serviceTier: session.serviceTier ?? "default" });
 			}
 
 			// =================================================================

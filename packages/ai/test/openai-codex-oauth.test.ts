@@ -471,8 +471,9 @@ describe("OpenAI Codex OAuth", () => {
 			}),
 		);
 
-		await expect(
-			openaiCodexOAuth.refresh(
+		let thrown: unknown;
+		try {
+			await openaiCodexOAuth.refresh(
 				{
 					type: "oauth",
 					access: "invalid-access-token",
@@ -480,9 +481,38 @@ describe("OpenAI Codex OAuth", () => {
 					expires: 0,
 				},
 				neverAbortedSignal,
-			),
-		).rejects.toThrow(/OpenAI Codex token refresh failed \(401\).*Could not validate your token/);
+			);
+		} catch (error) {
+			thrown = error;
+		}
+		expect(thrown).toMatchObject({ oauthErrorCode: "token_endpoint_error", status: 401 });
+		expect((thrown as Error).message).not.toContain("Could not validate your token");
 		expect(consoleError).not.toHaveBeenCalled();
+	});
+
+	it("returns structured invalid_grant without retaining the refresh response", async () => {
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(
+				async () =>
+					new Response(JSON.stringify({ error: "invalid_grant", error_description: "sentinel-token-detail" }), {
+						status: 400,
+						headers: { "Content-Type": "application/json" },
+					}),
+			),
+		);
+
+		let thrown: unknown;
+		try {
+			await openaiCodexOAuth.refresh(
+				{ type: "oauth", access: "old", refresh: "old", expires: 0 },
+				neverAbortedSignal,
+			);
+		} catch (error) {
+			thrown = error;
+		}
+		expect(thrown).toMatchObject({ oauthErrorCode: "invalid_grant", status: 400 });
+		expect((thrown as Error).message).not.toContain("sentinel-token-detail");
 	});
 
 	it("uses the app's agent name as the browser login originator", async () => {

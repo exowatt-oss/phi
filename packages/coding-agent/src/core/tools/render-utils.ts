@@ -87,6 +87,45 @@ export type ToolRenderResultLike<TDetails> = {
 	details: TDetails;
 };
 
+/**
+ * One-line structural summary of a JSON payload, or undefined when the text is
+ * not JSON.
+ *
+ * MCP servers and HTTP-ish tools answer in whole JSON documents, frequently on a
+ * single 4 KB line. The first 80 characters of that (`{"registry_path":"/var/…`)
+ * tell you nothing, while `{registry_path, query, candidates, count} ·
+ * candidates[8]` tells you what you got and roughly how much of it. The array
+ * called out is the first one at the top level, which is almost always the
+ * payload people are looking for.
+ */
+export function describeJsonShape(text: string): string | undefined {
+	const trimmed = text.trim();
+	const first = trimmed[0];
+	if (first !== "{" && first !== "[") return undefined;
+
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(trimmed);
+	} catch {
+		return undefined;
+	}
+
+	if (Array.isArray(parsed)) {
+		return `${parsed.length} item${parsed.length === 1 ? "" : "s"}`;
+	}
+	if (typeof parsed !== "object" || parsed === null) return undefined;
+
+	const record = parsed as Record<string, unknown>;
+	const keys = Object.keys(record);
+	if (keys.length === 0) return "{}";
+
+	const head = keys.slice(0, 4).join(", ");
+	const rest = keys.length > 4 ? `, +${keys.length - 4}` : "";
+	const listKey = keys.find((key) => Array.isArray(record[key]));
+	const list = listKey ? ` · ${listKey}[${(record[listKey] as unknown[]).length}]` : "";
+	return `{${head}${rest}}${list}`;
+}
+
 const COLLAPSED_ARGS_CHARS = 100;
 
 /**

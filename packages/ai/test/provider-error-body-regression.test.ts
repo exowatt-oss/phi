@@ -18,13 +18,17 @@ import type { Model } from "../src/types.ts";
 // openai SDK APIError shape: "<status> status code (no body)" message, the
 // parsed body kept on `.error`.
 class FakeAPIError extends Error {
-	status: number;
+	status: number | undefined;
+	code: number | undefined;
 	error: unknown;
-	constructor(status: number, parsedBody: unknown) {
-		super(`${status} status code (no body)`);
+	headers: Headers;
+	constructor(status: number | undefined, parsedBody: unknown, code?: number, headers?: Headers) {
+		super(status === undefined ? "stream error" : `${status} status code (no body)`);
 		this.name = "PermissionDeniedError";
 		this.status = status;
+		this.code = code;
 		this.error = parsedBody;
+		this.headers = headers ?? new Headers();
 	}
 }
 
@@ -35,13 +39,16 @@ const bedrockMock = vi.hoisted(() => ({
 const openaiMock = vi.hoisted(() => ({
 	// Default parsed body; individual tests may override before invoking.
 	parsedBody: { error: "blocked by gateway WAF" } as unknown,
+	status: 403 as number | undefined,
+	code: undefined as number | undefined,
+	headers: new Headers(),
 }));
 
 vi.mock("openai", () => {
 	function throwingCreate() {
 		const promise = Promise.resolve(undefined) as unknown as { withResponse: () => Promise<never> };
 		promise.withResponse = async () => {
-			throw new FakeAPIError(403, openaiMock.parsedBody);
+			throw new FakeAPIError(openaiMock.status, openaiMock.parsedBody, openaiMock.code, openaiMock.headers);
 		};
 		return promise;
 	}
@@ -124,7 +131,12 @@ const responsesModel: Model<"openai-responses"> = {
 
 async function drainResult(stream: {
 	[Symbol.asyncIterator](): AsyncIterator<unknown>;
-	result(): Promise<{ errorMessage?: string; stopReason?: string }>;
+	result(): Promise<{
+		errorMessage?: string;
+		providerErrorMessage?: string;
+		responseModel?: string;
+		stopReason?: string;
+	}>;
 }) {
 	for await (const _event of stream) {
 		void _event;
@@ -135,6 +147,9 @@ async function drainResult(stream: {
 describe("provider error body passthrough (per-tier regression)", () => {
 	beforeEach(() => {
 		openaiMock.parsedBody = { error: "blocked by gateway WAF" };
+		openaiMock.status = 403;
+		openaiMock.code = undefined;
+		openaiMock.headers = new Headers();
 	});
 
 	it("openai-completions (body-blind text) surfaces status + body", async () => {
@@ -169,6 +184,61 @@ describe("provider error body passthrough (per-tier regression)", () => {
 		expect(output.stopReason).toBe("error");
 		expect(output.errorMessage).toContain("OpenAI API error (403)");
 		expect(output.errorMessage).toContain("blocked by gateway WAF");
+	});
+
+	it("openai-responses turns a 200 SSE gateway error into an actionable gateway headline", async () => {
+		openaiMock.status = undefined;
+		openaiMock.code = 503;
+		openaiMock.parsedBody = { message: "upstream unavailable", code: 503 };
+		openaiMock.headers = new Headers({
+			"x-litellm-call-id": "call-sse-1",
+			"x-request-id": "request-sse-1",
+			"x-litellm-model-id": "deployment-example-large",
+			"x-litellm-model-name": "bedrock/anthropic.claude-sonnet",
+			"x-litellm-model-region": "us",
+			"x-litellm-attempted-retries": "2",
+			"x-litellm-max-retries": "2",
+		});
+
+		const model: Model<"openai-responses"> = {
+			...responsesModel,
+			provider: "gateway",
+			id: "example-large",
+			baseUrl: "https://llm.example.com/v1",
+		};
+		const output = await drainResult(streamOpenAIResponses(model, context, { apiKey: "test" }));
+
+		expect(output.stopReason).toBe("error");
+		expect(output.errorMessage).toContain("gateway/example-large");
+		expect(output.errorMessage).toContain("upstream status 503");
+		expect(output.errorMessage).toContain("deployment deployment-example-large");
+		expect(output.errorMessage).toContain("allowed region us");
+		expect(output.errorMessage).toContain("initial route");
+		expect(output.errorMessage).toContain("retry attempts 2/2");
+		expect(output.errorMessage).toContain("retry the request or choose another model");
+		expect(output.errorMessage).toContain("call ID call-sse-1");
+		expect(output.errorMessage).not.toContain("gateway dashboard");
+		expect(output.errorMessage).not.toContain("fallback attempts");
+		expect(output.providerErrorMessage).toContain("upstream unavailable");
+		expect(output.responseModel).toBe("bedrock/anthropic.claude-sonnet");
+	});
+
+	it("openai-responses never records a LiteLLM deployment id as responseModel", async () => {
+		openaiMock.status = undefined;
+		openaiMock.code = 503;
+		openaiMock.parsedBody = { message: "upstream unavailable", code: 503 };
+		openaiMock.headers = new Headers({ "x-litellm-model-id": "deployment-example-large" });
+
+		const model: Model<"openai-responses"> = {
+			...responsesModel,
+			provider: "gateway",
+			id: "example-large",
+			baseUrl: "https://llm.example.com/v1",
+		};
+		const output = await drainResult(streamOpenAIResponses(model, context, { apiKey: "test" }));
+
+		expect(output.stopReason).toBe("error");
+		expect(output.responseModel).not.toBe("deployment-example-large");
 	});
 
 	it("bedrock (body-blind) surfaces the gateway body instead of Unknown: UnknownError", async () => {

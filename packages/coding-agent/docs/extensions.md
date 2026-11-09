@@ -378,6 +378,137 @@ Release resources in `session_shutdown` even when normal operation attempted cle
 Keep cleanup idempotent because cancellation, reload, session replacement, and process exit can converge on the same path.
 Use `ctx.shutdown()` to request an orderly process shutdown.
 
+<a id="phi-extension-api"></a>
+
+## phi extension API additions
+
+phi adds these events, context methods, and options on top of the upstream contracts above. Their exact types are in the exported declarations in `extensions/types.ts`.
+
+<a id="session_before_auto_compact"></a>
+
+### session_before_auto_compact
+
+Fired before automatic (threshold or overflow) compaction, ahead of `session_before_compact`, summary preparation, and summarization auth. Manual `/compact` does not fire it. Provider-bound inputs awaiting this preflight are in `pendingMessages`, not `branchEntries`. Return `newContext` to start a fresh context window (a persisted `context_window` entry) instead of a summary; the trigger then never reaches `session_before_compact`. Returning nothing lets normal compaction proceed. Only one extension should own this policy: the last handler result wins.
+
+```typescript
+pi.on("session_before_auto_compact", async (event, ctx) => {
+  const { branchEntries, pendingMessages, reason, willRetry, signal } = event;
+  // pendingMessages - inputs in the pending provider request that are not yet in branchEntries
+  // reason - "threshold" or "overflow"; willRetry - the aborted turn is retried after the boundary
+  return { newContext: { handoff: "Concise state for the next window" } };
+});
+```
+
+<a id="ui_prompt_start--ui_prompt_end"></a>
+
+### ui_prompt_start / ui_prompt_end
+
+Notification-only lifecycle events for blocking user-facing extension UI prompts. They fire around `ctx.ui.select()`, `ctx.ui.confirm()`, `ctx.ui.input()`, `ctx.ui.editor()`, and `ctx.ui.custom()` so host/status integrations can report "waiting for user" instead of just "running". This covers every dialog opened through an extension `ctx.ui`, including phi's built-in extensions (MCP elicitation, `/hub`, `/loop`) and RPC-mode dialogs; phi's own interactive selectors such as `/model` and `/settings`, and the startup project-trust prompt, are not extension prompts and do not emit them. Without a UI (print mode) no prompt is shown and nothing fires.
+
+Nested or overlapping prompts are coalesced into one outer waiting span. Handlers are invoked best-effort and are not awaited before showing or closing the prompt.
+
+```typescript
+pi.on("ui_prompt_start", async (event, ctx) => {
+  // event.reason === "ui_prompt"
+  // event.kind: "select" | "confirm" | "input" | "editor" | "custom"
+  // event.title: prompt title when available
+});
+
+pi.on("ui_prompt_end", async (event, ctx) => {
+  // Pi is no longer waiting on that UI prompt span.
+});
+```
+
+### ctx.getContextBreakdown()
+
+Returns a category breakdown of what currently fills the context window: the fixed
+per-request overhead (system prompt, tool definitions) plus the conversation bucketed
+by message role. `total`/`percent` come from provider usage and are authoritative (and
+`null` right after compaction, until the next model response); the per-category numbers
+are heuristic estimates and need not sum to `total`. The system prompt is measured as
+last sent to the provider (including `before_agent_start` additions) and estimated at
+~3.5 chars/token; tool definitions are measured as compact JSON at ~2.3 chars/token.
+The remaining gap is provider framing and cache blocks the estimate does not model.
+Also reports the automatic-compaction threshold, so a caller can see remaining headroom.
+
+```typescript
+const b = ctx.getContextBreakdown();
+if (b) {
+  console.log(`${b.total} / ${b.contextWindow} tokens`);
+  console.log(`system prompt: ${b.systemPrompt.tokens}`);
+  console.log(`tool defs: ${b.tools.tokens} (${b.tools.count} tools)`);
+  console.log(`tool results: ${b.messages.byRole.toolResult?.tokens ?? 0}`);
+  console.log(`auto-compacts above: ${b.compaction.threshold}`);
+}
+```
+
+Useful for attributing context bloat — a large `messages.byRole.toolResult` bucket
+points at unfiltered tool output, which is the usual cause of a single turn
+overflowing the window.
+
+### ctx.getCompactionSettings()
+
+Returns the effective compaction settings (`enabled`, `reserveTokens`, `keepRecentTokens`) exactly as Pi resolved them, including whether project settings are trusted. Prefer this over re-reading settings files.
+
+### ctx.compact() from a tool
+
+Compaction aborts the active stream, so it cannot be triggered from inside a tool call
+without killing the turn that called it. From a tool, record the intent and call
+`ctx.compact()` from a `turn_end` handler instead.
+
+### pi.registerTools(definitions)
+
+Register several tools at once. Each registration refreshes the whole tool registry and rebuilds the system prompt, so registering a large catalogue one `registerTool()` call at a time is quadratic in the tool count and can block the event loop for seconds. `registerTools()` stores every definition and refreshes once; the tools are then visible exactly as if each had been registered separately.
+
+### Ephemeral custom messages
+
+Set `ephemeral: true` on a `pi.sendMessage()` message to keep it in the session for display and forensics while excluding it from LLM context after the next assistant message exists. Without `ephemeral`, custom messages remain in context for the rest of the session.
+
+```typescript
+pi.sendMessage({
+  customType: "my-extension",
+  content: "Message text",
+  display: true,
+  // Optional: include only until the next assistant message is added.
+  ephemeral: true,
+}, { triggerTurn: true, deliverAs: "steer" });
+```
+
+### Commands without arguments
+
+Commands that take no arguments should declare `acceptsArgs: false`. Trailing text after such a command is then treated as a normal prompt instead of being silently swallowed — `/no-feads fix the tests` runs the command, then sends "fix the tests" to the model:
+
+```typescript
+pi.registerCommand("no-feads", {
+  description: "Disable all Feads requests for this session",
+  acceptsArgs: false, // "/no-feads <prompt>" forwards <prompt> to the model
+  handler: async (_args, ctx) => {
+    ctx.ui.notify("Feads disabled for this session.", "info");
+  },
+});
+```
+
+### Session-scoped model and thinking changes
+
+`pi.setModel()` is scoped to the current session: it updates the live session's model plus its session history and events, and does not change the default model in `settings.json`. Other sessions already running keep their own model, and new sessions still start on the configured default. Explicit user selection through the built-in UI or RPC (`/model`, the model picker, model cycling, `set_model`) may still persist the choice as the default.
+
+Like `pi.setModel()`, `pi.setThinkingLevel()` is scoped to the current session and does not change `defaultThinkingLevel` in `settings.json` — including the clamped level applied when `pi.setModel()` switches to a model with fewer thinking levels. Built-in thinking-level controls (settings, keybindings, RPC) may still persist the level as the default.
+
+### Tool result rendering fallback
+
+If a tool's `renderResult` slot renderer is not defined or throws, phi shows text from `content`, collapsed to `toolOutputLines` visual lines with a
+`ctrl+o` hint. A JSON payload is headed by a structural summary
+(`{registry_path, query, candidates, count} · candidates[8]`) instead of its first line, since
+a whole document on one line says nothing useful in 80 characters. Expanding shows everything.
+
+With the default `toolDisplay: "minimal"` setting the collapsed fallback shows only that summary
+header line; `toolDisplay: "compact"` also shows the budgeted preview lines. Errors keep their
+content in both modes. See [Tool Display](tool-display.md).
+
+Writing `renderResult` yourself is still better than the fallback when the result has a natural
+summary; read `options.collapsedLines` so a compact renderer honors the user's setting, and
+`options.display` / `context.display` (`"minimal" | "compact"`) to honor the collapsed density.
+
 <a id="examples-reference"></a>
 <a id="use-examples-as-the-implementation-reference"></a>
 

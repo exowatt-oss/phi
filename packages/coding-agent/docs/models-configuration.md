@@ -48,6 +48,8 @@ Each `models` entry adds a model to the provider. An entry whose `id` matches an
 | `cost.tiers[].output` | number |  | Required. Output cost in USD per million tokens. |
 | `cost.tiers[].cacheRead` | number |  | Required. Cache-read cost in USD per million tokens. |
 | `cost.tiers[].cacheWrite` | number |  | Required. Cache-write cost in USD per million tokens. |
+| `compaction` | object |  | Per-model compaction settings. |
+| `compaction.softCeilingTokens` | unknown |  | Caps the context window this model's compaction thresholds use, in tokens; overrides the compaction.softCeilingTokens setting. A non-negative integer; 0 uses the raw window. Invalid values are ignored. |
 | `promptCache` | object |  | Best-effort prompt cache lifetime in seconds for the short and long retention tiers. Pi warms only tiers with a known lifetime. |
 | `contextWindow` | number | `128000` | Context window in tokens. |
 | `maxTokens` | number | `16384` | Maximum output tokens. |
@@ -63,6 +65,7 @@ Each `modelOverrides` key is the ID of a built-in or extension model. Unknown ID
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `name` | string |  | Display name, also matched by --model patterns. |
+| `api` | string |  |  |
 | `reasoning` | boolean |  | Whether the model supports thinking. |
 | `thinkingLevelMap` | object |  | Provider value sent for each thinking level. null marks a level unsupported. Levels the model does not map use the provider's default value through high; xhigh and max are unsupported. |
 | `input` | `("text" \| "image")[]` |  |  |
@@ -80,6 +83,8 @@ Each `modelOverrides` key is the ID of a built-in or extension model. Unknown ID
 | `cost.tiers[].cacheWrite` | number |  | Required. Cache-write cost in USD per million tokens. |
 | `promptCache` | object |  | Best-effort prompt cache lifetime in seconds for the short and long retention tiers. Pi warms only tiers with a known lifetime. |
 | `contextWindow` | number |  | Context window in tokens. |
+| `compaction` | object |  | Per-model compaction settings. |
+| `compaction.softCeilingTokens` | unknown |  | Caps the context window this model's compaction thresholds use, in tokens; overrides the compaction.softCeilingTokens setting. A non-negative integer; 0 uses the raw window. Invalid values are ignored. |
 | `maxTokens` | number |  | Maximum output tokens. |
 | `samplingParams` | object |  | Fields merged into every request body. Applies only to OpenAI-compatible APIs. |
 | `samplingParamsByThinkingLevel` | object |  | samplingParams per thinking level, merged over samplingParams. |
@@ -113,6 +118,7 @@ See [Describe model input and caching](models.md#describe-model-input-and-cachin
 | `supportsStore` | boolean |  | Whether the provider supports the store field. Default: auto-detected from URL. |
 | `supportsDeveloperRole` | boolean |  | Whether the provider supports the developer role instead of system. Default: auto-detected from URL. |
 | `supportsReasoningEffort` | boolean |  | Whether the provider supports reasoning_effort. Default: auto-detected from URL. |
+| `sendReasoningEffortOff` | boolean | `false` | Whether to send reasoning_effort with the thinkingLevelMap "off" value when thinking is off, instead of omitting the field. Set it only for a model whose own endpoint needs an explicit off value; a gateway that re-maps onto an upstream with a different vocabulary rejects it. |
 | `supportsUsageInStreaming` | boolean | `true` | Whether the provider supports stream_options.include_usage for token usage in streaming responses. |
 | `supportsFinishReason` | boolean | `true` | Whether streamed responses include finish_reason. When false, pi infers stop or toolUse when the stream ends. |
 | `maxTokensField` | `"max_completion_tokens" \| "max_tokens"` |  | Which field to use for max tokens. Default: auto-detected from URL. |
@@ -153,6 +159,10 @@ Also applies to `azure-openai-responses` and `openai-codex-responses`.
 | `supportsAdditionalTools` | boolean | `false` | Whether the model supports message-anchored additional_tools input items. |
 | `supportsToolSearch` | boolean | `false` | Whether the model supports client-executed tool search for transcript-anchored additions. |
 | `supportsExplicitPromptCacheMode` | boolean | `false` | Whether the model accepts prompt_cache_options. Older OpenAI models reject the parameter. |
+| `supportsExplicitPromptCacheBreakpoints` | boolean |  | Whether the model accepts OpenAI GPT-5.6+ explicit prompt cache breakpoints on input content. Default: follows supportsExplicitPromptCacheMode. |
+| `fastServiceTier` | string |  | Wire service_tier sent when the session asks for the fast tier, and read back as fast. Default: "ultrafast" for GPT-6 Astra on Amazon Bedrock /openai/v1 endpoints; otherwise unset, so fast goes out as "fast". |
+| `fastServiceTierCostMultiplier` | number |  | Multiplier applied to every cost rate when a response is served at fastServiceTier. Default: 6 for Bedrock GPT-6 Astra UltraFast; 2 otherwise. |
+| `sortToolSchemaKeys` | boolean |  | Recursively sort the keys of tool JSON schemas before sending, so Amazon Bedrock renders the same prompt prefix before and after the first tool call. Default: true for Amazon Bedrock /openai/v1 endpoints, false otherwise. |
 | `supportsMidConvoEffort` | boolean | `false` | Whether thinking level changes are sent as configuration_update input items instead of changing reasoning.effort, so a change keeps the prompt cache. Only used by the openai-responses API, and ignored with Sign in with ChatGPT on the openai provider. |
 | `supportsMaxOutputTokens` | boolean | `true` | Whether the provider accepts max_output_tokens. Some Codex-protocol gateways reject it. |
 
@@ -173,6 +183,8 @@ Also applies to `azure-openai-responses` and `openai-codex-responses`.
 | `supportsMidConvoSystemMessages` | boolean | `false` | Whether the exact model accepts system-role messages inside the conversation. When false, later system messages are folded into the top-level system prompt. |
 | `supportsMidConvoToolChanges` | boolean | `false` | Whether the exact model accepts mid-conversation tool_addition and tool_removal blocks. Requires supportsMidConvoSystemMessages. |
 | `allowedFallbackModels` | `object[]` |  | Models Anthropic accepts for server-side refusal fallback, with local pricing metadata for returned fallback responses. When absent or empty, callers must omit fallbacks; Anthropic rejects the field for models with no permitted fallback targets. |
+| `supportsFastMode` | boolean |  | Whether the model accepts Anthropic fast mode (speed: "fast" with the fast-mode-2026-02-01 beta). When false, a fast service tier is ignored for this model. Default: true for first-party Claude Opus 5.5, Opus 5, and Opus 4.8; false otherwise. |
+| `fastModeCostMultiplier` | number |  | Multiplier applied to every cost rate when a response reports usage.speed "fast". Default: 2. |
 
 ### `bedrock-converse-stream`
 

@@ -1,7 +1,7 @@
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { type CredentialStore, createModels, type Provider } from "@earendil-works/pi-ai";
+import { type CredentialStore, createModels, OAuthTokenError, type Provider } from "@earendil-works/pi-ai";
 import lockfile from "proper-lockfile";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { AuthStorage, FileAuthStorageBackend } from "../src/core/auth-storage.ts";
@@ -114,7 +114,8 @@ describe("AuthStorage", () => {
 	});
 
 	test("keeps a coalesced reload alive while another credential reader is waiting", async () => {
-		writeAuthJson({ anthropic: { type: "api_key", key: "old" } });
+		// Different length from "new": on coarse-timestamp filesystems (CI overlayfs) equal-size rewrites keep the same revision.
+		writeAuthJson({ anthropic: { type: "api_key", key: "stale" } });
 		const storage = AuthStorage.create(authJsonPath);
 		writeAuthJson({ anthropic: { type: "api_key", key: "new" } });
 		let grantLock: (() => void) | undefined;
@@ -350,6 +351,133 @@ describe("AuthStorage", () => {
 		expect(update).not.toHaveBeenCalled();
 		expect(JSON.parse(readFileSync(authJsonPath, "utf8"))).toEqual({
 			anthropic: { type: "api_key", key: "stored" },
+		});
+	});
+
+	test("two file-store instances serialize a rotating OAuth refresh", async () => {
+		const firstStore = AuthStorage.create(authJsonPath);
+		const secondStore = AuthStorage.create(authJsonPath);
+		await firstStore.modify("anthropic", async () => ({
+			type: "oauth",
+			access: "old-access",
+			refresh: "old-refresh",
+			expires: 0,
+		}));
+		let refreshes = 0;
+		const provider: Provider = {
+			id: "anthropic",
+			name: "Anthropic",
+			auth: {
+				oauth: {
+					name: "OAuth",
+					login: async () => {
+						throw new Error("not used");
+					},
+					refresh: async () => {
+						refreshes++;
+						await new Promise((resolve) => setTimeout(resolve, 20));
+						return {
+							type: "oauth",
+							access: "new-access",
+							refresh: "new-refresh",
+							expires: Date.now() + 60 * 60_000,
+						};
+					},
+					toAuth: async (credential) => ({ apiKey: credential.access }),
+				},
+			},
+			getModels: () => [],
+			stream: () => {
+				throw new Error("not used");
+			},
+			streamSimple: () => {
+				throw new Error("not used");
+			},
+		};
+		const firstModels = createModels({ credentials: firstStore });
+		const secondModels = createModels({ credentials: secondStore });
+		firstModels.setProvider(provider);
+		secondModels.setProvider(provider);
+
+		const [first, second] = await Promise.all([firstModels.getAuth("anthropic"), secondModels.getAuth("anthropic")]);
+		expect(refreshes).toBe(1);
+		expect(first?.auth.apiKey).toBe("new-access");
+		expect(second?.auth.apiKey).toBe("new-access");
+	});
+
+	test("atomically invalidates invalid_grant across file stores without deleting a queued login", async () => {
+		const firstStore = AuthStorage.create(authJsonPath);
+		const secondStore = AuthStorage.create(authJsonPath);
+		await firstStore.modify("anthropic", async () => ({
+			type: "oauth",
+			access: "old-access",
+			refresh: "old-refresh",
+			expires: 0,
+		}));
+		let refreshes = 0;
+		let releaseRefresh: () => void = () => {};
+		const refreshStarted = new Promise<void>((resolve) => {
+			releaseRefresh = resolve;
+		});
+		let notifyRefreshStarted: () => void = () => {};
+		const didStartRefresh = new Promise<void>((resolve) => {
+			notifyRefreshStarted = resolve;
+		});
+		const provider: Provider = {
+			id: "anthropic",
+			name: "Anthropic",
+			auth: {
+				oauth: {
+					name: "OAuth",
+					login: async () => {
+						throw new Error("not used");
+					},
+					refresh: async () => {
+						refreshes++;
+						notifyRefreshStarted();
+						await refreshStarted;
+						throw new OAuthTokenError("invalid_grant", 400);
+					},
+					toAuth: async (credential) => ({ apiKey: credential.access }),
+				},
+			},
+			getModels: () => [],
+			stream: () => {
+				throw new Error("not used");
+			},
+			streamSimple: () => {
+				throw new Error("not used");
+			},
+		};
+		const firstModels = createModels({ credentials: firstStore });
+		const secondModels = createModels({ credentials: secondStore });
+		firstModels.setProvider(provider);
+		secondModels.setProvider(provider);
+
+		const firstRequest = firstModels.getAuth("anthropic");
+		await didStartRefresh;
+		const secondRequest = secondModels.getAuth("anthropic");
+		const login = secondStore.modify("anthropic", async () => ({
+			type: "oauth",
+			access: "new-access",
+			refresh: "new-refresh",
+			expires: Date.now() + 60 * 60_000,
+			providerExtension: "new-login",
+		}));
+		releaseRefresh();
+
+		const [first, second] = await Promise.allSettled([firstRequest, secondRequest]);
+		await login;
+		expect(refreshes).toBe(1);
+		expect(first).toMatchObject({ status: "rejected", reason: { code: "auth_required" } });
+		if (second.status === "fulfilled") {
+			expect(second.value?.auth.apiKey).toBe("new-access");
+		} else {
+			expect(second.reason).toMatchObject({ code: "auth_required" });
+		}
+		await expect(secondStore.read("anthropic")).resolves.toMatchObject({
+			refresh: "new-refresh",
+			providerExtension: "new-login",
 		});
 	});
 

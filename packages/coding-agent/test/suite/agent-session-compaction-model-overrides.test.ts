@@ -85,6 +85,8 @@ describe("AgentSession compaction model overrides", () => {
 				enabled: path !== "manual",
 				reserveTokens: 2000,
 				keepRecentTokens: 150,
+				// phi: compaction settings carry the soft ceiling (default 300k).
+				softCeilingTokens: 300_000,
 			});
 			expect(preparations[0]?.reason).toBe(
 				path === "manual" ? "manual" : path === "overflow" ? "overflow" : "threshold",
@@ -124,6 +126,17 @@ describe("AgentSession compaction model overrides", () => {
 							tokensBefore: event.preparation.tokensBefore,
 						},
 					}));
+					// phi never reuses usage reported by another model, so each model reports the same
+					// 2500-token context itself: within small's policy, over big's override.
+					pi.on("message_end", (event) => {
+						if (event.message.role !== "assistant") return;
+						return {
+							message: {
+								...event.message,
+								usage: { ...event.message.usage, input: 2500, output: 1, totalTokens: 2501 },
+							},
+						};
+					});
 				},
 			],
 		});
@@ -132,8 +145,7 @@ describe("AgentSession compaction model overrides", () => {
 		harness.setResponses([fauxAssistantMessage("small response"), fauxAssistantMessage("big response")]);
 		await harness.session.prompt("continue on small");
 		expect(harness.eventsOfType("compaction_start")).toHaveLength(0);
-		// Retain usage from the small model: the next check must use the active big model's policy.
-		seedHistory(harness, 2500);
+		// The next check must use the active big model's policy.
 		await harness.session.setModel(harness.getModel("big")!);
 		await harness.session.prompt("continue on big");
 		expect(harness.eventsOfType("compaction_end")).toHaveLength(1);

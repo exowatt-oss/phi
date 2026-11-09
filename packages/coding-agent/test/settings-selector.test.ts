@@ -22,6 +22,55 @@ describe("SettingsSelectorComponent", () => {
 		harness = undefined;
 	});
 
+	it("changes the OpenAI service tier", () => {
+		const onChange = vi.fn();
+		const selector = new SettingsSelectorComponent(
+			{
+				serviceTier: "default",
+				fullscreenScrollbar: "auto",
+				warnings: {},
+				defaultModel: "not set",
+				availableDefaultModels: [],
+				availableThinkingLevels: [],
+				modelThinkingLevels: {},
+				availableThemes: [],
+			} as unknown as SettingsConfig,
+			{ onServiceTierChange: onChange } as unknown as SettingsCallbacks,
+		);
+		const settingsList = selector.getSettingsList();
+
+		for (const character of "Service tier") settingsList.handleInput(character);
+		settingsList.handleInput("\r");
+
+		expect(onChange).toHaveBeenCalledWith("fast");
+	});
+
+	it("shows Auto-update marked NEW, off by default, and toggles it", () => {
+		const onAutoUpdateChange = vi.fn();
+		const selector = new SettingsSelectorComponent(
+			{
+				autoUpdate: false,
+				fullscreenScrollbar: "auto",
+				warnings: {},
+				defaultModel: "not set",
+				availableDefaultModels: [],
+				availableThinkingLevels: [],
+				modelThinkingLevels: {},
+				availableThemes: [],
+			} as unknown as SettingsConfig,
+			{ onAutoUpdateChange } as unknown as SettingsCallbacks,
+		);
+		const list = selector.getSettingsList();
+		for (const character of "Auto-update") list.handleInput(character);
+		const row = list
+			.render(120)
+			.map(stripAnsi)
+			.find((line) => line.includes("NEW"));
+		expect(row).toMatch(/Auto-update NEW\s+false/);
+		list.handleInput("\r");
+		expect(onAutoUpdateChange).toHaveBeenCalledWith(true);
+	});
+
 	it("cycles through fullscreen settings", () => {
 		const onExitOutputChange = vi.fn();
 		const onScrollbarChange = vi.fn();

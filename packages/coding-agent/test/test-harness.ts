@@ -348,6 +348,8 @@ export interface HarnessOptions {
 	resourceLoader?: ResourceLoader;
 	/** Inline extensions to load into the session resource loader. */
 	extensionFactories?: Array<InlineExtension | CreateTestExtensionsResultInput>;
+	/** Session manager to use (e.g. a file-backed one). Default: in memory. */
+	sessionManager?: SessionManager;
 }
 
 export interface Harness {
@@ -393,7 +395,7 @@ async function createHarnessWithResourceLoader(
 		streamFn: streamFn,
 	});
 
-	const sessionManager = SessionManager.inMemory();
+	const sessionManager = options.sessionManager ?? SessionManager.inMemory();
 	const settingsManager = SettingsManager.create(tempDir, tempDir);
 
 	if (options.settings) {

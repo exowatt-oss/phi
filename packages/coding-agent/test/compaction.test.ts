@@ -3,11 +3,12 @@ import type { AssistantMessage, Usage } from "@earendil-works/pi-ai/compat";
 import { getModel } from "@earendil-works/pi-ai/compat";
 import { readFileSync } from "fs";
 import { join } from "path";
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
 	type CompactionSettings,
 	calculateContextTokens,
 	compact,
+	compactionLines,
 	DEFAULT_COMPACTION_SETTINGS,
 	estimateContextTokens,
 	findCutPoint,
@@ -18,12 +19,14 @@ import {
 import {
 	buildSessionContext,
 	type CompactionEntry,
+	type ContextWindowEntry,
 	type CustomMessageEntry,
 	type ModelChangeEntry,
 	migrateSessionEntries,
 	parseSessionEntries,
 	type SessionEntry,
 	type SessionMessageEntry,
+	sessionEntryToContextMessages,
 	type ThinkingLevelChangeEntry,
 } from "../src/core/session-manager.ts";
 
@@ -76,9 +79,27 @@ function resetEntryCounter() {
 }
 
 // Reset counter before each test to get predictable IDs
+const initialTuiMode = process.env.PI_TUI_MODE;
 beforeEach(() => {
 	resetEntryCounter();
+	delete process.env.PI_TUI_MODE;
 });
+afterEach(() => {
+	if (initialTuiMode === undefined) delete process.env.PI_TUI_MODE;
+	else process.env.PI_TUI_MODE = initialTuiMode;
+});
+
+function withTuiMode<T>(value: string | undefined, callback: () => T): T {
+	const previous = process.env.PI_TUI_MODE;
+	if (value === undefined) delete process.env.PI_TUI_MODE;
+	else process.env.PI_TUI_MODE = value;
+	try {
+		return callback();
+	} finally {
+		if (previous === undefined) delete process.env.PI_TUI_MODE;
+		else process.env.PI_TUI_MODE = previous;
+	}
+}
 
 function createMessageEntry(message: AgentMessage): SessionMessageEntry {
 	const id = `test-id-${entryCounter++}`;
@@ -93,7 +114,7 @@ function createMessageEntry(message: AgentMessage): SessionMessageEntry {
 	return entry;
 }
 
-function createCompactionEntry(summary: string, firstKeptEntryId: string): CompactionEntry {
+function createCompactionEntry(summary: string, firstKeptEntryId: string, pinned?: string[]): CompactionEntry {
 	const id = `test-id-${entryCounter++}`;
 	const entry: CompactionEntry = {
 		type: "compaction",
@@ -102,6 +123,21 @@ function createCompactionEntry(summary: string, firstKeptEntryId: string): Compa
 		timestamp: new Date().toISOString(),
 		summary,
 		firstKeptEntryId,
+		tokensBefore: 10000,
+		...(pinned ? { pinned } : {}),
+	};
+	lastId = id;
+	return entry;
+}
+
+function createContextWindowEntry(handoff?: string): ContextWindowEntry {
+	const id = `test-id-${entryCounter++}`;
+	const entry: ContextWindowEntry = {
+		type: "context_window",
+		id,
+		parentId: lastId,
+		timestamp: new Date().toISOString(),
+		handoff,
 		tokensBefore: 10000,
 	};
 	lastId = id;
@@ -135,15 +171,16 @@ function createThinkingLevelEntry(thinkingLevel: string): ThinkingLevelChangeEnt
 	return entry;
 }
 
-function createCustomMessageEntry(content: string): CustomMessageEntry {
+function createCustomMessageEntry(content: string, customType = "test", details?: unknown): CustomMessageEntry {
 	const id = `test-id-${entryCounter++}`;
 	const entry: CustomMessageEntry = {
 		type: "custom_message",
 		id,
 		parentId: lastId,
 		timestamp: new Date().toISOString(),
-		customType: "test",
+		customType,
 		content,
+		details,
 		display: true,
 	};
 	lastId = id;
@@ -268,6 +305,48 @@ describe("estimateContextTokens", () => {
 		expect(estimate.lastUsageIndex).toBe(1);
 		expect(estimate.trailingTokens).toBeGreaterThan(0);
 		expect(estimate.tokens).toBe(150 + estimate.trailingTokens);
+	});
+});
+
+describe("compactionLines", () => {
+	it.each([
+		{
+			contextWindow: 1_000_000,
+			softCeilingTokens: 300_000,
+			reserveTokens: 16_384,
+			expected: { effectiveWindow: 300_000, hardAt: 283_616, windowOpenAt: 226_892, pruneAt: 150_000 },
+		},
+		{
+			contextWindow: 200_000,
+			softCeilingTokens: 300_000,
+			reserveTokens: 16_384,
+			expected: { effectiveWindow: 200_000, hardAt: 183_616, windowOpenAt: 146_892, pruneAt: 100_000 },
+		},
+		{
+			contextWindow: 128_000,
+			softCeilingTokens: 0,
+			reserveTokens: 16_384,
+			expected: { effectiveWindow: 128_000, hardAt: 111_616, windowOpenAt: 89_292, pruneAt: 64_000 },
+		},
+	])(
+		"derives thresholds for contextWindow=$contextWindow and softCeilingTokens=$softCeilingTokens",
+		({ contextWindow, softCeilingTokens, reserveTokens, expected }) => {
+			expect(compactionLines(contextWindow, { enabled: true, reserveTokens, softCeilingTokens })).toEqual(expected);
+		},
+	);
+
+	it("uses a model soft ceiling instead of the global setting", () => {
+		const model = { compaction: { softCeilingTokens: 200_000 } } as Parameters<typeof compactionLines>[2];
+		expect(
+			compactionLines(1_000_000, { enabled: true, reserveTokens: 16_384, softCeilingTokens: 300_000 }, model),
+		).toEqual({ effectiveWindow: 200_000, hardAt: 183_616, windowOpenAt: 146_892, pruneAt: 100_000 });
+	});
+
+	it("uses the global soft ceiling when the model has no override", () => {
+		const model = {} as Parameters<typeof compactionLines>[2];
+		expect(
+			compactionLines(1_000_000, { enabled: true, reserveTokens: 16_384, softCeilingTokens: 300_000 }, model),
+		).toEqual({ effectiveWindow: 300_000, hardAt: 283_616, windowOpenAt: 226_892, pruneAt: 150_000 });
 	});
 });
 
@@ -497,6 +576,29 @@ describe("buildSessionContext", () => {
 	});
 });
 
+describe("prepareCompaction with context windows", () => {
+	it("never summarizes entries from an earlier window", () => {
+		const oldUser = createMessageEntry(createUserMessage("old secret ".repeat(100)));
+		const oldAssistant = createMessageEntry(createAssistantMessage("old response ".repeat(100)));
+		const boundary = createContextWindowEntry("current task");
+		const currentUser = createMessageEntry(createUserMessage("current first ".repeat(100)));
+		const currentAssistant = createMessageEntry(createAssistantMessage("current response ".repeat(100)));
+		const recentUser = createMessageEntry(createUserMessage("recent request ".repeat(100)));
+		const recentAssistant = createMessageEntry(createAssistantMessage("recent response ".repeat(100)));
+		const settings: CompactionSettings = { ...DEFAULT_COMPACTION_SETTINGS, keepRecentTokens: 100 };
+
+		const preparation = prepareCompaction(
+			[oldUser, oldAssistant, boundary, currentUser, currentAssistant, recentUser, recentAssistant],
+			settings,
+		);
+
+		expect(preparation).toBeDefined();
+		const summarizedText = extractText(preparation!.messagesToSummarize);
+		expect(summarizedText).toContain("current first");
+		expect(summarizedText).not.toContain("old secret");
+	});
+});
+
 describe("prepareCompaction", () => {
 	it("does not treat system messages as conversation history", () => {
 		const system = createMessageEntry({
@@ -517,6 +619,57 @@ describe("prepareCompaction", () => {
 		expect(preparation?.isSplitTurn).toBe(true);
 		expect(preparation?.messagesToSummarize).toEqual([]);
 		expect(preparation?.turnPrefixMessages).toEqual([user.message]);
+	});
+
+	it("splits a turn at the assistant tool call before oversized trailing tool results", () => {
+		// Two turns on a projection that starts with the replayed system prompt: the first turn's
+		// tool results exceed the recent budget by themselves, so the cut lands inside that turn,
+		// on an assistant tool call, and the turn prefix before it is summarized.
+		const system = createMessageEntry({
+			role: "system",
+			content: "",
+			sections: { preamble: "p".repeat(2000) },
+			timestamp: Date.now(),
+		});
+		const user1 = createMessageEntry(createUserMessage("read the three files"));
+		const toolTurn = (index: number) => {
+			const call = createMessageEntry({
+				...createAssistantMessage(""),
+				content: [{ type: "toolCall", id: `call-${index}`, name: "read", arguments: { path: `f${index}` } }],
+				stopReason: "toolUse",
+			});
+			const result = createMessageEntry({
+				role: "toolResult",
+				toolCallId: `call-${index}`,
+				toolName: "read",
+				content: [{ type: "text", text: "x".repeat(3000) }],
+				isError: false,
+				timestamp: Date.now(),
+			});
+			return [call, result];
+		};
+		const [call1, result1] = toolTurn(1);
+		const [call2, result2] = toolTurn(2);
+		const [call3, result3] = toolTurn(3);
+		const assistant1 = createMessageEntry(createAssistantMessage("read them all"));
+		const user2 = createMessageEntry(createUserMessage("reply ready"));
+		const assistant2 = createMessageEntry(createAssistantMessage("ready"));
+		const entries = [system, user1, call1, result1, call2, result2, call3, result3, assistant1, user2, assistant2];
+
+		const preparation = prepareCompaction(entries, { ...DEFAULT_COMPACTION_SETTINGS, keepRecentTokens: 1500 });
+
+		// The budget overflows on the second result; the cut lands on the tool call after it.
+		expect(preparation).toBeDefined();
+		expect(preparation?.isSplitTurn).toBe(true);
+		expect(preparation?.firstKeptEntryId).toBe(call3.id);
+		expect(preparation?.messagesToSummarize).toEqual([]);
+		expect(preparation?.turnPrefixMessages.map((message) => message.role)).toEqual([
+			"user",
+			"assistant",
+			"toolResult",
+			"assistant",
+			"toolResult",
+		]);
 	});
 });
 
@@ -564,6 +717,122 @@ describe("prepareCompaction with previous compaction", () => {
 	});
 });
 
+describe("context-aware pinned compaction", () => {
+	const settings: CompactionSettings = {
+		...DEFAULT_COMPACTION_SETTINGS,
+		keepRecentTokens: 1,
+	};
+
+	it("collects the first user request and checkpoint keep items, excluding the request from summary input", () => {
+		withTuiMode("1", () => {
+			const firstUser = createMessageEntry(createUserMessage("preserve this request exactly"));
+			const firstAssistant = createMessageEntry(createAssistantMessage("first response"));
+			const checkpoint = createCustomMessageEntry("checkpoint notes", "checkpoint", { keep: ["src/file.ts"] });
+			const laterUser = createMessageEntry(createUserMessage("a later request"));
+			const laterAssistant = createMessageEntry(createAssistantMessage("a later response"));
+
+			const preparation = prepareCompaction(
+				[firstUser, firstAssistant, checkpoint, laterUser, laterAssistant],
+				settings,
+			);
+
+			expect(preparation).toBeDefined();
+			expect(preparation?.pinned).toEqual(["preserve this request exactly", "src/file.ts"]);
+			expect(extractText(preparation?.messagesToSummarize ?? [])).not.toContain("preserve this request exactly");
+		});
+	});
+
+	it("carries previous pinned values forward in order without duplicates", () => {
+		withTuiMode("1", () => {
+			const firstUser = createMessageEntry(createUserMessage("original request"));
+			const firstAssistant = createMessageEntry(createAssistantMessage("first response"));
+			const keptUser = createMessageEntry(createUserMessage("kept request"));
+			const previous = createCompactionEntry("summary", keptUser.id, ["existing", "original request"]);
+			const laterUser = createMessageEntry(createUserMessage("later request"));
+			const laterAssistant = createMessageEntry(createAssistantMessage("later response"));
+
+			const preparation = prepareCompaction(
+				[firstUser, firstAssistant, keptUser, previous, laterUser, laterAssistant],
+				settings,
+			);
+
+			expect(preparation?.pinned).toEqual(["existing", "original request"]);
+		});
+	});
+
+	it("uses checkpoint notes as the previous summary seed", () => {
+		withTuiMode("1", () => {
+			const firstUser = createMessageEntry(createUserMessage("original request"));
+			const firstAssistant = createMessageEntry(createAssistantMessage("first response"));
+			const checkpoint = createCustomMessageEntry("fresh checkpoint notes", "checkpoint");
+			const laterUser = createMessageEntry(createUserMessage("later request"));
+			const laterAssistant = createMessageEntry(createAssistantMessage("later response"));
+
+			const preparation = prepareCompaction(
+				[firstUser, firstAssistant, checkpoint, laterUser, laterAssistant],
+				settings,
+			);
+
+			expect(preparation?.previousSummary).toBe("fresh checkpoint notes");
+		});
+	});
+
+	it("does not let a checkpoint kept by the previous compaction override its newer summary", () => {
+		const firstUser = createMessageEntry(createUserMessage("original request"));
+		const firstAssistant = createMessageEntry(createAssistantMessage("first response"));
+		const keptUser = createMessageEntry(createUserMessage("kept request"));
+		const checkpoint = createCustomMessageEntry("stale checkpoint notes", "checkpoint");
+		const keptAssistant = createMessageEntry(createAssistantMessage("kept response"));
+		const previous = createCompactionEntry("newer summary", keptUser.id);
+		const laterUser = createMessageEntry(createUserMessage("later request"));
+		const laterAssistant = createMessageEntry(createAssistantMessage("later response"));
+
+		const preparation = prepareCompaction(
+			[firstUser, firstAssistant, keptUser, checkpoint, keptAssistant, previous, laterUser, laterAssistant],
+			settings,
+		);
+
+		expect(preparation?.previousSummary).toBe("newer summary");
+	});
+
+	it("does not collect pinned context when the feature flag is off", () => {
+		withTuiMode(undefined, () => {
+			const firstUser = createMessageEntry(createUserMessage("legacy request"));
+			const firstAssistant = createMessageEntry(createAssistantMessage("first response"));
+			const laterUser = createMessageEntry(createUserMessage("later request"));
+			const laterAssistant = createMessageEntry(createAssistantMessage("later response"));
+
+			const preparation = prepareCompaction([firstUser, firstAssistant, laterUser, laterAssistant], settings);
+
+			expect(preparation?.pinned).toBeUndefined();
+			expect(extractText(preparation?.messagesToSummarize ?? [])).toContain("legacy request");
+		});
+	});
+
+	it("renders pinned context immediately after a compaction summary", () => {
+		const entry: CompactionEntry = {
+			type: "compaction",
+			id: "compaction-id",
+			parentId: null,
+			timestamp: new Date().toISOString(),
+			summary: "summary",
+			firstKeptEntryId: "kept-id",
+			tokensBefore: 100,
+			pinned: ["first constraint", "src/file.ts"],
+		};
+
+		const messages = sessionEntryToContextMessages(entry);
+		expect(messages).toHaveLength(2);
+		expect(messages[0]?.role).toBe("compactionSummary");
+		expect(messages[1]).toMatchObject({
+			role: "custom",
+			customType: "pinned-context",
+			display: false,
+			content: "<pinned-context>\nfirst constraint\n---\nsrc/file.ts\n</pinned-context>",
+		});
+	});
+});
+
 // ============================================================================
 // Integration tests with real session data
 // ============================================================================
@@ -579,7 +848,7 @@ describe("Large session fixture", () => {
 
 	it("should find cut point in large session", () => {
 		const entries = loadLargeSessionEntries();
-		const result = findCutPoint(entries, 0, entries.length, DEFAULT_COMPACTION_SETTINGS.keepRecentTokens);
+		const result = findCutPoint(entries, 0, entries.length, DEFAULT_COMPACTION_SETTINGS.keepRecentTokens ?? 20_000);
 
 		// Cut point should be at a message entry (user or assistant)
 		expect(entries[result.firstKeptEntryIndex].type).toBe("message");

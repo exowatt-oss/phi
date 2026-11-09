@@ -18,8 +18,13 @@ function createSession(options: {
 	sessionName: string;
 	modelId?: string;
 	provider?: string;
+	api?: string;
+	baseUrl?: string;
 	reasoning?: boolean;
 	thinkingLevel?: string;
+	serviceTier?: "default" | "flex" | "fast" | "ultrafast";
+	fastTierKind?: "anthropic" | "openai";
+	lastResponseSpeed?: "fast" | "standard";
 	usage?: AssistantUsage;
 	branchUsage?: AssistantUsage;
 	compactionUsage?: AssistantUsage;
@@ -69,6 +74,8 @@ function createSession(options: {
 			model: {
 				id: options.modelId ?? "test-model",
 				provider: options.provider ?? "test",
+				api: options.api,
+				baseUrl: options.baseUrl,
 				contextWindow: 200_000,
 				reasoning: options.reasoning ?? false,
 			},
@@ -87,6 +94,9 @@ function createSession(options: {
 		modelRuntime: {
 			isUsingSubscription: () => options.usingSubscription ?? false,
 		},
+		serviceTier: options.serviceTier ?? "default",
+		fastTierKind: options.fastTierKind,
+		lastResponseSpeed: options.lastResponseSpeed,
 	};
 
 	return session as unknown as AgentSession;
@@ -163,13 +173,14 @@ describe("FooterComponent width handling", () => {
 			modelId: "auto",
 			reasoning: true,
 			thinkingLevel: "high",
-			routedModel: { model: { id: "gpt-5.6-luna" }, thinkingLevel: "medium" },
+			routedModel: { model: { id: "example-medium" }, thinkingLevel: "medium" },
 		});
 		const footer = new FooterComponent(session, createFooterData(1));
 
 		const statsLine = stripAnsi(footer.render(120)[1]);
 
-		expect(statsLine).toContain("auto \u2022 high \u2192 gpt-5.6-luna \u2022 medium");
+		// phi: the footer always shows the service tier between the model and the thinking level.
+		expect(statsLine).toContain("auto \u2022 default \u2022 high \u2192 example-medium \u2022 medium");
 	});
 
 	it("includes summary and tool result usage in the total cost", () => {
@@ -235,6 +246,82 @@ describe("FooterComponent width handling", () => {
 
 		const statsLine = stripAnsi(footer.render(120)[1]);
 		expect(statsLine).toContain("CH25.0%");
+	});
+
+	it("shows service tier between model and thinking level", () => {
+		const session = createSession({
+			sessionName: "",
+			modelId: "example-medium",
+			reasoning: true,
+			thinkingLevel: "max",
+			serviceTier: "fast",
+			fastTierKind: "openai",
+		});
+		const footer = new FooterComponent(session, createFooterData(1));
+
+		expect(stripAnsi(footer.render(120)[1])).toContain("example-medium • ↯ fast • max");
+	});
+
+	it("shows the default tier plainly", () => {
+		const session = createSession({ sessionName: "", modelId: "claude-opus-5-5" });
+		const footer = new FooterComponent(session, createFooterData(1));
+
+		expect(stripAnsi(footer.render(120)[1])).toContain("claude-opus-5-5 • default");
+	});
+
+	it("marks fast mode that the last response downgraded to standard speed", () => {
+		const session = createSession({
+			sessionName: "",
+			modelId: "claude-opus-5-5",
+			serviceTier: "fast",
+			fastTierKind: "anthropic",
+			lastResponseSpeed: "standard",
+		});
+		const footer = new FooterComponent(session, createFooterData(1));
+
+		expect(stripAnsi(footer.render(120)[1])).toContain("claude-opus-5-5 • ↯ fast (standard)");
+	});
+
+	it("marks fast mode as n/a on a model without a fast tier", () => {
+		const session = createSession({ sessionName: "", modelId: "claude-sonnet-5", serviceTier: "fast" });
+		const footer = new FooterComponent(session, createFooterData(1));
+
+		expect(stripAnsi(footer.render(120)[1])).toContain("claude-sonnet-5 • fast (n/a)");
+	});
+
+	it("marks fast mode as unsupported on an Amazon Bedrock model without a fast tier", () => {
+		const session = createSession({
+			sessionName: "",
+			modelId: "openai.gpt-6-sol",
+			api: "openai-responses",
+			baseUrl: "https://bedrock-mantle.us-east-1.api.aws/openai/v1",
+			serviceTier: "fast",
+		});
+		const footer = new FooterComponent(session, createFooterData(1));
+
+		expect(stripAnsi(footer.render(120)[1])).toContain("openai.gpt-6-sol • fast (unsupported)");
+	});
+
+	it("shows explicit ultrafast as fast only where the model is known to serve it", () => {
+		const bedrock = { api: "openai-responses", baseUrl: "https://bedrock-mantle.us-east-1.api.aws/openai/v1" };
+		const astra = createSession({
+			sessionName: "",
+			modelId: "openai.gpt-6-astra",
+			...bedrock,
+			serviceTier: "ultrafast",
+		});
+		expect(stripAnsi(new FooterComponent(astra, createFooterData(1)).render(120)[1])).toContain(
+			"openai.gpt-6-astra • ↯ ultrafast",
+		);
+		const bedrockModel = createSession({
+			sessionName: "",
+			modelId: "openai.gpt-6-sol",
+			...bedrock,
+			serviceTier: "ultrafast",
+		});
+		const solLine = stripAnsi(new FooterComponent(bedrockModel, createFooterData(1)).render(120)[1]);
+		expect(solLine).toContain("openai.gpt-6-sol • ultrafast");
+		expect(solLine).not.toContain("↯");
 	});
 
 	it("marks Kimi Coding costs as subscription estimates", () => {

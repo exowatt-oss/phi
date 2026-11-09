@@ -30,9 +30,23 @@ describe("Fireworks models", () => {
 		expect(model.input).toEqual(["text", "image"]);
 	});
 
+	it("registers the current Fire Pass fast router model", () => {
+		// Fireworks' current Fire Pass docs no longer list the former Kimi K2.5 `-turbo` router.
+		// They document the pinned Kimi K3 `-fast` router instead.
+		const model = getModel("fireworks", "accounts/fireworks/routers/kimi-k3-fast");
+
+		expect(model).toBeDefined();
+		expect(model.api).toBe("openai-completions");
+		expect(model.baseUrl).toBe("https://api.fireworks.ai/inference/v1");
+		expect(model.input).toEqual(["text", "image"]);
+	});
+
 	it("aligns GLM 5.3 Fast with GLM 5.3's OpenAI-compatible config", () => {
 		const base = getModel("fireworks", "accounts/fireworks/models/glm-5p3");
 		const fast = getModel("fireworks", "accounts/fireworks/routers/glm-5p3-fast");
+
+		expect(base.api).toBe("openai-completions");
+		expect(base.baseUrl).toBe("https://api.fireworks.ai/inference/v1");
 
 		expect(fast.api).toBe(base.api);
 		expect(fast.baseUrl).toBe(base.baseUrl);
@@ -41,9 +55,12 @@ describe("Fireworks models", () => {
 	});
 
 	it.each(["accounts/fireworks/models/glm-5p3", "accounts/fireworks/routers/glm-5p3-fast"] as const)(
-		"omits unsupported long cache retention for %s",
+		"keeps session affinity and omits unsupported long cache retention for %s",
 		async (modelId) => {
 			const model = getModel("fireworks", modelId);
+			expect(model.compat?.sendSessionAffinityHeaders).toBe(true);
+			expect(model.compat?.supportsLongCacheRetention).toBe(false);
+
 			let payload: Record<string, unknown> | undefined;
 			const response = streamSimple(
 				model,

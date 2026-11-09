@@ -14,6 +14,7 @@ if (typeof process !== "undefined" && (process.versions?.node || process.version
 }
 
 import { getProviderEnvValue } from "../../utils/provider-env.ts";
+import { OAuthTokenError } from "../errors.ts";
 import type { LoginOptions, OAuthAuth, OAuthCredential, ProviderAuthInteraction } from "../types.ts";
 import { startOAuthCallbackServer, waitForCallbackOrManualInput } from "./callback-server.ts";
 import { pollOAuthDeviceCodeFlow } from "./device-code.ts";
@@ -121,8 +122,14 @@ async function fetchWithLoginCancellation(input: string, init: RequestInit): Pro
 
 async function readTokenResponse(response: Response, operation: TokenOperation): Promise<OAuthToken> {
 	if (!response.ok) {
-		const text = await response.text().catch(() => "");
-		throw new Error(`OpenAI Codex token ${operation} failed (${response.status}): ${text || response.statusText}`);
+		let code = "token_endpoint_error";
+		try {
+			const parsed = JSON.parse(await response.text()) as { error?: unknown };
+			if (parsed?.error === "invalid_grant") code = "invalid_grant";
+		} catch {
+			// Token endpoint bodies are secret-bearing and never retained.
+		}
+		throw new OAuthTokenError(code, response.status, TOKEN_URL);
 	}
 
 	const rawJson = await response.json();
@@ -132,7 +139,7 @@ async function readTokenResponse(response: Response, operation: TokenOperation):
 		expires_in?: number;
 	} | null;
 	if (!json?.access_token || !json.refresh_token || typeof json.expires_in !== "number") {
-		throw new Error(`OpenAI Codex token ${operation} response missing fields: ${JSON.stringify(json)}`);
+		throw new Error(`OpenAI Codex token ${operation} response missing required fields`);
 	}
 
 	return {

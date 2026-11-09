@@ -9,11 +9,13 @@
  */
 
 import type {
+	AgentContext,
 	AgentMessage,
 	AgentTool,
 	AgentToolCallOutcome,
 	AgentToolResult,
 	AgentToolUpdateCallback,
+	NewContextRequest,
 	ThinkingLevel,
 	ToolExecutionMode,
 } from "@earendil-works/pi-agent-core";
@@ -58,7 +60,12 @@ import type { Static, TSchema } from "typebox";
 import type { Theme } from "../../modes/interactive/theme/theme.ts";
 import type { BashResult } from "../bash-executor.ts";
 import type { CacheWarmingDecisionEvent, CacheWarmingDecisionEventResult } from "../cache-warmer.ts";
-import type { CompactionPreparation, CompactionResult } from "../compaction/index.ts";
+import type {
+	CompactionPreparation,
+	CompactionResult,
+	CompactionSettings,
+	CompactionSettingsWithLines,
+} from "../compaction/index.ts";
 import type { EventBus } from "../event-bus.ts";
 import type { ExecOptions, ExecResult } from "../exec.ts";
 import type { ReadonlyFooterDataProvider } from "../footer-data-provider.ts";
@@ -103,7 +110,7 @@ import type { ModelRoute, ModelRouteRequest, VirtualModelDefinition } from "../v
 
 export type { ExecOptions, ExecResult } from "../exec.ts";
 export type { BuildSystemPromptOptions, NormalizedBuildSystemPromptOptions } from "../system-prompt.ts";
-export type { AgentToolResult, AgentToolUpdateCallback, ToolExecutionMode };
+export type { AgentToolResult, AgentToolUpdateCallback, NewContextRequest, ToolExecutionMode };
 export type { AppKeybinding, KeybindingsManager } from "../keybindings.ts";
 
 // ============================================================================
@@ -307,8 +314,56 @@ export interface ContextUsage {
 	/** Estimated context tokens, or null if unknown (e.g. right after compaction, before next LLM response). */
 	tokens: number | null;
 	contextWindow: number;
+	/** Effective context window after applying the active model/settings soft ceiling. */
+	effectiveWindow?: number;
 	/** Context usage as percentage of context window, or null if tokens is unknown. */
 	percent: number | null;
+}
+
+/** One category of the context breakdown (estimated). */
+export interface ContextBreakdownCategory {
+	/** Estimated tokens attributed to this category. */
+	tokens: number;
+	/** Item count (e.g. number of tools, or messages of a role), when meaningful. */
+	count?: number;
+}
+
+/**
+ * A category breakdown of what currently fills the context window: the fixed
+ * overhead (system prompt, tool definitions) plus the conversation, bucketed by
+ * message role. `total`/`percent` come from provider usage (authoritative);
+ * the per-category numbers are heuristic estimates and need not sum to `total`.
+ */
+export interface ContextBreakdown {
+	/** Authoritative total context tokens from provider usage, or null if unknown (e.g. right after compaction). */
+	total: number | null;
+	contextWindow: number;
+	/** Total as a percentage of the context window, or null when total is unknown. */
+	percent: number | null;
+	/** Sum of the estimated categories below. Heuristic — compare against `total` to gauge estimate drift. */
+	estimatedTotal: number;
+	/** Fixed per-request system prompt. */
+	systemPrompt: ContextBreakdownCategory;
+	/** Tool definitions (names + descriptions + parameter schemas) sent every request. */
+	tools: ContextBreakdownCategory;
+	/** The conversation, bucketed by message role (user, assistant, toolResult, ...). */
+	messages: {
+		total: number;
+		byRole: Record<string, ContextBreakdownCategory>;
+	};
+	/** Automatic-compaction configuration, so callers can see how much headroom remains. */
+	compaction: {
+		enabled: boolean;
+		reserveTokens: number;
+		/** Effective context window after applying the active model/settings soft ceiling. */
+		effectiveWindow?: number;
+		/** Background compaction opens at this threshold. */
+		windowOpenAt?: number;
+		/** Active model soft ceiling, or the global setting when no model override is set. */
+		softCeilingTokens?: number;
+		/** Auto-compaction fires once context exceeds the effective window minus reserveTokens; null when disabled. */
+		threshold: number | null;
+	};
 }
 
 export interface CompactOptions {
@@ -321,6 +376,20 @@ export interface CompactOptions {
  * Context passed to extension event handlers.
  */
 export type ExtensionMode = "tui" | "rpc" | "json" | "print";
+
+export interface SubagentSpawnEvent {
+	type: "subagent_spawn";
+	runId: string;
+	handle: string;
+	name: string;
+	toolCallId: string;
+	env: Record<string, string>;
+}
+
+export type SubagentSpawnHook = (
+	event: SubagentSpawnEvent,
+	ctx: ExtensionContext,
+) => Promise<Record<string, string> | undefined> | Record<string, string> | undefined;
 
 export interface ExtensionContext {
 	/** UI methods for user interaction */
@@ -358,10 +427,18 @@ export interface ExtensionContext {
 	shutdown(): void;
 	/** Get current context usage for the active model. */
 	getContextUsage(): ContextUsage | undefined;
+	/** Effective compaction settings as Pi resolved them, including the project-trust decision. */
+	getCompactionSettings(): CompactionSettingsWithLines;
+	/** Start a fresh model context while preserving the full session transcript. */
+	newContext(options?: NewContextRequest): void;
 	/** Trigger compaction without awaiting completion. */
 	compact(options?: CompactOptions): void;
 	/** Get the current effective system prompt. */
 	getSystemPrompt(): string;
+	/** Get a category breakdown of current context usage (system prompt, tools, messages by role). */
+	getContextBreakdown(): ContextBreakdown | undefined;
+	/** Execute an isolated, tool-less model call without changing the session transcript. */
+	sideQuestion?(request: SideQuestionRequest): Promise<SideQuestionResult>;
 }
 
 /** Options for {@link ExtensionToolContext.executeTool}. */
@@ -441,7 +518,7 @@ export interface ExtensionCommandContext extends ExtensionContext {
  */
 export interface ReplacedSessionContext extends ExtensionCommandContext {
 	sendMessage<T = unknown>(
-		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details">,
+		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details" | "ephemeral">,
 		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
 	): Promise<void>;
 
@@ -455,12 +532,23 @@ export interface ReplacedSessionContext extends ExtensionCommandContext {
 // Tool Types
 // ============================================================================
 
+/** Collapsed rendering density a renderer must honor (`"full"` is resolved by the host into `"compact"` + expanded). */
+export type ToolCollapsedDisplay = "minimal" | "compact";
+
 /** Rendering options for tool results */
 export interface ToolRenderResultOptions {
 	/** Whether the result view is expanded */
 	expanded: boolean;
+	/** Collapsed density: "minimal" shows intent+summary only; "compact" shows budgeted previews. */
+	display: ToolCollapsedDisplay;
 	/** Whether this is a partial/streaming result */
 	isPartial: boolean;
+	/**
+	 * Output lines a renderer should show while collapsed (`toolOutputLines`).
+	 * Undefined when the host does not supply one, in which case a renderer keeps
+	 * its own default. Ignored when `expanded` is true.
+	 */
+	collapsedLines?: number;
 }
 
 /** Context passed to tool renderers. */
@@ -485,6 +573,8 @@ export interface ToolRenderContext<TState = any, TArgs = any> {
 	isPartial: boolean;
 	/** Whether the result view is expanded. */
 	expanded: boolean;
+	/** Collapsed density: "minimal" shows intent+summary only; "compact" shows budgeted previews. */
+	display: ToolCollapsedDisplay;
 	/** Whether inline images are currently shown in the TUI. */
 	showImages: boolean;
 	/** Whether the current result is an error. */
@@ -581,6 +671,8 @@ export interface ToolDefinition<TParams extends TSchema = TSchema, TDetails = un
 	name: string;
 	/** Human-readable label for UI */
 	label: string;
+	/** Whether a missing-tool resolver may activate this tool from a transcript call. */
+	autoActivateOnCall?: boolean | ((context: AgentContext) => boolean);
 	/** Description for LLM */
 	description: string;
 	/** Optional one-line snippet for the Available tools section in the default system prompt. Custom tools are omitted from that section when this is not provided. */
@@ -781,6 +873,22 @@ export interface SessionBeforeForkEvent {
 	position: "before" | "at";
 }
 
+/**
+ * Fired before automatic (threshold or overflow) compaction, ahead of summary preparation and
+ * summarization auth. Manual /compact does not fire it. Return `newContext` to start a fresh
+ * context window instead; `session_before_compact` is then not fired for that trigger.
+ */
+export interface SessionBeforeAutoCompactEvent {
+	type: "session_before_auto_compact";
+	branchEntries: SessionEntry[];
+	/** Inputs included in the pending provider request but not yet persisted in branchEntries. */
+	pendingMessages: AgentMessage[];
+	reason: "threshold" | "overflow";
+	/** True when the aborted turn is retried after this compaction (overflow recovery) */
+	willRetry: boolean;
+	signal: AbortSignal;
+}
+
 /** Fired before context compaction (can be cancelled or customized) */
 export interface SessionBeforeCompactEvent {
 	type: "session_before_compact";
@@ -864,6 +972,7 @@ export type SessionEvent =
 	| SessionInfoChangedEvent
 	| SessionBeforeSwitchEvent
 	| SessionBeforeForkEvent
+	| SessionBeforeAutoCompactEvent
 	| SessionBeforeCompactEvent
 	| SessionCompactEvent
 	| SessionCompactFailedEvent
@@ -1434,7 +1543,8 @@ export type ExtensionEvent =
 	| UserBashEvent
 	| InputEvent
 	| ToolCallEvent
-	| ToolResultEvent;
+	| ToolResultEvent
+	| SubagentSpawnEvent;
 
 // ============================================================================
 // Event Results
@@ -1494,7 +1604,7 @@ export interface MessageEndEventResult {
 }
 
 export interface BeforeAgentStartEventResult {
-	message?: Pick<CustomMessage, "customType" | "content" | "display" | "details">;
+	message?: Pick<CustomMessage, "customType" | "content" | "display" | "details" | "ephemeral">;
 	/** Replace the complete system prompt for this turn. Later handlers observe this exact override. */
 	systemPrompt?: string;
 }
@@ -1508,9 +1618,18 @@ export interface SessionBeforeForkResult {
 	skipConversationRestore?: boolean;
 }
 
+export interface SessionBeforeAutoCompactResult {
+	/** Start a fresh context window instead of compacting. */
+	newContext?: NewContextRequest;
+}
+
 export interface SessionBeforeCompactResult {
 	cancel?: boolean;
 	compaction?: CompactionResult;
+	/** Constraints or other context to carry verbatim through the compaction. */
+	pinned?: string[];
+	/** Replace automatic summary compaction with a fresh context window. */
+	newContext?: NewContextRequest;
 }
 
 export interface SessionBeforeTreeResult {
@@ -1570,6 +1689,12 @@ export interface RegisteredCommand {
 	name: string;
 	sourceInfo: SourceInfo;
 	description?: string;
+	/**
+	 * Whether trailing text is arguments to this command. Defaults to true.
+	 * When false, "/cmd rest of line" runs the handler with empty args and the
+	 * remainder is processed as a normal prompt instead of being swallowed.
+	 */
+	acceptsArgs?: boolean;
 	getArgumentCompletions?: (argumentPrefix: string) => AutocompleteItem[] | null | Promise<AutocompleteItem[] | null>;
 	handler: (args: string, ctx: ExtensionCommandContext) => Promise<void>;
 }
@@ -1609,6 +1734,10 @@ export interface ExtensionAPI {
 		event: "session_before_fork",
 		handler: ExtensionHandler<SessionBeforeForkEvent, SessionBeforeForkResult>,
 	): () => void;
+	on(
+		event: "session_before_auto_compact",
+		handler: ExtensionHandler<SessionBeforeAutoCompactEvent, SessionBeforeAutoCompactResult>,
+	): void;
 	on(
 		event: "session_before_compact",
 		handler: ExtensionHandler<SessionBeforeCompactEvent, SessionBeforeCompactResult>,
@@ -1662,6 +1791,8 @@ export interface ExtensionAPI {
 	on(event: "tool_result", handler: ExtensionHandler<ToolResultEvent, ToolResultEventResult>): () => void;
 	on(event: "user_bash", handler: ExtensionHandler<UserBashEvent, UserBashEventResult>): () => void;
 	on(event: "input", handler: ExtensionHandler<InputEvent, InputEventResult>): () => void;
+	onSubagentSpawn(handler: SubagentSpawnHook): void;
+	emitSubagentSpawn(event: SubagentSpawnEvent): Promise<Record<string, string>>;
 
 	// =========================================================================
 	// Tool Registration
@@ -1671,6 +1802,18 @@ export interface ExtensionAPI {
 	registerTool<TParams extends TSchema = TSchema, TDetails = unknown, TState = any>(
 		tool: ToolDefinition<TParams, TDetails, TState>,
 	): void;
+
+	/**
+	 * Register several tools at once, with one tool-registry refresh instead of one per
+	 * tool. Use it for bulk registration such as an MCP server catalogue: each refresh
+	 * rebuilds every tool wrapper and the system prompt, so registering N tools one at a
+	 * time costs O(N^2).
+	 *
+	 * Entries are not inferred from this call the way `registerTool()` infers one
+	 * definition: build each with `defineTool()` so its `execute` parameters, result
+	 * details and render state keep their own schema-derived types.
+	 */
+	registerTools(tools: readonly ToolDefinition<any, any, any>[]): void;
 
 	// =========================================================================
 	// Command, Shortcut, Flag Registration
@@ -1729,7 +1872,7 @@ export interface ExtensionAPI {
 
 	/** Send a custom message to the session. */
 	sendMessage<T = unknown>(
-		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details">,
+		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details" | "ephemeral">,
 		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
 	): void;
 
@@ -2101,7 +2244,7 @@ export interface ExtensionShortcut {
 type HandlerFn = (...args: unknown[]) => Promise<unknown>;
 
 export type SendMessageHandler = <T = unknown>(
-	message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details">,
+	message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details" | "ephemeral">,
 	options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
 ) => void;
 
@@ -2152,6 +2295,7 @@ export type SetLabelHandler = (entryId: string, label: string | undefined) => vo
  * Contains flag values (defaults set during registration, CLI values set after).
  */
 export interface ExtensionRuntimeState {
+	subagentSpawnHooks: SubagentSpawnHook[];
 	flagValues: Map<string, boolean | string>;
 	/** Legacy provider-config registrations queued during extension loading, processed when runner binds. */
 	pendingProviderRegistrations: Array<{ name: string; config: ProviderConfig; extensionPath: string }>;
@@ -2187,6 +2331,7 @@ export interface ExtensionRuntimeState {
  * Provided to runner.initialize(), copied into the shared runtime.
  */
 export interface ExtensionActions {
+	emitSubagentSpawn?: (event: SubagentSpawnEvent) => Promise<Record<string, string>>;
 	sendMessage: SendMessageHandler;
 	sendUserMessage: SendUserMessageHandler;
 	appendEntry: AppendEntryHandler;
@@ -2204,6 +2349,19 @@ export interface ExtensionActions {
 	setThinkingLevel: SetThinkingLevelHandler;
 }
 
+export interface SideQuestionRequest {
+	messages: Message[];
+	systemPrompt?: string;
+	model?: string | Model<any>;
+	thinkingLevel?: ThinkingLevel;
+	signal?: AbortSignal;
+}
+
+export interface SideQuestionResult {
+	answer: string;
+	usage: Usage | undefined;
+}
+
 /**
  * Actions for ExtensionContext (ctx.* in event handlers).
  * Required by all modes.
@@ -2218,8 +2376,12 @@ export interface ExtensionContextActions {
 	hasPendingMessages: () => boolean;
 	shutdown: () => void;
 	getContextUsage: () => ContextUsage | undefined;
+	getCompactionSettings: () => CompactionSettings;
+	newContext?: (options?: NewContextRequest) => void;
 	compact: (options?: CompactOptions) => void;
 	getSystemPrompt: () => string;
+	getContextBreakdown?: () => ContextBreakdown | undefined;
+	sideQuestion?: (request: SideQuestionRequest) => Promise<SideQuestionResult>;
 	getSystemPromptOptions?: () => BuildSystemPromptOptions;
 	/** Backs `ExtensionToolContext.executeTool()`. Without it, nested calls fail. */
 	executeTool?: (

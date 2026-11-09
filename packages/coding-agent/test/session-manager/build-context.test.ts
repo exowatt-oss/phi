@@ -4,10 +4,12 @@ import {
 	buildContextEntries,
 	buildSessionContext,
 	type CompactionEntry,
+	type ContextWindowEntry,
 	type CustomEntry,
 	type ModelChangeEntry,
 	type SessionEntry,
 	type SessionMessageEntry,
+	sessionEntryToDisplayMessages,
 	type ThinkingLevelChangeEntry,
 } from "../../src/core/session-manager.ts";
 
@@ -47,6 +49,17 @@ function compaction(id: string, parentId: string | null, summary: string, firstK
 		summary,
 		firstKeptEntryId,
 		tokensBefore: 1000,
+	};
+}
+
+function contextWindow(id: string, parentId: string | null, handoff?: string): ContextWindowEntry {
+	return {
+		type: "context_window",
+		id,
+		parentId,
+		timestamp: "2025-01-01T00:00:00Z",
+		handoff,
+		tokensBefore: 900,
 	};
 }
 
@@ -92,6 +105,31 @@ describe("buildSessionContext", () => {
 			const ctx = buildSessionContext(entries);
 			expect(ctx.messages).toHaveLength(4);
 			expect(ctx.messages.map((m) => m.role)).toEqual(["user", "assistant", "user", "assistant"]);
+		});
+
+		it("does not resume a persisted errored assistant with an orphan tool call", () => {
+			const partial = msg("2", "1", "assistant", "");
+			if (partial.message.role !== "assistant") throw new Error("Expected assistant fixture");
+			partial.message = {
+				...partial.message,
+				content: [{ type: "toolCall", id: "partial-tool", name: "read", arguments: {} }],
+				stopReason: "error",
+				errorMessage: "StreamIdleTimeoutError: timed out",
+			};
+			const ctx = buildSessionContext([
+				msg("1", null, "user", "inspect this"),
+				partial,
+				msg("3", "2", "user", "resume"),
+			]);
+
+			expect(ctx.messages.map((message) => message.role)).toEqual(["user", "user"]);
+			expect(
+				ctx.messages.some(
+					(message) =>
+						message.role === "assistant" && message.content.some((content) => content.type === "toolCall"),
+				),
+			).toBe(false);
+			expect(sessionEntryToDisplayMessages(partial)).toEqual([partial.message]);
 		});
 
 		it("tracks thinking level changes", () => {
@@ -205,6 +243,58 @@ describe("buildSessionContext", () => {
 			const ctx = buildSessionContext(entries);
 			expect(ctx.thinkingLevel).toBe("high");
 			expect(ctx.messages.map((message) => message.role)).toEqual(["compactionSummary", "user"]);
+		});
+	});
+
+	describe("with context windows", () => {
+		it("drops all earlier messages and keeps the handoff", () => {
+			const entries: SessionEntry[] = [
+				msg("1", null, "user", "old request"),
+				msg("2", "1", "assistant", "old response"),
+				contextWindow("3", "2", "Continue the migration"),
+				msg("4", "3", "assistant", "new response"),
+			];
+
+			expect(buildContextEntries(entries).map((entry) => entry.id)).toEqual(["3", "4"]);
+			const ctx = buildSessionContext(entries);
+			expect(ctx.messages.map((message) => message.role)).toEqual(["custom", "assistant"]);
+			expect((ctx.messages[0] as any).content).toContain("Continue the migration");
+		});
+
+		it("only applies compaction entries from the current window", () => {
+			const entries: SessionEntry[] = [
+				msg("1", null, "user", "old request"),
+				msg("2", "1", "assistant", "old response"),
+				compaction("3", "2", "Old summary", "1"),
+				contextWindow("4", "3"),
+				msg("5", "4", "user", "current request"),
+				msg("6", "5", "assistant", "current response"),
+				compaction("7", "6", "Current summary", "5"),
+			];
+
+			const ctx = buildSessionContext(entries);
+			expect(ctx.messages).toHaveLength(3);
+			expect((ctx.messages[0] as any).summary).toBe("Current summary");
+			expect((ctx.messages[1] as any).content).toBe("current request");
+		});
+
+		it("is branch-local while retaining model and thinking settings", () => {
+			const entries: SessionEntry[] = [
+				modelChange("1", null, "openai", "gpt-test"),
+				thinkingLevel("2", "1", "high"),
+				msg("3", "2", "user", "old request"),
+				contextWindow("4", "3"),
+				msg("5", "4", "user", "new request"),
+				msg("6", "3", "user", "sibling request"),
+			];
+
+			const current = buildSessionContext(entries, "5");
+			expect(current.messages.map((message) => message.role)).toEqual(["custom", "user"]);
+			expect(current.thinkingLevel).toBe("high");
+			expect(current.model).toEqual({ provider: "openai", modelId: "gpt-test" });
+
+			const sibling = buildSessionContext(entries, "6");
+			expect(sibling.messages.map((message) => message.role)).toEqual(["user", "user"]);
 		});
 	});
 

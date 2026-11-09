@@ -1,6 +1,7 @@
 {
 	"name": "@earendil-works/pi-env",
-	"version": "1.4.0",
+	"version": "1.4.0-exo.15",
+	"private": true,
 	"description": "Remote execution environments for Pi Durable: a small daemon deployed over SSH and its ExecutionEnv client",
 	"type": "module",
 	"main": "./dist/index.js",
@@ -25,7 +26,7 @@
 		"clean": "shx rm -rf dist",
 		"build": "tsc -p tsconfig.build.json",
 		"build:daemon": "cargo build --manifest-path daemon/Cargo.toml --locked",
-		"test": "vitest --run",
+		"test": "node scripts/test.mjs",
 		"prepublishOnly": "npm run clean && npm run build"
 	},
 	"keywords": [
@@ -38,15 +39,17 @@
 	"license": "MIT",
 	"repository": {
 		"type": "git",
-		"url": "git+https://github.com/earendil-works/pi.git",
+		"url": "https://github.com/exowatt-oss/phi",
 		"directory": "packages/env"
 	},
+	"bugs": { "url": "https://github.com/exowatt-oss/phi/issues" },
+	"homepage": "https://github.com/exowatt-oss/phi",
 	"engines": {
 		"node": ">=22.19.0"
 	},
 	"dependencies": {
-		"@earendil-works/chord": "1.4.0",
-		"@earendil-works/pi-durable": "1.4.0"
+		"@earendil-works/chord": "1.4.0-exo.15",
+		"@earendil-works/pi-durable": "1.4.0-exo.15"
 	},
 	"devDependencies": {
 		"shx": "0.3.4",

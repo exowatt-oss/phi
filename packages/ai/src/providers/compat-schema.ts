@@ -201,6 +201,13 @@ export const OpenAICompletionsCompatSchema = Type.Object(
 				description: "Whether the provider supports reasoning_effort. Default: auto-detected from URL.",
 			}),
 		),
+		sendReasoningEffortOff: Type.Optional(
+			Type.Boolean({
+				description:
+					'Whether to send reasoning_effort with the thinkingLevelMap "off" value when thinking is off, instead of omitting the field. Set it only for a model whose own endpoint needs an explicit off value; a gateway that re-maps onto an upstream with a different vocabulary rejects it.',
+				default: false,
+			}),
+		),
 		supportsUsageInStreaming: Type.Optional(
 			Type.Boolean({
 				description:
@@ -396,6 +403,31 @@ export const OpenAIResponsesCompatSchema = Type.Object(
 				default: false,
 			}),
 		),
+		supportsExplicitPromptCacheBreakpoints: Type.Optional(
+			Type.Boolean({
+				description:
+					"Whether the model accepts OpenAI GPT-5.6+ explicit prompt cache breakpoints on input content. Default: follows supportsExplicitPromptCacheMode.",
+			}),
+		),
+		fastServiceTier: Type.Optional(
+			Type.String({
+				description:
+					'Wire service_tier sent when the session asks for the fast tier, and read back as fast. Default: "ultrafast" for GPT-6 Astra on Amazon Bedrock /openai/v1 endpoints; otherwise unset, so fast goes out as "fast".',
+			}),
+		),
+		fastServiceTierCostMultiplier: Type.Optional(
+			Type.Number({
+				exclusiveMinimum: 0,
+				description:
+					"Multiplier applied to every cost rate when a response is served at fastServiceTier. Default: 6 for Bedrock GPT-6 Astra UltraFast; 2 otherwise.",
+			}),
+		),
+		sortToolSchemaKeys: Type.Optional(
+			Type.Boolean({
+				description:
+					"Recursively sort the keys of tool JSON schemas before sending, so Amazon Bedrock renders the same prompt prefix before and after the first tool call. Default: true for Amazon Bedrock /openai/v1 endpoints, false otherwise.",
+			}),
+		),
 		supportsMidConvoEffort: Type.Optional(
 			Type.Boolean({
 				description:
@@ -494,6 +526,19 @@ export const AnthropicMessagesCompatSchema = Type.Object(
 				maxItems: 3,
 				description:
 					"Models Anthropic accepts for server-side refusal fallback, with local pricing metadata for returned fallback responses. When absent or empty, callers must omit fallbacks; Anthropic rejects the field for models with no permitted fallback targets.",
+			}),
+		),
+		supportsFastMode: Type.Optional(
+			Type.Boolean({
+				description:
+					'Whether the model accepts Anthropic fast mode (speed: "fast" with the fast-mode-2026-02-01 beta). When false, a fast service tier is ignored for this model. Default: true for first-party Claude Opus 5.5, Opus 5, and Opus 4.8; false otherwise.',
+			}),
+		),
+		fastModeCostMultiplier: Type.Optional(
+			Type.Number({
+				exclusiveMinimum: 0,
+				description:
+					'Multiplier applied to every cost rate when a response reports usage.speed "fast". Default: 2.',
 			}),
 		),
 	},

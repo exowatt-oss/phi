@@ -179,7 +179,8 @@ function withTrustFileLock<T>(path: string, fn: () => T): T {
 /**
  * Returns true when cwd has project-local resources that must be gated by
  * project trust: trust-requiring entries under cwd/.pi, or .agents/skills in
- * cwd or one of its ancestors. Returns false when no such project resources
+ * cwd or one of its ancestors up to the Git root.
+ * Returns false when no such project resources
  * exist. The user/global ~/.agents/skills directory is always treated as a
  * trusted user resource and is ignored here, even when cwd is $HOME.
  */
@@ -198,6 +199,8 @@ export function hasTrustRequiringProjectResources(cwd: string): boolean {
 		if (agentsSkillsDir !== userAgentsSkillsDir && existsSync(agentsSkillsDir)) {
 			return true;
 		}
+
+		if (existsSync(join(currentDir, ".git"))) return false;
 
 		const parentDir = dirname(currentDir);
 		if (parentDir === currentDir) {

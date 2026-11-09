@@ -47,7 +47,7 @@ function buildBunBinaryRelease(targetDirectory, archiveDirectory) {
 	], { stdio: "inherit" });
 	rmSync(targetDirectory, { force: true, recursive: true });
 	cpSync(join(binaryBuildDirectory, platform), targetDirectory, { recursive: true });
-	const archiveName = platform.startsWith("windows-") ? `pi-${platform}.zip` : `pi-${platform}.tar.gz`;
+	const archiveName = platform.startsWith("windows-") ? `phi-${platform}.zip` : `phi-${platform}.tar.gz`;
 	cpSync(join(binaryBuildDirectory, archiveName), join(archiveDirectory, archiveName));
 	return platform;
 }
@@ -94,9 +94,16 @@ const repoRoot = process.cwd();
 const rootPackageJson = JSON.parse(readFileSync(join(repoRoot, "package.json"), "utf8"));
 if (rootPackageJson.name !== "pi-monorepo") throw new Error("Run this script from the repository root");
 
-execNpmSync(["run", "generate:models"], { cwd: repoRoot, stdio: "inherit" });
+// Checks and tests run against the committed model data so they cannot drift
+// with live provider catalogs.
 if (!options.skipCheck) execNpmSync(["run", "check"], { cwd: repoRoot, stdio: "inherit" });
+if (!options.skipTest) {
+	execNpmSync(["run", "build"], { cwd: repoRoot, stdio: "inherit" });
+	execFileSync("bash", ["./test.sh"], { cwd: repoRoot, stdio: "inherit" });
+}
 
+// Release artifacts always use a freshly generated, strictly validated catalog.
+execNpmSync(["run", "generate:models"], { cwd: repoRoot, stdio: "inherit" });
 const artifactSet = produceArtifactSet({
 	build: true,
 	force: options.force,
@@ -108,8 +115,6 @@ const outDir = artifactSet.artifactDirectory;
 const binaryDirectory = join(outDir, "bun");
 const nodeInstallDirectory = join(outDir, "node");
 const bunInstallDirectory = join(outDir, "bun-install");
-
-if (!options.skipTest) execFileSync("bash", ["./test.sh"], { cwd: repoRoot, stdio: "inherit" });
 
 let binaryPlatform;
 if (!options.skipInstall) {

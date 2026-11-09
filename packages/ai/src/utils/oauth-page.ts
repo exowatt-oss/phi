@@ -1,4 +1,5 @@
-const LOGO_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 800" aria-hidden="true"><path fill="#F09082" d="M165.29 165.29H517.36V400H400V282.65H165.29Z"/><path fill="#4D9ABF" d="M165.29 282.65H282.65V400H400V517.36H282.65V634.72H165.29Z"/><path fill="#F1BE58" d="M517.36 400H634.72V634.72H517.36Z"/></svg>`;
+// phi logo: the block φ on the page's fixed dark background.
+const LOGO_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="-58.68 0 704.16 704.16" aria-hidden="true"><path fill="#F5F5F5" d="M234.72 0H352.08V117.36H234.72ZM117.36 117.36H469.44V234.72H117.36ZM0 234.72H117.36V352.08H0ZM234.72 234.72H352.08V352.08H234.72ZM469.44 234.72H586.8V352.08H469.44ZM0 352.08H117.36V469.44H0ZM234.72 352.08H352.08V469.44H234.72ZM469.44 352.08H586.8V469.44H469.44ZM117.36 469.44H469.44V586.8H117.36ZM234.72 586.8H352.08V704.16H234.72Z"/></svg>`;
 
 function escapeHtml(value: string): string {
 	return value

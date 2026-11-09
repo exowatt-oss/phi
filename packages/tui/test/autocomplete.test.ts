@@ -114,6 +114,103 @@ describe("CombinedAutocompleteProvider", () => {
 		});
 	});
 
+	describe("slash command completion", () => {
+		const commands = [
+			{ name: "model", description: "Select a model" },
+			{ name: "skill:review", description: "Review the current change" },
+			{ name: "skill:search", description: "Search the web" },
+		];
+
+		test("suggests a skill command after prose at the end of the line", async () => {
+			const provider = new CombinedAutocompleteProvider(commands, "/tmp");
+			const line = "Please use /skill:rev";
+			const result = await getSuggestions(provider, [line], 0, line.length);
+
+			assert.notEqual(result, null);
+			assert.strictEqual(result?.prefix, "/skill:rev");
+			assert.ok(result?.items.some((item) => item.value === "skill:review"));
+		});
+
+		test("suggests and applies a command with text after the cursor", async () => {
+			const provider = new CombinedAutocompleteProvider(commands, "/tmp");
+			const line = "Please use /skill:rev in this message";
+			const cursorCol = line.indexOf(" in this message");
+			const result = await getSuggestions(provider, [line], 0, cursorCol);
+
+			assert.notEqual(result, null);
+			assert.strictEqual(result?.prefix, "/skill:rev");
+			const item = result?.items.find((entry) => entry.value === "skill:review");
+			assert.ok(item, "Should find skill:review suggestion");
+
+			const applied = provider.applyCompletion([line], 0, cursorCol, item!, result!.prefix);
+			assert.strictEqual(applied.lines[0], "Please use /skill:review in this message");
+			assert.strictEqual(applied.cursorCol, "Please use /skill:review ".length);
+		});
+
+		test("applies a command at the end with one trailing space", async () => {
+			const provider = new CombinedAutocompleteProvider(commands, "/tmp");
+			const line = "status /skill:rev";
+			const result = await getSuggestions(provider, [line], 0, line.length);
+			const item = result?.items.find((entry) => entry.value === "skill:review");
+			assert.ok(item, "Should find skill:review suggestion");
+
+			const applied = provider.applyCompletion([line], 0, line.length, item!, result!.prefix);
+			assert.strictEqual(applied.lines[0], "status /skill:review ");
+			assert.strictEqual(applied.cursorCol, applied.lines[0].length);
+		});
+
+		test("keeps start-of-line argument completion", async () => {
+			const provider = new CombinedAutocompleteProvider(
+				[
+					{
+						name: "model",
+						getArgumentCompletions: (prefix: string) =>
+							prefix === "op" ? [{ value: "openai", label: "openai" }] : null,
+					},
+				],
+				"/tmp",
+			);
+			const line = "/model op";
+			const result = await getSuggestions(provider, [line], 0, line.length);
+
+			assert.notEqual(result, null);
+			assert.strictEqual(result?.prefix, "op");
+			assert.strictEqual(result?.items[0]?.value, "openai");
+		});
+
+		test("keeps start-of-line argument completion for slash-prefixed arguments", async () => {
+			const provider = new CombinedAutocompleteProvider(
+				[
+					{
+						name: "model",
+						getArgumentCompletions: (prefix: string) =>
+							prefix === "/fo" ? [{ value: "folder", label: "folder" }] : null,
+					},
+				],
+				"/tmp",
+			);
+			const line = "/model /fo";
+			const result = await getSuggestions(provider, [line], 0, line.length);
+
+			assert.notEqual(result, null);
+			assert.strictEqual(result?.prefix, "/fo");
+			const item = result?.items[0];
+			assert.ok(item);
+
+			const applied = provider.applyCompletion([line], 0, line.length, item!, result!.prefix);
+			assert.strictEqual(applied.lines[0], "/model folder");
+		});
+
+		test("does not treat a path-like slash token as a command", async () => {
+			const provider = new CombinedAutocompleteProvider([{ name: "one" }], "/tmp");
+			const line = "Read /one/two";
+			const cursorCol = line.indexOf("/two");
+			const result = await getSuggestions(provider, [line], 0, cursorCol);
+
+			assert.strictEqual(result, null);
+		});
+	});
+
 	describe("fd @ file suggestions", { skip: !isFdInstalled }, () => {
 		let rootDir = "";
 		let baseDir = "";

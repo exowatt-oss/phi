@@ -75,6 +75,7 @@ describe("OpenAI completions raw stop reasons", () => {
 
 		expect(message.stopReason).toBe("error");
 		expect(message.rawStopReason).toBe("content_filter");
-		expect(message.errorMessage).toBe("Provider finish_reason: content_filter");
+		// Attributed to the requested model; the original wording follows the prefix.
+		expect(message.errorMessage).toBe("openai/test-model: Provider finish_reason: content_filter");
 	});
 });

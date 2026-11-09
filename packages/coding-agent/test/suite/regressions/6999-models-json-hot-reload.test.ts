@@ -10,6 +10,8 @@ import { initTheme } from "../../../src/modes/interactive/theme/theme.ts";
 import { stripAnsi } from "../../../src/utils/ansi.ts";
 import { createModelRegistry, getModelRuntime } from "../../model-runtime-test-utils.ts";
 
+// The selector requests one render for its initial snapshot and one when its background
+// refresh finishes; waiting for the second replaces a timing-dependent poll.
 function observeRefreshRender(): { tui: TUI; renderedAfterRefresh: Promise<void> } {
 	let renderCount = 0;
 	let resolveRefreshRender = () => {};
@@ -57,6 +59,8 @@ describe("issue #6999 models.json hot reload", () => {
 	});
 
 	it("reloads models.json when opening /model", async () => {
+		// A bare registry, not the session harness: registering the harness provider starts a
+		// background refresh that could land after the selector's and restore the old catalog.
 		tempDir = mkdtempSync(join(tmpdir(), "pi-models-json-hot-reload-"));
 		const modelsPath = join(tempDir, "models.json");
 		writeFileSync(modelsPath, JSON.stringify(modelsJson("old-provider", "old-model")));
@@ -78,5 +82,6 @@ describe("issue #6999 models.json hot reload", () => {
 		const rendered = stripAnsi(selector.render(120).join("\n"));
 		expect(rendered).toContain("new-model [new-provider]");
 		expect(rendered).not.toContain("old-model [old-provider]");
+		expect(modelRuntime.getModel("old-provider", "old-model")).toBeUndefined();
 	});
 });

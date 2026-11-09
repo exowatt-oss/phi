@@ -1,6 +1,7 @@
 {
 	"name": "@earendil-works/pi-ai",
-	"version": "1.4.0",
+	"version": "1.4.0-exo.15",
+	"private": true,
 	"description": "Unified LLM API with automatic model discovery and provider configuration",
 	"type": "module",
 	"main": "./dist/index.js",
@@ -61,15 +62,15 @@
 		"hydrate-model-data": "node scripts/generate-models.ts --strict --data-only",
 		"generate-model-catalog": "node scripts/generate-models.ts --strict --json-only --json-output ../../.artifacts/model-catalog",
 		"check:model-data": "node scripts/check-model-data.ts",
-		"build": "npm run generate-models && npm run build:offline",
+		"build": "npm run build:offline",
 		"build:offline": "npm run check:model-data && tsc -p tsconfig.build.json && shx rm -rf dist/providers/data && shx cp -r src/providers/data dist/providers/data",
-		"test": "vitest --run",
+		"test": "vitest --run --maxWorkers=4",
 		"prepublishOnly": "npm run clean && npm run build"
 	},
 	"dependencies": {
 		"@anthropic-ai/sdk": "0.129.0",
 		"@aws-sdk/client-bedrock-runtime": "3.1127.0",
-		"@earendil-works/pi-telemetry": "1.4.0",
+		"@earendil-works/pi-telemetry": "1.4.0-exo.15",
 		"@google/genai": "2.21.0",
 		"@smithy/node-http-handler": "4.12.1",
 		"http-proxy-agent": "9.1.0",
@@ -92,9 +93,11 @@
 	"license": "MIT",
 	"repository": {
 		"type": "git",
-		"url": "git+https://github.com/earendil-works/pi.git",
+		"url": "https://github.com/exowatt-oss/phi",
 		"directory": "packages/ai"
 	},
+	"bugs": { "url": "https://github.com/exowatt-oss/phi/issues" },
+	"homepage": "https://github.com/exowatt-oss/phi",
 	"engines": {
 		"node": ">=22.19.0"
 	},

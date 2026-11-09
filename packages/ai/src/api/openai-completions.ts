@@ -11,7 +11,7 @@ import type {
 	ChatCompletionSystemMessageParam,
 	ChatCompletionToolMessageParam,
 } from "openai/resources/chat/completions.js";
-import { calculateCost, clampThinkingLevel } from "../models.ts";
+import { calculateCost, clampThinkingLevel, getUnsupportedFastServiceTierError } from "../models.ts";
 import type {
 	AssistantMessage,
 	CacheRetention,
@@ -23,6 +23,7 @@ import type {
 	OpenAICompletionsCompat,
 	ProviderEnv,
 	ProviderHeaders,
+	ServiceTier,
 	SimpleStreamOptions,
 	StopReason,
 	StreamFunction,
@@ -35,8 +36,14 @@ import type {
 	ToolCall,
 	ToolResultMessage,
 } from "../types.ts";
-import { formatProviderError, normalizeProviderError } from "../utils/error-body.ts";
+import {
+	attributeProviderError,
+	extractResponseModelFromError,
+	formatProviderError,
+	normalizeProviderError,
+} from "../utils/error-body.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
+import { extractGatewayRouting } from "../utils/gateway-routing.ts";
 import { shortHash } from "../utils/hash.ts";
 import { headersToRecord } from "../utils/headers.ts";
 import { type ClientIdentity, getIdentityHeaders } from "../utils/identity.ts";
@@ -154,6 +161,7 @@ function isOpenAIReasoningDetail(detail: unknown): detail is OpenAIReasoningDeta
 export interface OpenAICompletionsOptions extends StreamOptions {
 	toolChoice?: OpenAI.Chat.Completions.ChatCompletionToolChoiceOption;
 	reasoningEffort?: "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+	serviceTier?: ServiceTier;
 	/** Token budgets per thinking level. Used when `compat.thinkingTokenBudgetField` or `compat.supportsThinkingTokenBudget` is set, or by `{ "$var": "thinking.budget" }`. */
 	thinkingBudgets?: ThinkingBudgets;
 }
@@ -170,6 +178,7 @@ interface OpenAICompatCacheControl {
 type ResolvedOpenAICompletionsCompat = Omit<
 	Required<OpenAICompletionsCompat>,
 	| "cacheControlFormat"
+	| "sendReasoningEffortOff"
 	| "supportsThinkingTokenBudget"
 	| "thinkingTokenBudgetField"
 	| "supportsMidConvoSystemMessages"
@@ -177,6 +186,8 @@ type ResolvedOpenAICompletionsCompat = Omit<
 	| "vllmPriority"
 > & {
 	cacheControlFormat?: OpenAICompletionsCompat["cacheControlFormat"];
+	/** Opt-in only, so it stays optional here rather than being detected per provider. */
+	sendReasoningEffortOff?: OpenAICompletionsCompat["sendReasoningEffortOff"];
 	supportsThinkingTokenBudget?: OpenAICompletionsCompat["supportsThinkingTokenBudget"];
 	thinkingTokenBudgetField?: OpenAICompletionsCompat["thinkingTokenBudgetField"];
 	supportsMidConvoSystemMessages?: OpenAICompletionsCompat["supportsMidConvoSystemMessages"];
@@ -381,7 +392,10 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 					signal: options?.signal,
 				},
 			);
-			await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
+			const responseHeaders = headersToRecord(response.headers);
+			await options?.onResponse?.({ status: response.status, headers: responseHeaders }, model);
+			const routing = extractGatewayRouting(model, responseHeaders);
+			if (routing) output.routing = routing;
 			stream.push({ type: "start", partial: output });
 
 			interface StreamingToolCallBlock extends ToolCall {
@@ -404,6 +418,7 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 			let textBlock: TextContent | null = null;
 			let thinkingBlock: ThinkingContent | null = null;
 			let hasFinishReason = false;
+			let actualServiceTier: ChatCompletionChunk["service_tier"];
 			const toolCallBlocksByIndex = new Map<number, StreamingToolCallBlock>();
 			const toolCallBlocksById = new Map<string, StreamingToolCallBlock>();
 			const blocks = output.content as StreamingBlock[];
@@ -563,8 +578,13 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 				// OpenAI documents ChatCompletionChunk.id as the unique chat completion identifier,
 				// and each chunk in a streamed completion carries the same id.
 				output.responseId ||= chunk.id;
-				if (typeof chunk.model === "string" && chunk.model.length > 0 && chunk.model !== model.id) {
+				// Recorded even when it equals the requested id, so a host can tell a
+				// confirmed model apart from a server that never named one.
+				if (typeof chunk.model === "string" && chunk.model.length > 0) {
 					output.responseModel ||= chunk.model;
+				}
+				if (chunk.service_tier !== undefined && chunk.service_tier !== null) {
+					actualServiceTier = chunk.service_tier;
 				}
 				if (chunk.usage) {
 					output.usage = parseChunkUsage(chunk.usage, model);
@@ -701,6 +721,7 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 			if (output.stopReason === "error") {
 				throw new Error(output.errorMessage || "Provider returned an error stop reason");
 			}
+			applyServiceTierPricing(output.usage, actualServiceTier ?? options?.serviceTier);
 			if ((compat.supportsFinishReason && !hasFinishReason) || output.stopReason === "pending") {
 				throw new Error("Stream ended without finish_reason");
 			}
@@ -728,6 +749,12 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 			if (rawMetadata && !output.errorMessage.includes(String(rawMetadata))) {
 				output.errorMessage += `\n${rawMetadata}`;
 			}
+			// A failing response can still have named its serving model before it failed.
+			output.responseModel ||= extractResponseModelFromError(error, model.id);
+			const providerErrorMessage = output.errorMessage;
+			output.errorMessage = attributeProviderError(providerErrorMessage, model, output.responseModel);
+			// Classifiers read this, not the prefixed text. See AssistantMessage.providerErrorMessage.
+			if (output.errorMessage !== providerErrorMessage) output.providerErrorMessage = providerErrorMessage;
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
 		}
@@ -753,6 +780,7 @@ export const streamSimple: StreamFunction<"openai-completions", SimpleStreamOpti
 	return stream(model, context, {
 		...base,
 		reasoningEffort,
+		serviceTier: options?.serviceTier,
 		thinkingBudgets: options?.thinkingBudgets,
 	} satisfies OpenAICompletionsOptions);
 };
@@ -803,6 +831,32 @@ function createClient(
 	});
 }
 
+/**
+ * Resolve a pi thinking level into the provider's own effort vocabulary.
+ *
+ * The three `thinkingLevelMap` cases, which `getSupportedThinkingLevels` already
+ * reads this way and which every caller here must agree with:
+ *
+ * - a string: the provider's word for this level.
+ * - an explicit `null`: the provider does NOT accept this level. Return
+ *   undefined so the caller omits the field; sending something anyway is how a
+ *   request ends up carrying an effort value the endpoint rejects with
+ *   `400 invalid_request_error: Invalid effort level`.
+ * - absent: pass the pi level name through unchanged — the catalog convention
+ *   for providers that share pi's `low`/`medium`/`high` vocabulary.
+ *
+ * `?? level` conflates the last two, because `??` fires on null as well as
+ * undefined: an explicit "unsupported" became "send the raw pi level name".
+ */
+function resolveReasoningEffort(
+	model: Model<"openai-completions">,
+	level: NonNullable<OpenAICompletionsOptions["reasoningEffort"]>,
+): string | undefined {
+	const mapped = model.thinkingLevelMap?.[level];
+	if (mapped === null) return undefined;
+	return mapped ?? level;
+}
+
 function buildParams(
 	model: Model<"openai-completions">,
 	context: TranscriptContext,
@@ -843,6 +897,13 @@ function buildParams(
 
 	if (compat.supportsStore) {
 		params.store = false;
+	}
+
+	const unsupportedServiceTier = getUnsupportedFastServiceTierError(model, options?.serviceTier);
+	if (unsupportedServiceTier) throw new Error(unsupportedServiceTier);
+	// GitHub Copilot has no processing-tier concept and 400s on the param.
+	if (options?.serviceTier !== undefined && model.provider !== "github-copilot") {
+		(params as unknown as { service_tier?: ServiceTier }).service_tier = options.serviceTier;
 	}
 
 	if (options?.maxTokens) {
@@ -938,16 +999,15 @@ function buildParams(
 			(params as any).thinking = { type: "disabled" };
 		}
 		if (options?.reasoningEffort && compat.supportsReasoningEffort) {
-			(params as any).reasoning_effort =
-				model.thinkingLevelMap?.[options.reasoningEffort] ?? options.reasoningEffort;
+			const effort = resolveReasoningEffort(model, options.reasoningEffort);
+			if (effort !== undefined) (params as any).reasoning_effort = effort;
 		}
 	} else if (compat.thinkingFormat === "openrouter" && model.reasoning) {
 		// OpenRouter normalizes reasoning across providers via a nested reasoning object.
 		const openRouterParams = params as typeof params & { reasoning?: { effort?: string } };
 		if (options?.reasoningEffort) {
-			openRouterParams.reasoning = {
-				effort: model.thinkingLevelMap?.[options.reasoningEffort] ?? options.reasoningEffort,
-			};
+			const effort = resolveReasoningEffort(model, options.reasoningEffort);
+			if (effort !== undefined) openRouterParams.reasoning = { effort };
 		} else if (model.thinkingLevelMap?.off !== null) {
 			openRouterParams.reasoning = { effort: model.thinkingLevelMap?.off ?? "none" };
 		}
@@ -963,19 +1023,31 @@ function buildParams(
 		};
 		togetherParams.reasoning = { enabled: !!options?.reasoningEffort };
 		if (options?.reasoningEffort && compat.supportsReasoningEffort) {
-			togetherParams.reasoning_effort = model.thinkingLevelMap?.[options.reasoningEffort] ?? options.reasoningEffort;
+			const effort = resolveReasoningEffort(model, options.reasoningEffort);
+			if (effort !== undefined) togetherParams.reasoning_effort = effort;
 		}
 	} else if (compat.thinkingFormat === "string-thinking" && model.reasoning) {
 		const stringThinkingParams = params as typeof params & { thinking?: string };
 		if (options?.reasoningEffort) {
-			stringThinkingParams.thinking = model.thinkingLevelMap?.[options.reasoningEffort] ?? options.reasoningEffort;
+			const effort = resolveReasoningEffort(model, options.reasoningEffort);
+			if (effort !== undefined) stringThinkingParams.thinking = effort;
 		} else if (model.thinkingLevelMap?.off !== null) {
 			stringThinkingParams.thinking = model.thinkingLevelMap?.off ?? "none";
 		}
 	} else if (options?.reasoningEffort && model.reasoning && compat.supportsReasoningEffort) {
 		// OpenAI-style reasoning_effort
-		(params as any).reasoning_effort = model.thinkingLevelMap?.[options.reasoningEffort] ?? options.reasoningEffort;
-	} else if (!options?.reasoningEffort && model.reasoning && compat.supportsReasoningEffort) {
+		const effort = resolveReasoningEffort(model, options.reasoningEffort);
+		if (effort !== undefined) (params as any).reasoning_effort = effort;
+	} else if (
+		!options?.reasoningEffort &&
+		model.reasoning &&
+		compat.supportsReasoningEffort &&
+		compat.sendReasoningEffortOff === true
+	) {
+		// Opt-in only: `thinkingLevelMap.off` is provider-specific vocabulary, and a
+		// gateway model group that re-maps onto an upstream which does not share it
+		// answers `400 Invalid effort level`. Omitting the field instead leaves the
+		// upstream on its own default effort, which is a far cheaper failure mode.
 		const offValue = model.thinkingLevelMap?.off;
 		if (typeof offValue === "string") {
 			(params as any).reasoning_effort = offValue;
@@ -1569,6 +1641,19 @@ function parseChunkUsage(
 	return usage;
 }
 
+function applyServiceTierPricing(
+	usage: AssistantMessage["usage"],
+	serviceTier: ChatCompletionChunk["service_tier"] | ServiceTier | undefined,
+): void {
+	const multiplier = serviceTier === "flex" ? 0.5 : serviceTier === "fast" || serviceTier === "priority" ? 2 : 1;
+	if (multiplier === 1) return;
+	usage.cost.input *= multiplier;
+	usage.cost.output *= multiplier;
+	usage.cost.cacheRead *= multiplier;
+	usage.cost.cacheWrite *= multiplier;
+	usage.cost.total = usage.cost.input + usage.cost.output + usage.cost.cacheRead + usage.cost.cacheWrite;
+}
+
 function mapStopReason(reason: ChatCompletionChunk.Choice["finish_reason"] | string): {
 	stopReason: StopReason;
 	errorMessage?: string;
@@ -1739,6 +1824,7 @@ function getCompat(model: Model<"openai-completions">): ResolvedOpenAICompletion
 		sendSessionAffinityHeaders: model.compat.sendSessionAffinityHeaders ?? detected.sendSessionAffinityHeaders,
 		sessionAffinityFormat: model.compat.sessionAffinityFormat ?? detected.sessionAffinityFormat,
 		supportsLongCacheRetention: model.compat.supportsLongCacheRetention ?? detected.supportsLongCacheRetention,
+		sendReasoningEffortOff: model.compat.sendReasoningEffortOff,
 		vllmPriority: model.compat.vllmPriority,
 	};
 }

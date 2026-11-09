@@ -24,21 +24,99 @@ Both use closely related structured formats and track file operations cumulative
 
 ## Compaction
 
-### When It Triggers
+### The Context-Management Ladder (phi)
 
-Auto-compaction triggers when:
+The context-aware ladder is a continuation aid for TUI sessions and for hosts that set
+`PI_CONTEXT_BUDGET=on` (P3 Code). It computes every line from the
+**effective window**: `min(raw contextWindow, softCeilingTokens)`. The global
+`compaction.softCeilingTokens` defaults to `PI_COMPACTION_SOFT_CEILING_TOKENS` when a host sets it,
+else 300k (`0` uses the raw window), while a model entry's
+`compaction.softCeilingTokens` in `models.json` overrides the global value for that model. The
+**hard line** is `effectiveWindow - reserveTokens`; `reserveTokens` defaults to 16,384 and leaves
+room for the next prompt and response.
 
-```
-contextTokens > contextWindow - reserveTokens
+In order, the ladder is:
+
+1. **Prune at 50% of the effective window.** When enough old tool-result payload can be reclaimed,
+   phi writes a `mode: "prune"` watermark and elides those payloads from model context (keeping
+   the conversation and the full session file). This is deterministic and uses no summarizer call.
+2. **Open the compaction window at 80% of the hard line.** phi prepares a structured background
+   summary from a branch snapshot while the run continues. The hidden, ephemeral `context-budget`
+   line tells the model that the window is open and asks it to call `checkpoint()` at a natural
+   boundary; the line never adds transcript noise.
+3. **Apply the prepared summary at a safe boundary.** The model's `checkpoint()` request applies
+   the summary before the next turn. If the model does not checkpoint, the summary is applied when
+   the run ends. A checkpoint's `mode: "fresh"` requests a clean context with its notes as the
+   handoff; the default `summarize` mode keeps the summary path.
+4. **Force compaction at the hard line.** At `effectiveWindow - reserveTokens`, phi compacts before
+   the next request. A ready background summary is preferred; if one is not available, the
+   summarizer runs on the blocking path. A provider context-overflow error remains a compact-and-
+   retry backstop.
+
+Do not stop a task merely because the budget line appeared. It is a signal to make a checkpoint at
+an appropriate boundary, not a task or wall-clock budget. The ladder is checked at tool-calling
+turn boundaries (including trailing tool-result estimates), after a run ends, and before a new
+prompt when the previous usage was incomplete. `/compact [instructions]` remains available; an
+interactive request issued during a run is queued rather than aborting the running work.
+
+#### TUI gate and unchanged behavior
+
+The context-aware additions are enabled only with `PI_TUI_MODE=1` (accepted truthy spellings are
+`1`, `true`, `on`, and `yes`). In TUI mode, `PI_CONTEXT_BUDGET=off` (also `0` or `false`) opts
+out. With the gate unset or opted out, phi does not load the `context-budget` extension, hidden
+budget lines, or the `checkpoint` tool, and it does not select the TUI-only default summarizer.
+Existing compaction settings and the pre-existing prune, background, hard-threshold, overflow,
+manual, and transcript-preserving behavior remain unchanged; an explicitly configured
+`compaction.model` is still honored.
+
+#### Summarizer defaults
+
+When `compaction.model` is unset, a gated TUI session defaults to
+`anthropic/claude-sonnet-5:low` for an Anthropic session. For other providers, no additional summarizer is selected. An explicit `compaction.model` always wins. Outside the TUI gate, an unset setting
+falls back to the session model as before.
+
+#### Compaction entries and pinned context
+
+Compaction entries record `trigger` when known (`background`, `threshold`, `overflow`, `manual`,
+`checkpoint`, or `stall`) and `stats` when available: `toolResultsElided` and `turnsSummarized`.
+The TUI summary card keeps those facts in its header, for example:
+
+```text
+Compacted 227k → 98k · background summary applied at run end · 41 tool results, 96 turns summarized
 ```
 
 By default, `reserveTokens` is 16384 tokens (configurable in `~/.pi/agent/settings.json` or `<project-dir>/.pi/settings.json`). It only decides when compaction starts. Summary requests use the model's output limit, reduced when needed so input and output fit the context window.
+
+`pinned` context is carried through the summary verbatim. It includes the first user message,
+items named by a checkpoint's `keep` list, and strings returned by an extension's
+`session_before_compact` hook as `pinned`. phi re-emits these strings as a `pinned-context`
+message immediately after the summary so the next request sees the constraints exactly as written.
+
+#### Between-turn checks and recovery
 
 During a multi-turn agent run, Pi checks the canonical projected context after tools finish and their results are appended, before starting the next assistant response. If the threshold is crossed, Pi compacts during `prepareNextTurn`, then performs the existing catch-up steering poll before `turn_start`. It skips this between-turn check when the completed tool batch terminates the run and no queued message requires another response. Pi also checks before a new user prompt and performs final-attempt overflow recovery after the low-level run ends.
 
 A provider context-overflow error or an early final `stopReason: "length"` can select one compact-and-retry recovery attempt. Length responses with tool calls retain their synthetic failed tool results and follow the ordinary tool/queue scheduler rather than forcing the run to end.
 
-You can also trigger manually with `/compact [instructions]`, where optional instructions focus the summary.
+### Display Behavior
+
+Compaction rewrites what the *model* sees, never what the user saw happen. The TUI keeps the
+transcript scrollback intact and appends the compaction summary card in place, plus a status
+line with the before/after token counts. Resuming a compacted session renders the session as
+it happened (a capped tail of the full branch), not the model's compacted view. Elided tool
+results likewise render in full in the transcript — the elision exists only in LLM context.
+
+### Compaction Never Loses Concurrent Input
+
+While a compaction is in flight, the session is rewriting agent state, so anything that
+would start a turn is **queued instead of raced**: programmatic prompts and turn-triggering
+extension messages (e.g. background `subagent-results`) go to the follow-up queue, and
+stacking a second compaction on top of a running one is refused. When compaction ends, the
+queue is flushed — delivered by the continuing run (mid-run/agent_end cases), by the user's
+pending prompt (pre-prompt case), or by a queued continuation started after a manual
+`/compact`. The subagents extension additionally injects a continuity note after a
+compaction while background runs are still in flight, so the model keeps expecting their
+results message (see the subagents docs).
 
 ### How It Works
 
@@ -153,6 +231,7 @@ interface CompactionEntry<T = unknown> {
   usage?: Usage;       // LLM usage that generated the summary
   fromHook?: boolean;  // true if provided by extension (legacy field name)
   details?: T;         // implementation-specific data
+  mode?: "summary" | "prune";  // "prune" = elision watermark, drops nothing (phi)
 }
 
 // Default compaction uses this for details (from compaction.ts):
@@ -423,7 +502,9 @@ Configure compaction in `~/.pi/agent/settings.json` or `<project-dir>/.pi/settin
   "compaction": {
     "enabled": true,
     "reserveTokens": 16384,
-    "keepRecentTokens": 20000
+    "keepRecentTokens": 30000,
+    "softCeilingTokens": 300000,
+    "model": "example/model:low"
   }
 }
 ```
@@ -431,8 +512,10 @@ Configure compaction in `~/.pi/agent/settings.json` or `<project-dir>/.pi/settin
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `enabled` | `true` | Enable auto-compaction |
-| `reserveTokens` | `16384` | Free context tokens below which auto-compaction starts |
-| `keepRecentTokens` | `20000` | Recent tokens to keep (not summarized) |
+| `reserveTokens` | `16384` | Free context tokens below which auto-compaction starts. It only decides when compaction starts; summary requests use the model's output limit |
+| `keepRecentTokens` | adaptive | Recent tokens kept verbatim. Unset = `max(20000, 10% of the effective window)` |
+| `softCeilingTokens` | `300000` | Caps the window all compaction thresholds use: `min(contextWindow, softCeilingTokens)`. `0` = raw window |
+| `model` | session model | Summarizer override as `"provider/modelId[:thinkingLevel]"`; unresolvable specs fall back to the session model. An explicit summarizer defaults to `low` thinking |
 
 Disable auto-compaction with `"enabled": false`. You can still compact manually with `/compact`.
 
@@ -461,3 +544,14 @@ Keys are exact, case-sensitive `provider/modelId` values, including any slashes 
 These resolved values are used for manual compaction, all automatic threshold checks, overflow recovery, and extension-visible `preparation.settings`. Model switches affect subsequent checks and compactions without changing ordinary settings. Compaction already in progress uses the model and settings captured for that operation. Branch summarization settings are unaffected.
 
 Overrides work in both global and project settings. The files merge recursively before lookup, so a global model-specific value beats a project-wide fallback; a project must override that model entry to change it. See [Settings](settings.md#per-model-compaction-overrides) for details.
+
+## Stall Guard
+
+A companion built-in extension (`extensions/stall-guard/`) composes with compaction. Long
+reasoning-model sessions can end a turn on a short "I'm doing that now" message with **zero
+tool calls and zero reasoning tokens** — a false claim, since nothing runs between turns. When
+a run ends on that exact fingerprint (and no background subagents are actually delivering
+results), the guard steers one continuation nudge that triggers a follow-up turn. The nudge
+goes through the normal pre-send compaction check, so an oversized session compacts first and
+then continues — compact-on-stall by composition. A second consecutive stall surfaces a
+visible warning instead of another nudge. Disable with `PI_STALL_GUARD=off`.

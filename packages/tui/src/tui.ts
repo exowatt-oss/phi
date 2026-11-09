@@ -355,26 +355,38 @@ type OverlayFocusRestorePolicy = "clear" | "preserve";
 /**
  * Container - a component that contains other components
  */
+type ContainerRenderCache = {
+	width: number;
+	children: Component[];
+	childLines: string[][];
+	lines: string[];
+};
+
 export class Container implements Component {
 	children: Component[] = [];
+	private renderCache?: ContainerRenderCache;
 	private mouseLayout?: { width: number; children: Array<{ component: Component; height: number }> };
 
 	addChild(component: Component): void {
 		this.children.push(component);
+		this.renderCache = undefined;
 	}
 
 	removeChild(component: Component): void {
 		const index = this.children.indexOf(component);
 		if (index !== -1) {
 			this.children.splice(index, 1);
+			this.renderCache = undefined;
 		}
 	}
 
 	clear(): void {
 		this.children = [];
+		this.renderCache = undefined;
 	}
 
 	invalidate(): void {
+		this.renderCache = undefined;
 		for (const child of this.children) {
 			child.invalidate?.();
 		}
@@ -403,16 +415,32 @@ export class Container implements Component {
 	}
 
 	render(width: number): string[] {
+		const cache = this.renderCache;
+		const sameChildren =
+			cache?.children.length === this.children.length &&
+			cache.children.every((child, i) => child === this.children[i]);
+		const childLines: string[][] = [];
+		let unchanged = cache !== undefined && cache.width === width && sameChildren;
+
+		for (const child of this.children) {
+			const lines = child.render(width);
+			childLines.push(lines);
+			if (unchanged && lines !== cache?.childLines[childLines.length - 1]) unchanged = false;
+		}
+
+		// Unchanged children (same components, same line arrays) keep the mouse layout
+		// recorded with the cached lines.
+		if (unchanged && cache !== undefined && this.mouseLayout?.width === width) return cache.lines;
+
 		const lines: string[] = [];
 		const mouseChildren: Array<{ component: Component; height: number }> = [];
-		for (const child of this.children) {
-			const childLines = child.render(width);
-			mouseChildren.push({ component: child, height: childLines.length });
-			for (const line of childLines) {
-				lines.push(line);
-			}
+		for (let i = 0; i < childLines.length; i++) {
+			const child = childLines[i];
+			mouseChildren.push({ component: this.children[i], height: child.length });
+			for (const line of child) lines.push(line);
 		}
 		this.mouseLayout = { width, children: mouseChildren };
+		this.renderCache = { width, children: [...this.children], childLines, lines };
 		return lines;
 	}
 }
@@ -1035,7 +1063,8 @@ export abstract class TuiBase extends Container implements TUI {
 		process.nextTick(() => this.scheduleRender());
 	}
 
-	private requestImmediateRender(): void {
+	/** Protected so renderers with frame-to-frame caches (TuiAltScreen) can invalidate them first. */
+	protected requestImmediateRender(): void {
 		this.cancelRenderTimer();
 		this.renderRequested = true;
 		if (this.immediateRenderScheduled) return;

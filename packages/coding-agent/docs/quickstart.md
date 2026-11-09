@@ -4,35 +4,21 @@ Pi runs in your terminal and works with files on your machine. To use it, you ne
 
 For native Windows setup, read [Windows Setup](windows.md). For Android, read [Termux Setup](termux.md).
 
-## 1. Install Pi
+## 1. Install phi
 
-On macOS or Linux, you can use the installer:
-
-```bash
-curl -fsSL https://pi.dev/install.sh | sh
-```
-
-The installer pins all dependencies and updates Pi with `pi update`. Alternatively, install Pi from npm, which does not pin transitive dependencies. This requires Node.js 22.19 or newer:
+Node.js 22.19+ and npm are required. Build this fork from the source checkout:
 
 ```bash
-npm install -g --ignore-scripts @earendil-works/pi-coding-agent
+git clone https://github.com/exowatt-oss/phi.git
+cd phi
+npm ci --ignore-scripts
+npm run build:offline
+./pi-test.sh --no-env
 ```
 
-Pi does not require dependency lifecycle scripts for a normal npm installation.
-
-With Nix on macOS or Linux, install the latest release from Pi's flake. Nix builds Pi from source:
-
-```bash
-nix profile add github:earendil-works/pi/stable
-```
-
-Older Nix versions use `nix profile install` instead. Update with `nix profile upgrade pi`; `pi update` cannot update a Nix installation. To pin a release, use a tag such as `github:earendil-works/pi/v1.0.0`.
-
-Verify the installation:
-
-```bash
-pi --version
-```
+The pi.dev installer and upstream npm package install upstream Pi, not phi.
+On Windows, use Node.js to build this source checkout; no Windows installer
+is provided by this repository.
 
 ## 2. Start Pi
 

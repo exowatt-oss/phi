@@ -9,12 +9,13 @@ import type { OpenAICodexResponsesOptions } from "./api/openai-codex-responses.t
 import type { OpenAICompletionsOptions } from "./api/openai-completions.ts";
 import type { OpenAIResponsesOptions } from "./api/openai-responses.ts";
 import type { PiMessagesOptions } from "./api/pi-messages.ts";
+import type { AuthRequiredDetails } from "./auth/errors.ts";
 import type {
-	AnthropicMessagesCompat,
+	AnthropicMessagesCompat as AnthropicMessagesSchemaCompat,
 	BedrockCompat,
 	MistralConversationsCompat,
-	OpenAICompletionsCompat,
-	OpenAIResponsesCompat,
+	OpenAICompletionsCompat as OpenAICompletionsSchemaCompat,
+	OpenAIResponsesCompat as OpenAIResponsesSchemaCompat,
 	SystemOneCompat,
 } from "./providers/compat-schema.ts";
 import type {
@@ -33,12 +34,9 @@ import type { ClientIdentity } from "./utils/identity.ts";
 
 export type {
 	AnthropicAllowedFallbackModel,
-	AnthropicMessagesCompat,
 	BedrockCompat,
 	ChatTemplateKwargValue,
 	MistralConversationsCompat,
-	OpenAICompletionsCompat,
-	OpenAIResponsesCompat,
 	OpenRouterRouting,
 	SessionAffinityFormat,
 	SystemOneCompat,
@@ -163,6 +161,18 @@ export interface ProviderRequestOptions<TModel = Model<Api>> {
 	telemetry?: TelemetrySpan;
 	apiKey?: string;
 	/**
+	 * Max silence (ms) between raw stream data before the request is treated as
+	 * a dead connection: the transport is aborted and the turn ends with a
+	 * retryable error instead of hanging forever. `undefined` uses the
+	 * process-wide default (420s, see `setDefaultStreamIdleTimeoutMs`); `0`
+	 * disables the watchdog for this call.
+	 */
+	idleTimeoutMs?: number;
+	/** @internal Provider transports call this for observable raw bytes or WebSocket frames. */
+	onStreamActivity?: () => void;
+	/** @internal Provider transports call this after installing their raw-activity observation hook. */
+	onStreamActivityInstalled?: () => void;
+	/**
 	 * Optional fetch implementation for provider HTTP requests.
 	 * Defaults to `globalThis.fetch`. Provider adapters that cannot inject a custom implementation may reject it.
 	 * This does not affect WebSocket transports.
@@ -258,7 +268,7 @@ export interface StreamOptions extends ProviderRequestOptions<Model<Api>> {
 	/**
 	 * WebSocket connect timeout in milliseconds for providers that support
 	 * WebSocket transports. This covers the connection/open handshake only;
-	 * stream idleness after connection uses timeoutMs.
+	 * stream idleness after connection uses `idleTimeoutMs`.
 	 */
 	websocketConnectTimeoutMs?: number;
 	/**
@@ -374,10 +384,29 @@ export interface ImagesOptions extends ProviderRequestOptions<ImageModel<ImageAp
 export type ProviderImagesOptions = ImagesOptions & Record<string, unknown>;
 
 // Unified options with reasoning passed to streamSimple() and completeSimple()
+export type ServiceTier = "default" | "flex" | "fast" | "ultrafast";
+
+/**
+ * Inference speed a provider reports for a response. Anthropic fast mode reports
+ * `usage.speed`; "fast" means the premium fast-mode configuration served the
+ * request, "standard" means it ran (or fell back to) the regular configuration.
+ */
+export type InferenceSpeed = "standard" | "fast";
+
 export interface SimpleStreamOptions extends StreamOptions {
 	/** Provider-neutral tool selection for simple requests. When omitted, adapters use provider-specific behavior. */
 	toolChoice?: ToolChoice;
 	reasoning?: ThinkingLevel;
+	/**
+	 * Processing tier. "fast" maps to OpenAI's fast (priority) tier and, on
+	 * first-party Claude Opus models that support it, to Anthropic fast mode
+	 * (`speed: "fast"`, 2.5x output speed at a per-token premium). "flex" is
+	 * OpenAI-only. "ultrafast" is sent verbatim as `service_tier: "ultrafast"` on
+	 * OpenAI-style APIs (Amazon Bedrock's UltraFast tier); the provider decides
+	 * whether the model accepts it. Providers and models without tiers ignore
+	 * this option.
+	 */
+	serviceTier?: ServiceTier;
 	/** Ask a capable provider to return a durable handle and continue the request asynchronously. */
 	deferred?: boolean | { window?: "15m" | "1h" | "24h" };
 	/** Custom token budgets for thinking levels (token-based providers only) */
@@ -575,13 +604,61 @@ export interface UserMessage {
 	timestamp: number; // Unix timestamp in milliseconds
 }
 
+/**
+ * Structured description of a safety-classifier decline, so callers can tell a
+ * policy refusal from a transport error without matching on message text.
+ *
+ * Anthropic reports this as `stop_details` alongside `stop_reason: "refusal"`.
+ * Proxied deployments of the same models (a gateway speaking the OpenAI
+ * completions API, say) usually lose the structure and only carry text, so
+ * `category` and `explanation` are both optional: the field's presence is the
+ * signal, its contents are a bonus.
+ */
+export interface RefusalDetails {
+	/** Policy category that declined, when the provider names one. */
+	category?: "cyber" | "bio" | (string & {}) | null;
+	/** Provider-supplied explanation of the decline, verbatim. */
+	explanation?: string;
+}
+
+/**
+ * Where a gateway-routed request actually went. Populated only for the
+ * optional `gateway/auto` model group, from LiteLLM response headers. Absent for every other model,
+ * even when the same gateway headers are present on the response.
+ */
+export interface RoutingInfo {
+	/** Model id the client asked for (`auto`). */
+	requestedModel: string;
+	/** Gateway model group that served the request (`x-litellm-model-group`, e.g. `example-model`). */
+	servedModel: string;
+	/** Upstream provider model id (`x-litellm-model-name`, e.g. `example-model`). */
+	upstreamModel?: string;
+	/**
+	 * Cost of this response in USD. `gateway` = `x-litellm-response-cost` as billed by
+	 * LiteLLM (non-streaming only; streams end before the gateway knows the cost);
+	 * `estimate` = served model's catalog price applied to the actual token usage.
+	 */
+	costUsd?: number;
+	costSource?: "gateway" | "estimate";
+	/** LiteLLM call id (`x-litellm-call-id`) for cross-referencing gateway logs. */
+	callId?: string;
+	/** Jev tier decision (`x-auto-tier`), when the router hook exposes it. */
+	tier?: string;
+	/** Jev intent classification (`x-auto-intent`), when exposed. */
+	intent?: string;
+	/** Jev tier confidence 0..1 (`x-auto-confidence`), when exposed. */
+	confidence?: number;
+}
+
 export interface AssistantMessage {
 	role: "assistant";
 	content: (TextContent | ThinkingContent | ToolCall)[];
 	api: Api;
 	provider: ProviderId;
 	model: string;
-	responseModel?: string; // Concrete model reported by the provider when different from the requested `model`
+	/** Gateway routing decision for `gateway/auto`; see RoutingInfo. Persisted with the message. */
+	routing?: RoutingInfo;
+	responseModel?: string; // Concrete model the server said it served (e.g. OpenRouter `auto` -> `anthropic/...`); equals `model` when confirmed, absent when the server never named one
 	responseId?: string; // Provider-specific response/message identifier when the upstream API exposes one
 	/** Exact provider-native effort level used for this response. Absent for legacy or unmanaged responses. */
 	providerThinkingLevel?: string;
@@ -592,7 +669,37 @@ export interface AssistantMessage {
 	stopReason: StopReason;
 	deferred?: DeferredHandle;
 	errorMessage?: string;
+	/** Structured recovery metadata for terminal OAuth failures. */
+	authRequired?: AuthRequiredDetails;
+	/**
+	 * The provider's own error text, before phi prefixed it with the model the
+	 * request was addressed to (see `attributeProviderError`). Set only when the
+	 * two differ.
+	 *
+	 * Every text classifier in the library — overflow, retryable, unavailable,
+	 * refusal — must key on this when it is present. They match unanchored
+	 * substrings, including bare status codes like `502`, and phi's own prefix is
+	 * attacker-free but not pattern-free: `amazon-bedrock/us.mistral.pixtral-large-2502-v1:0`
+	 * contains `502`, so classifying the prefixed string would read a hard 400 from
+	 * that model as a gateway outage and reroute the session. Attribution is for
+	 * humans reading the message; classification stays on what the provider said.
+	 */
+	providerErrorMessage?: string;
+	/**
+	 * Present when this turn failed because a safety classifier declined it, which
+	 * `stopReason: "error"` alone cannot express. A refusal is not retryable on the
+	 * same model (the decline is deterministic in the request), so consumers use
+	 * this to escalate to a different model instead of retrying.
+	 */
+	refusal?: RefusalDetails;
 	rawStopReason?: string;
+	/**
+	 * Inference speed the provider reported for this response (Anthropic
+	 * `usage.speed`). Set only when fast mode was requested or the provider
+	 * reported a speed; consumers use it to tell a fast-mode turn from one that
+	 * fell back to standard speed, and cost is billed against this value.
+	 */
+	speed?: InferenceSpeed;
 	/**
 	 * Provider indication of whether the model explicitly ended its turn.
 	 * Preserved for debugging and does not currently affect agent control flow.
@@ -829,6 +936,78 @@ export type AssistantMessageEvent =
 	  }
 	| { type: "error"; reason: Extract<StopReason, "aborted" | "error">; error: AssistantMessage };
 
+// phi compat fields. Upstream derives the compat interfaces from the TypeBox schemas in
+// `providers/compat-schema.ts` (the source of the published models.json schema); phi's own
+// fields extend them here. Those schemas allow additional properties, so a models.json entry
+// that sets one of these validates.
+
+/**
+ * Compatibility settings for OpenAI-compatible completions APIs.
+ * Use this to override URL-based auto-detection for custom providers.
+ */
+export interface OpenAICompletionsCompat extends OpenAICompletionsSchemaCompat {
+	/**
+	 * Whether to send `reasoning_effort: <thinkingLevelMap.off>` when thinking is
+	 * off, instead of omitting the field. Default: false (omit).
+	 *
+	 * Set this only for a model that genuinely needs an explicit "do not think"
+	 * effort value and whose endpoint is the one that will read it. It is off by
+	 * default because the value is provider-specific vocabulary (`"none"`, in
+	 * practice) and a gateway model group that re-maps onto an upstream with a
+	 * different vocabulary answers `400 invalid_request_error: Invalid effort
+	 * level` — a hard failure, where omitting the field merely leaves the
+	 * upstream at its own default effort.
+	 */
+	sendReasoningEffortOff?: boolean;
+}
+
+/** Compatibility settings for OpenAI Responses APIs. */
+export interface OpenAIResponsesCompat extends OpenAIResponsesSchemaCompat {
+	/** Whether the model accepts OpenAI GPT-5.6+ explicit prompt cache breakpoints on input content. Default: follows supportsExplicitPromptCacheMode. */
+	supportsExplicitPromptCacheBreakpoints?: boolean;
+	/**
+	 * Wire `service_tier` sent when the session asks for the `fast` tier, and read back as fast.
+	 * Default: `"ultrafast"` for GPT-6 Astra on Amazon Bedrock (Mantle or bedrock-runtime
+	 * `/openai/v1`); otherwise unset, so `fast` goes out as `"fast"` (OpenAI's own spelling).
+	 */
+	fastServiceTier?: string;
+	/**
+	 * Multiplier applied to every cost rate when a response is served at `fastServiceTier`.
+	 * Default: 6 for Bedrock GPT-6 Astra UltraFast; 2 otherwise.
+	 */
+	fastServiceTierCostMultiplier?: number;
+	/**
+	 * Recursively sort the keys of tool JSON schemas before sending. Amazon Bedrock renders tool
+	 * schemas in the order sent until the conversation contains a tool call and canonically after,
+	 * which changes the prompt prefix and misses the cache on turn 2. Sorted keys are stable in
+	 * both renderings. Default: true for Amazon Bedrock `/openai/v1` endpoints, false otherwise.
+	 */
+	sortToolSchemaKeys?: boolean;
+}
+
+/** Compatibility settings for Anthropic Messages-compatible APIs. */
+export interface AnthropicMessagesCompat extends AnthropicMessagesSchemaCompat {
+	/**
+	 * Whether the model accepts Anthropic fast mode (`speed: "fast"` with the
+	 * `fast-mode-2026-02-01` beta). When false, a "fast" service tier is ignored
+	 * for this model instead of producing an API error.
+	 * Default: true for first-party Anthropic Claude Opus 5.5, Opus 5, and
+	 * Opus 4.8 (the models the Claude API serves in fast mode); false otherwise,
+	 * including Opus 4.7 (rejects the parameter) and Opus 4.6 (silently runs at
+	 * standard speed).
+	 */
+	supportsFastMode?: boolean;
+	/**
+	 * Multiplier applied to every `cost` rate when a response reports
+	 * `usage.speed: "fast"`. Anthropic prices fast mode as a flat multiple of the
+	 * standard rates across the full context window, with prompt-caching
+	 * multipliers stacking on top, so the same factor applies to input, output,
+	 * cache read, and cache write.
+	 * Default: 2 (Opus 5.5 $8/$40, Opus 5 and Opus 4.8 $10/$50 per MTok).
+	 */
+	fastModeCostMultiplier?: number;
+}
+
 /** Fields shared by every catalog entry, regardless of what you can do with it. */
 export interface BaseModel<TApi extends string> {
 	id: string;
@@ -860,6 +1039,11 @@ export interface Model<TApi extends Api> extends BaseModel<TApi> {
 	/** Prompt cache lifetimes per retention tier. Unset when the provider's cache behavior is unknown. */
 	promptCache?: ModelPromptCache;
 	contextWindow: number;
+	/** Optional compaction policy overrides for this model. */
+	compaction?: {
+		/** Soft ceiling for automatic compaction; 0 uses the raw context window. */
+		softCeilingTokens?: number;
+	};
 	maxTokens: number;
 	/** Default sampling parameters for this model. See {@link StreamOptions.samplingParams}; per-request keys override these. */
 	samplingParams?: SamplingParams;

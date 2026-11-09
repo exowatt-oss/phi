@@ -37,6 +37,7 @@ describe("ProjectTrustStore", () => {
 	});
 
 	it("detects trust-requiring project resources", () => {
+		mkdirSync(join(tempDir, ".git")); // Keep host .agents/skills out of this project fixture.
 		const originalHome = process.env.HOME;
 		process.env.HOME = tempDir;
 		try {
@@ -50,6 +51,9 @@ describe("ProjectTrustStore", () => {
 			rmSync(join(tempDir, ".pi", "settings.json"), { force: true });
 
 			mkdirSync(join(cwd, ".pi"), { recursive: true });
+			writeFileSync(join(cwd, ".pi", "mcp.json"), "{}");
+			expect(hasTrustRequiringProjectResources(cwd)).toBe(true);
+			rmSync(join(cwd, ".pi", "mcp.json"));
 			writeFileSync(join(cwd, ".pi", "settings.json"), "{}");
 			expect(hasTrustRequiringProjectResources(cwd)).toBe(true);
 

@@ -1,6 +1,26 @@
 import { describe, expect, it, vi } from "vitest";
 import { fauxAssistantMessage } from "../src/providers/faux.ts";
-import { isRetryableAssistantError, type RetryPolicy, retryAssistantCall, retryDelayMs } from "../src/utils/retry.ts";
+import {
+	getRefusalDetails,
+	isProviderUnavailableAssistantError,
+	isRefusalAssistantError,
+	isRetryableAssistantError,
+	type RetryPolicy,
+	retryAssistantCall,
+	retryDelayMs,
+} from "../src/utils/retry.ts";
+
+/**
+ * Auth-layer failures from a revoked or rotated-away Anthropic OAuth refresh
+ * token, in the shapes phi actually surfaces them (the raw provider body, and
+ * the `ModelsError` wrapper thrown before any request is sent).
+ */
+const deadOAuthMessages = [
+	'OAuth refresh failed for anthropic: Anthropic token refresh request failed. body={"error": "invalid_grant", "error_description": "Refresh token not found or invalid"}',
+	'{"error": "invalid_grant", "error_description": "Refresh token not found or invalid"}',
+	"OAuth auth derivation failed for anthropic",
+	"OAuth refresh returned a token that expires too soon for anthropic",
+];
 
 const openAIExplicitRetryMessage =
 	"An error occurred while processing your request. You can retry your request, or contact us through our help center at help.openai.com if the error persists. Please include the request ID req_******** in your message.";
@@ -12,6 +32,12 @@ const bunFetchSocketClosedMessage =
 const openAIResponsesEarlyEofMessage = "OpenAI Responses stream ended before a terminal response event";
 const wrappedDnsLookupError =
 	"The pending stream has been canceled (caused by: getaddrinfo ENOTFOUND bedrock-runtime.us-east-1.amazonaws.com)";
+const aiohttpTruncatedTransferMessages = [
+	"Response payload is not completed: <TransferEncodingError: 400, message='Not enough data to satisfy transfer length header.'>",
+	"aiohttp.client_exceptions.ClientPayloadError: Response payload is not completed",
+	"TransferEncodingError: 400, message='Not enough data to satisfy transfer length header.'",
+	'Response payload is not completed: <TransferEncodingError: 400, message="Not enough data to satisfy transfer length header.">',
+];
 const azurePeakLoadError =
 	"The system is currently experiencing high demand and cannot process your request. Your request exceeds the maximum usage size allowed during peak load. For improved capacity reliability, consider switching to Provisioned Throughput.";
 
@@ -62,6 +88,13 @@ describe("provider retry classification", () => {
 		expect(isRetryableAssistantError(fauxAssistantMessage("", { stopReason: "error", errorMessage }))).toBe(true);
 	});
 
+	it.each(aiohttpTruncatedTransferMessages)("matches aiohttp truncated-transfer wording: %s", (errorMessage) => {
+		expect(isRetryableAssistantError(fauxAssistantMessage("", { stopReason: "error", errorMessage }))).toBe(true);
+	});
+
+	it.each(["400 Bad Request", "HTTP 400"])("does not retry a bare 400 response: %s", (errorMessage) => {
+		expect(isRetryableAssistantError(fauxAssistantMessage("", { stopReason: "error", errorMessage }))).toBe(false);
+	});
 	it.each(["The pending stream has been canceled", "The pending stream has been canceled (caused by: socket closed)"])(
 		"matches HTTP/2 pending stream cancellation: %s",
 		(errorMessage) => {
@@ -120,6 +153,30 @@ describe("provider retry classification", () => {
 		).toBe(false);
 	});
 
+	it("keeps dead-credential errors out of the same-model retry budget", () => {
+		// Re-asking the same provider with the same revoked refresh token just spends
+		// the budget on a guaranteed identical failure.
+		for (const errorMessage of deadOAuthMessages) {
+			expect(isRetryableAssistantError(fauxAssistantMessage("", { stopReason: "error", errorMessage }))).toBe(false);
+		}
+	});
+
+	it("uses auth-required structure before retry or provider-fallback text", () => {
+		const message = {
+			...fauxAssistantMessage("", { stopReason: "error", errorMessage: "timeout 503 overloaded" }),
+			authRequired: {
+				provider: "custom-timeout-provider",
+				reason: "invalid_grant" as const,
+				loginCommand: "phi" as const,
+				interactiveCommand: "/login custom-timeout-provider",
+				credentialInvalidated: true,
+			},
+		};
+
+		expect(isRetryableAssistantError(message)).toBe(false);
+		expect(isProviderUnavailableAssistantError(message)).toBe(false);
+	});
+
 	it("keeps the ChatGPT subscription usage limit non-retryable", () => {
 		const errorMessage =
 			'OpenAI API error (429): {"code":"subscription_sharing_usage_limit_exceeded","message":"Usage limit reached."}';
@@ -163,6 +220,87 @@ describe("provider retry classification", () => {
 		"400 image exceeds 5 MB maximum: 5316784 bytes > 5242880 bytes",
 	])("does not match status codes inside ids or longer numbers: %s", (errorMessage) => {
 		expect(isRetryableAssistantError(fauxAssistantMessage("", { stopReason: "error", errorMessage }))).toBe(false);
+	});
+});
+
+describe("provider-unavailable classification", () => {
+	it("treats dead credentials as unavailable so the ladder reroutes", () => {
+		// The 2026-09-01 cascade: a Bedrock blip rerouted onto an Anthropic-direct
+		// rung whose refresh token was revoked. Unless this classifies as
+		// "unavailable", the reroute ladder never advances past the dead rung.
+		for (const errorMessage of deadOAuthMessages) {
+			expect(
+				isProviderUnavailableAssistantError(fauxAssistantMessage("", { stopReason: "error", errorMessage })),
+			).toBe(true);
+		}
+	});
+
+	it("does not treat a bare authorization failure as a dead credential", () => {
+		// A single 401/403 can be a transient upstream auth hiccup; rewriting the
+		// session's model on that would be an overreaction.
+		for (const errorMessage of ["401 Unauthorized", "403 Forbidden", "invalid api key"]) {
+			expect(
+				isProviderUnavailableAssistantError(fauxAssistantMessage("", { stopReason: "error", errorMessage })),
+			).toBe(false);
+		}
+	});
+
+	it("still treats capacity throttling as the retry budget's job", () => {
+		expect(
+			isProviderUnavailableAssistantError(
+				fauxAssistantMessage("", { stopReason: "error", errorMessage: "overloaded_error" }),
+			),
+		).toBe(false);
+	});
+});
+
+describe("refusal classification", () => {
+	it("detects a structural refusal regardless of the error text", () => {
+		const message = fauxAssistantMessage("", {
+			stopReason: "error",
+			errorMessage: "something bland",
+			refusal: { category: "cyber", explanation: "Declined." },
+		});
+		expect(isRefusalAssistantError(message)).toBe(true);
+		expect(getRefusalDetails(message)).toEqual({ category: "cyber", explanation: "Declined." });
+	});
+
+	it.each([
+		"The model's safety classifier declined this request (category: cyber): nope.",
+		"This request triggered restrictions on violative cyber content and was blocked under Anthropic's Usage Policy.",
+		"litellm.BadRequestError: response was blocked by content filter",
+		"finish_reason: content_filter",
+		"The response was filtered due to the prompt triggering Azure OpenAI's content management policy",
+		"Bedrock: request blocked by the guardrail policy",
+	])("detects a proxied refusal from error text alone: %s", (errorMessage) => {
+		expect(isRefusalAssistantError(fauxAssistantMessage("", { stopReason: "error", errorMessage }))).toBe(true);
+	});
+
+	it.each(["overloaded_error", "524 status code (no body)", "insufficient_quota", "fetch failed"])(
+		"does not mistake an ordinary failure for a refusal: %s",
+		(errorMessage) => {
+			expect(isRefusalAssistantError(fauxAssistantMessage("", { stopReason: "error", errorMessage }))).toBe(false);
+		},
+	);
+
+	it("keeps refusals out of the same-model retry budget", () => {
+		// Text that would otherwise look retryable ('server error') must not win over
+		// the refusal: retrying a policy decline on the same model declines again.
+		const message = fauxAssistantMessage("", {
+			stopReason: "error",
+			errorMessage: "server error: response was blocked by content filter",
+		});
+		expect(isRefusalAssistantError(message)).toBe(true);
+		expect(isRetryableAssistantError(message)).toBe(false);
+	});
+
+	it("synthesizes details for a text-only refusal and returns none for non-refusals", () => {
+		const message = fauxAssistantMessage("", {
+			stopReason: "error",
+			errorMessage: "blocked by content filter",
+		});
+		expect(getRefusalDetails(message)).toEqual({ category: null, explanation: "blocked by content filter" });
+		expect(getRefusalDetails(fauxAssistantMessage("fine"))).toBeUndefined();
 	});
 });
 

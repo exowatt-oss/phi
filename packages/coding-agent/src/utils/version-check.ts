@@ -1,4 +1,5 @@
 import { compare, valid } from "semver";
+import { isVersionCheckEnabled } from "../core/exowatt-hardening.ts";
 import { fetchWithRetry } from "./management-http.ts";
 import { getPiUserAgent } from "./pi-user-agent.ts";
 
@@ -95,7 +96,8 @@ export async function getLatestPiVersion(
 }
 
 export async function checkForNewPiVersion(currentVersion: string): Promise<LatestPiRelease | undefined> {
-	if (process.env.PI_SKIP_VERSION_CHECK) return undefined;
+	// Exowatt fork: off by default rather than on — see core/exowatt-hardening.ts.
+	if (!isVersionCheckEnabled()) return undefined;
 
 	try {
 		const latestRelease = await getLatestPiRelease(currentVersion);

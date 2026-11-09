@@ -86,7 +86,9 @@ describe("openai-completions responseModel", () => {
 		expect(message.stopReason).toBe("stop");
 	});
 
-	it("leaves responseModel undefined when chunks echo the requested id", async () => {
+	it("records responseModel even when chunks echo the requested id", async () => {
+		// Behind a gateway the served id usually equals the requested one; a host
+		// still needs to see that the server named it rather than stayed silent.
 		mockState.chunks = [
 			{ id: "chatcmpl-2", model: "openrouter/auto", choices: [{ index: 0, delta: { content: "hi" } }] },
 			{
@@ -109,7 +111,7 @@ describe("openai-completions responseModel", () => {
 		);
 
 		expect(message.model).toBe("openrouter/auto");
-		expect(message.responseModel).toBeUndefined();
+		expect(message.responseModel).toBe("openrouter/auto");
 	});
 
 	it("ignores empty or missing chunk.model", async () => {

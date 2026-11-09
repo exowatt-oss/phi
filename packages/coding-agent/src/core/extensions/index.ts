@@ -53,6 +53,8 @@ export type {
 	CompactionEntryDraft,
 	// Context
 	CompactOptions,
+	ContextBreakdown,
+	ContextBreakdownCategory,
 	ContextEditEntryDraft,
 	// Events - Agent
 	ContextEvent,
@@ -125,6 +127,7 @@ export type {
 	MessageUpdateEvent,
 	ModelSelectEvent,
 	ModelSelectSource,
+	NewContextRequest,
 	NormalizedBuildSystemPromptOptions,
 	PowerShellToolCallEvent,
 	PowerShellToolResultEvent,
@@ -149,6 +152,8 @@ export type {
 	ResourcesDiscoverResult,
 	SendMessageHandler,
 	SendUserMessageHandler,
+	SessionBeforeAutoCompactEvent,
+	SessionBeforeAutoCompactResult,
 	SessionBeforeCompactEvent,
 	SessionBeforeCompactResult,
 	SessionBeforeForkEvent,

@@ -3,6 +3,7 @@
  */
 
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
+import type { ServiceTier } from "@earendil-works/pi-ai";
 import chalk from "chalk";
 import { APP_NAME, CONFIG_DIR_NAME, ENV_AGENT_DIR, ENV_SESSION_DIR } from "../config.ts";
 import type { ExtensionFlag } from "../core/extensions/types.ts";
@@ -17,6 +18,7 @@ export interface Args {
 	systemPrompt?: string;
 	appendSystemPrompt?: string[];
 	thinking?: ThinkingLevel;
+	serviceTier?: ServiceTier;
 	continue?: boolean;
 	resume?: boolean;
 	help?: boolean;
@@ -25,6 +27,8 @@ export interface Args {
 	name?: string;
 	noSession?: boolean;
 	session?: string;
+	/** With `--session`: run the opened session in this folder instead of its recorded cwd. */
+	sessionCwd?: string;
 	sessionId?: string;
 	fork?: string;
 	sessionDir?: string;
@@ -59,6 +63,7 @@ export interface Args {
 }
 
 const VALID_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+const VALID_SERVICE_TIERS = ["fast", "default", "flex", "ultrafast"] as const;
 
 export function isValidThinkingLevel(level: string): level is ThinkingLevel {
 	return VALID_THINKING_LEVELS.includes(level as ThinkingLevel);
@@ -133,6 +138,8 @@ export function parseArgs(args: string[]): Args {
 			result.noSession = true;
 		} else if (arg === "--session" && i + 1 < args.length) {
 			result.session = args[++i];
+		} else if (arg === "--session-cwd" && i + 1 < args.length) {
+			result.sessionCwd = args[++i];
 		} else if (arg === "--session-id" && i + 1 < args.length) {
 			result.sessionId = args[++i];
 		} else if (arg === "--fork" && i + 1 < args.length) {
@@ -164,6 +171,18 @@ export function parseArgs(args: string[]): Args {
 				.split(",")
 				.map((s) => s.trim())
 				.filter((name) => name.length > 0);
+		} else if (arg === "--service-tier" && i + 1 < args.length) {
+			const tier = args[++i];
+			if (VALID_SERVICE_TIERS.includes(tier as ServiceTier)) {
+				result.serviceTier = tier as ServiceTier;
+			} else {
+				result.diagnostics.push({
+					type: "error",
+					message: `Invalid service tier "${tier}". Valid values: ${VALID_SERVICE_TIERS.join(", ")}`,
+				});
+			}
+		} else if (arg === "--service-tier") {
+			result.diagnostics.push({ type: "error", message: "--service-tier requires a value" });
 		} else if (arg === "--thinking" && i + 1 < args.length) {
 			const level = args[++i];
 			if (isValidThinkingLevel(level)) {
@@ -290,9 +309,10 @@ ${chalk.bold("Commands:")}
   ${APP_NAME} install <source> [-l]     Install extension source and add to settings
   ${APP_NAME} remove <source> [-l]      Remove extension source from settings
   ${APP_NAME} uninstall <source> [-l]   Alias for remove
-  ${APP_NAME} update [source|self|pi]   Update pi, extensions, or model catalogs
+  ${APP_NAME} update [source|self|phi]  Update ${APP_NAME}, extensions, or model catalogs
   ${APP_NAME} list                      List installed extensions from settings
   ${APP_NAME} config [-l]               Open TUI to enable/disable package resources (Tab switches scope)
+  ${APP_NAME} auth token [options]      Print the configured gateway key for external clients
   ${APP_NAME} auth <command>            Print credentials or check provider readiness
   ${APP_NAME} mcp <command>             Check MCP servers, sign in to or out of OAuth servers
   ${APP_NAME} <command> --help          Show help for install/remove/uninstall/update/list/config/auth/mcp
@@ -308,6 +328,7 @@ ${chalk.bold("Options:")}
   --continue, -c                 Continue previous session
   --resume, -r                   Select a session to resume
   --session <path|id>            Use specific session file or partial UUID
+  --session-cwd <dir>            With --session: run the session in <dir> instead of its recorded cwd
   --session-id <id>              Use exact project session ID, creating it if missing
   --fork <path|id>               Fork specific session file or partial UUID into a new session
   --session-dir <dir>            Directory for session storage and lookup
@@ -323,6 +344,9 @@ ${chalk.bold("Options:")}
   --exclude-tools, -xt <tools>   Comma-separated denylist of tool names or patterns (*) to disable
                                  Applies to all tools, MCP tools included
   --thinking <level>             Set thinking level: off, minimal, low, medium, high, xhigh, max
+  --service-tier <tier>          Processing tier: fast, default, flex, or ultrafast. fast = OpenAI fast tier or
+                                 Anthropic fast mode (Claude Opus 5.5/5/4.8); flex is OpenAI-only;
+                                 ultrafast is sent as-is (Amazon Bedrock UltraFast, e.g. GPT-6 Astra)
   --extension, -e <path>         Load an extension file or builtin:<name> (can be used multiple times)
   --no-extensions, -ne           Disable extension discovery and built-in extensions (explicit -e paths still work)
   --no-mcp                       Disable built-in MCP support: no servers connect and no MCP tools
@@ -348,6 +372,9 @@ ${chalk.bold("Options:")}
 Extensions can register additional flags (e.g., --plan from plan-mode extension).${extensionFlagsText}
 
 ${chalk.bold("Examples:")}
+  # Print the configured gateway key for an external client
+  ${APP_NAME} auth token
+
   # Print a provider API key for an external client
   ${APP_NAME} auth print-api-key --provider openai
 
@@ -398,6 +425,10 @@ ${chalk.bold("Examples:")}
 
   # Start with a specific thinking level
   ${APP_NAME} --thinking high "Solve this complex problem"
+
+  # Use fast mode for this run (OpenAI fast tier / Anthropic fast mode); /fast toggles it in a session
+  ${APP_NAME} --service-tier fast --model openai/gpt-5.6-sol "Solve this quickly"
+  ${APP_NAME} --service-tier fast --model anthropic/claude-opus-5-5   # Anthropic fast mode from the start
 
   # Read-only mode (no file modifications possible)
   ${APP_NAME} --tools read,grep,find,ls -p "Review the code in src/"
@@ -463,8 +494,13 @@ ${chalk.bold("Environment Variables:")}
   ${ENV_SESSION_DIR.padEnd(32)} - Session storage directory (overridden by --session-dir)
   PI_PACKAGE_DIR                   - Override package directory (for Nix/Guix store paths)
   PI_OFFLINE                       - Disable startup network operations when set to 1/true/yes
-  PI_TELEMETRY                     - Override install telemetry when set to 1/true/yes or 0/false/no
+  PI_TELEMETRY                     - Override install telemetry when set to 1/true/yes or 0/false/no (phi default: off)
   PI_SHARE_VIEWER_URL              - Base URL for /share command (default: https://pi.dev/session/)
+  PHI_ENABLE_VERSION_CHECK         - Opt in to the pi.dev version check (phi default: off)
+  PHI_MCP_BROWSER_AUTH             - Allow local MCP browser OAuth when set to 1/true/yes
+  PHI_MCP_INSTRUCTIONS_WAIT_MS    - First-prompt wait for uncached MCP instructions (default: 3000 ms; 0 skips)
+  PHI_MODEL_CATALOG_URL            - Base URL for the remote model catalog (phi default: unset, built-in catalog only)
+  PHI_ENABLE_SHARE                 - Allow /share to upload the session to a GitHub gist (phi default: off)
 
 ${chalk.bold("Built-in Tool Names:")}
   read       - Read file contents

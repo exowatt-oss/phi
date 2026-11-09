@@ -1,0 +1,16 @@
+Copyright (c) 2026 Exowatt, Inc. (modifications)
+
+phi is based on Pi by Mario Zechner:
+https://github.com/earendil-works/pi
+Copyright (c) 2025 Mario Zechner. Pi and phi are distributed under the MIT
+license; the original LICENSE text and upstream history are retained.
+The upstream project does not endorse this fork.
+φ mark by Collin Rijock (Exowatt), after pi's block-grid icon. Released under MIT.
+The upstream clankolas.png artwork by Mario Zechner is retained with the
+Earendil announcement component and its MIT history.
+
+Third-party dependency choices and notices (review the final packaged artifact):
+- node-forge: BSD-3-Clause option selected from its BSD-3-Clause OR GPL-2.0 license.
+- sharp/libvips: libvips is LGPL-3.0-or-later; if redistributing a binary that
+  includes it, provide its license, corresponding source and replacement/relink
+  mechanism as applicable. npm dependency installation alone is not bundling.

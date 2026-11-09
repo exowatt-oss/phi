@@ -20,6 +20,7 @@ export type { OpenAIResponsesOptions } from "./api/openai-responses.ts";
 export type { PiMessagesEvent, PiMessagesOptions, PiMessagesRewriteImpact } from "./api/pi-messages.ts";
 export * from "./auth/context.ts";
 export * from "./auth/credential-store.ts";
+export * from "./auth/errors.ts";
 export * from "./auth/helpers.ts";
 export * from "./auth/types.ts";
 export type {
@@ -41,6 +42,7 @@ export * from "./utils/identity.ts";
 export * from "./utils/json-parse.ts";
 export * from "./utils/overflow.ts";
 export * from "./utils/retry.ts";
+export * from "./utils/stream-idle-guard.ts";
 export { contentText, getSystemMessageText, renderSystemMessageUpdate } from "./utils/text.ts";
 export * from "./utils/transcript.ts";
 export * from "./utils/typebox-helpers.ts";

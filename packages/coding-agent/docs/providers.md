@@ -17,6 +17,20 @@ Run `/logout` and select a provider to remove its stored credential. This does n
 
 `auth.json` can contain API keys and OAuth tokens. Keep it private and do not commit it.
 
+## OAuth Troubleshooting
+
+An `invalid_grant` response means the provider no longer accepts the stored refresh token. Phi removes the rejected credential inside the same locked refresh transaction, stops automatic retries, and reports an authentication-required error. A login queued by another process runs after that transaction and is preserved. The session and failed turn remain available to retry after login.
+
+For Anthropic, recover from a terminal:
+
+1. Run `phi` interactively.
+2. Enter `/login anthropic` and complete the browser flow.
+3. Return to the original client and retry the failed turn.
+
+`/login` is an interactive command; `phi "/login anthropic"` would submit text as an initial model prompt instead of running the login flow.
+
+Concurrent phi processes that use the same `auth.json` serialize rotating refreshes with a cross-process lock and reread the credential before writing. Treat OAuth credentials as machine-local: do not copy or synchronize `auth.json` between a Mac and a devbox. Independent machines have independent stores and cannot coordinate token rotation, so run the login flow separately on each machine. Whether a provider permits multiple simultaneous machine logins is provider policy, not a guarantee phi can make.
+
 ## Use an API key from the environment
 
 Environment variables are useful in CI and anywhere Pi should not store the key. Set the variable before starting Pi:
@@ -107,7 +121,7 @@ Radius is a service crafted for Pi by the builders of Pi, Earendil Works. It pro
 
 To get started, run `/login radius` in Pi. This adds Radius as a provider, and its models appear in `/model` like any other provider's.
 
-Radius also has an MCP server, so Pi can manage Radius for you.
+Radius also has an MCP server, so Pi can manage Radius for you. Upstream Pi offers to add it to `mcp.json` after `/login radius`; phi does not, because its native MCP runtime authenticates servers with MCP OAuth or static headers rather than a provider login. Add the server to `mcp.json` yourself to use it (see [MCP](mcp.md)).
 
 Radius is currently in early alpha and evolving quickly. See [radius.earendil.com](https://radius.earendil.com) for more.
 

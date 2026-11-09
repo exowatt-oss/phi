@@ -112,6 +112,11 @@ export interface HarnessOptions {
 	provider?: string;
 	models?: FauxModelDefinition[];
 	settings?: Partial<Settings>;
+	/** Replaces the in-memory manager built from `settings`, e.g. a file-backed one with project trust. */
+	settingsManager?: SettingsManager;
+	/** Replaces the in-memory session manager, e.g. a file-backed one to test resume. */
+	sessionManager?: SessionManager;
+	systemPrompt?: string;
 	tools?: AgentTool[];
 	initialActiveToolNames?: string[];
 	allowedToolNames?: string[];
@@ -120,8 +125,6 @@ export interface HarnessOptions {
 	extensionFactories?: Array<InlineExtension | CreateTestExtensionsResultInput>;
 	withConfiguredAuth?: boolean;
 	modelsJson?: Record<string, unknown>;
-	/** Session to continue, for example to test a resume. Default: a new in-memory session. */
-	sessionManager?: SessionManager;
 }
 
 export interface Harness {
@@ -161,7 +164,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 	const extensionRunnerRef: { current?: ExtensionRunner } = {};
 
 	const sessionManager = options.sessionManager ?? SessionManager.inMemory();
-	const settingsManager = SettingsManager.inMemory(options.settings);
+	const settingsManager = options.settingsManager ?? SettingsManager.inMemory(options.settings);
 
 	const authStorage = AuthStorage.inMemory();
 	if (withConfiguredAuth) {

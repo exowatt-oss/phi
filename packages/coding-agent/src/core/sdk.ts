@@ -1,10 +1,18 @@
 import { join } from "node:path";
 import { Agent, type AgentMessage, setDefaultStreamFn, type ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { ModelsSimpleStreamOptions } from "@earendil-works/pi-ai";
-import { clampThinkingLevel, type Message, type Model, streamSimple } from "@earendil-works/pi-ai/compat";
+import {
+	clampThinkingLevel,
+	type Message,
+	type Model,
+	type ServiceTier,
+	streamSimple,
+} from "@earendil-works/pi-ai/compat";
 import { getAgentDir } from "../config.ts";
+import { enabledModelBundlePaths } from "../extensions/hub/model-bundles.ts";
+import { fitImagesToProviderLimits } from "../utils/image-limits.ts";
 import { resolvePath } from "../utils/paths.ts";
-import { AgentSession } from "./agent-session.ts";
+import { AgentSession, type ServiceTierRef } from "./agent-session.ts";
 import { formatNoModelsAvailableMessage } from "./auth-guidance.ts";
 import { CacheWarmer } from "./cache-warmer.ts";
 import { getClientIdentity } from "./client-identity.ts";
@@ -58,6 +66,8 @@ export interface CreateAgentSessionOptions {
 	model?: Model<any>;
 	/** Thinking level. Default: from settings, else 'medium' (clamped to model capabilities) */
 	thinkingLevel?: ThinkingLevel;
+	/** Processing tier (OpenAI fast/flex, Anthropic fast mode). Default: from settings, else 'default'. */
+	serviceTier?: ServiceTier;
 	/** Models available for cycling (Ctrl+P in interactive mode) */
 	scopedModels?: Array<{ model: Model<any>; thinkingLevel?: ThinkingLevel }>;
 
@@ -195,7 +205,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 	const authPath = options.agentDir ? join(agentDir, "auth.json") : undefined;
 	const modelsPath = options.agentDir ? join(agentDir, "models.json") : undefined;
-	const modelRuntime = options.modelRuntime ?? (await ModelRuntime.create({ authPath, modelsPath }));
+	const modelLayerPathsResolver = options.agentDir ? () => enabledModelBundlePaths(agentDir) : undefined;
+	const modelRuntime =
+		options.modelRuntime ?? (await ModelRuntime.create({ authPath, modelsPath, modelLayerPathsResolver }));
 
 	const settingsManager = options.settingsManager ?? SettingsManager.create(cwd, agentDir);
 	const sessionManager = options.sessionManager ?? SessionManager.create(cwd, getDefaultSessionDir(cwd, agentDir));
@@ -270,6 +282,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		thinkingLevel = settingsManager.getDefaultThinkingLevel() ?? DEFAULT_THINKING_LEVEL;
 	}
 
+	// Keep the requested preference separate from the effective initial clamp so
+	// later model switches in this session can restore it on a more capable model.
+	const preferredThinkingLevel = thinkingLevel;
+
 	// Clamp to model capabilities
 	if (!model) {
 		thinkingLevel = "off";
@@ -293,12 +309,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	const isExcludedTool = excludedToolNames ? createToolNameMatcher(excludedToolNames) : undefined;
 	const initialActiveToolNames = (selectedToolNames ?? defaultToolNames).filter((name) => !isExcludedTool?.(name));
 
-	// Create convertToLlm wrapper that filters images if blockImages is enabled (defense-in-depth)
-	const convertToLlmWithBlockImages = (messages: AgentMessage[]): Message[] => {
+	// Create convertToLlm wrapper that filters images if blockImages is enabled (defense-in-depth),
+	// and otherwise keeps every image within provider limits for this request
+	const convertToLlmWithBlockImages = async (messages: AgentMessage[]): Promise<Message[]> => {
 		const converted = convertToLlm(messages);
 		// Check setting dynamically so mid-session changes take effect
 		if (!settingsManager.getBlockImages()) {
-			return converted;
+			return fitImagesToProviderLimits(converted);
 		}
 		// Filter out ImageContent from all messages, replacing with text placeholder
 		return converted.map((msg) => {
@@ -331,19 +348,32 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	};
 
 	const extensionRunnerRef: { current?: ExtensionRunner } = {};
+	// `--service-tier` seeds the session override; `/fast` mutates it later.
+	const serviceTierRef: ServiceTierRef = { override: options.serviceTier };
 	const cacheWarmer = new CacheWarmer(
 		modelRuntime,
 		sessionManager,
 		() => settingsManager.getCacheWarmingMode(),
 		async (event) => extensionRunnerRef.current?.emitCacheWarmingDecision(event) ?? event.action,
 	);
-	const buildRequestOptions = (options: ModelsSimpleStreamOptions = {}): ModelsSimpleStreamOptions => {
+	const buildRequestOptions = (
+		requestModel: Model<any>,
+		options: ModelsSimpleStreamOptions = {},
+	): ModelsSimpleStreamOptions => {
 		const providerRetrySettings = settingsManager.getProviderRetrySettings();
 		const httpIdleTimeoutMs = settingsManager.getHttpIdleTimeoutMs();
+		const streamIdleTimeoutMs = settingsManager.getStreamIdleTimeoutMs();
+		// SDKs treat timeout=0 as 0ms (immediate timeout), not "no timeout".
+		// Use max int32 to effectively disable the timeout.
 		const effectiveTimeoutMs = httpIdleTimeoutMs === 0 ? 2147483647 : httpIdleTimeoutMs;
 		const headerRunner = extensionRunnerRef.current;
+		// Omit the tier when it resolves to "default": the wire param is a no-op
+		// there, and providers without tiers (e.g. GitHub Copilot) reject it.
+		const resolvedServiceTier = serviceTierRef.override ?? settingsManager.getServiceTierForModel(requestModel.id);
 		return {
 			...options,
+			serviceTier: options.serviceTier ?? (resolvedServiceTier === "default" ? undefined : resolvedServiceTier),
+			idleTimeoutMs: options.idleTimeoutMs ?? streamIdleTimeoutMs,
 			timeoutMs: options.timeoutMs ?? providerRetrySettings.timeoutMs ?? effectiveTimeoutMs,
 			websocketConnectTimeoutMs: options.websocketConnectTimeoutMs ?? settingsManager.getWebSocketConnectTimeoutMs(),
 			maxRetries: options.maxRetries ?? providerRetrySettings.maxRetries,
@@ -410,7 +440,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		},
 		convertToLlm: convertToLlmWithBlockImages,
 		streamFn: async (model, context, options) => {
-			const requestOptions = buildRequestOptions(options);
+			const requestOptions = buildRequestOptions(model, options);
 			// Compaction and summaries use their own routing ids; only session requests
 			// replace the cache entry, so warming restarts from them. Keep warming while
 			// the current transcript still extends the request's prefix. Agent state may
@@ -456,6 +486,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		settingsManager,
 		cwd,
 		scopedModels: options.scopedModels,
+		preferredThinkingLevel,
 		resourceLoader,
 		customTools: options.customTools,
 		modelRuntime,
@@ -466,6 +497,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		allowedToolNames,
 		excludedToolNames,
 		extensionRunnerRef,
+		serviceTierRef,
 		sessionStartEvent: options.sessionStartEvent,
 	});
 

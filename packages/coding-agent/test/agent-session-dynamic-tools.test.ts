@@ -253,4 +253,62 @@ describe("AgentSession dynamic tool registration", () => {
 
 		session.dispose();
 	});
+
+	it("only auto-activates explicitly opted-in inactive tools", async () => {
+		const settingsManager = SettingsManager.create(tempDir, agentDir);
+		const sessionManager = SessionManager.inMemory();
+		const resourceLoader = new DefaultResourceLoader({
+			cwd: tempDir,
+			agentDir,
+			settingsManager,
+			extensionFactories: [
+				(pi) => {
+					pi.registerTool({
+						name: "deferred_tool",
+						label: "Deferred Tool",
+						description: "Deferred",
+						autoActivateOnCall: (context) => context.messages.length > 0,
+						parameters: Type.Object({}),
+						execute: async () => ({ content: [{ type: "text", text: "ok" }], details: {} }),
+					});
+					pi.registerTool({
+						name: "ordinary_tool",
+						label: "Ordinary Tool",
+						description: "Ordinary",
+						parameters: Type.Object({}),
+						execute: async () => ({ content: [{ type: "text", text: "ok" }], details: {} }),
+					});
+				},
+			],
+		});
+		await resourceLoader.reload();
+		const { session } = await createAgentSession({
+			cwd: tempDir,
+			agentDir,
+			model: getModel("anthropic", "claude-sonnet-4-5")!,
+			settingsManager,
+			sessionManager,
+			resourceLoader,
+		});
+		await session.bindExtensions({});
+		session.setActiveToolsByName([]);
+		const ineligible = await session.agent.resolveToolCall?.("deferred_tool", {
+			messages: [],
+			tools: [],
+		});
+		const deferred = await session.agent.resolveToolCall?.("deferred_tool", {
+			messages: [{ role: "user", content: "selected", timestamp: Date.now() }],
+			tools: [],
+		});
+		const ordinary = await session.agent.resolveToolCall?.("ordinary_tool", {
+			messages: [],
+			tools: [],
+		});
+		expect(ineligible).toBeUndefined();
+		expect(deferred?.name).toBe("deferred_tool");
+		expect(ordinary).toBeUndefined();
+		expect(session.getActiveToolNames()).toContain("deferred_tool");
+		expect(session.getActiveToolNames()).not.toContain("ordinary_tool");
+		session.dispose();
+	});
 });

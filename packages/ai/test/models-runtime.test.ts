@@ -1,10 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
 import { InMemoryCredentialStore } from "../src/auth/credential-store.ts";
+import { OAuthTokenError } from "../src/auth/errors.ts";
 import type { ApiKeyAuth, CredentialStore, OAuthAuth, ProviderAuth } from "../src/auth/types.ts";
 import { calculateCost, createModels, createProvider, hasApi, type Provider } from "../src/models.ts";
 import { InMemoryModelsStore, type ModelsStore, type ModelsStoreEntry } from "../src/models-store.ts";
 import type { Api, AssistantMessage, Context, Model, SimpleStreamOptions, StreamOptions, Usage } from "../src/types.ts";
 import { AssistantMessageEventStream } from "../src/utils/event-stream.ts";
+import { isProviderUnavailableAssistantError, isRetryableAssistantError } from "../src/utils/retry.ts";
 
 function testModel(provider: string, id: string): Model<Api> {
 	return {
@@ -493,6 +495,105 @@ describe("Models runtime", () => {
 		expect(await credentials.read("oauth-dynamic")).toMatchObject({ access: "fresh", refresh: "rotated" });
 	});
 
+	it("does not let one model-catalog caller's abort suppress another caller's real catalog refresh", async () => {
+		const credentials = new InMemoryCredentialStore();
+		let releaseRefresh: () => void = () => {};
+		const refreshGate = new Promise<void>((resolve) => {
+			releaseRefresh = resolve;
+		});
+		let notifyStarted: () => void = () => {};
+		const started = new Promise<void>((resolve) => {
+			notifyStarted = resolve;
+		});
+		await credentials.modify("oauth-dynamic", async () => ({
+			type: "oauth",
+			access: "expired",
+			refresh: "refresh",
+			expires: 0,
+		}));
+		const models = createModels({ credentials });
+		let catalogFetches = 0;
+		models.setProvider(
+			createProvider({
+				id: "oauth-dynamic",
+				auth: {
+					oauth: testOAuth({
+						refresh: async () => {
+							notifyStarted();
+							await refreshGate;
+							return {
+								type: "oauth",
+								access: "fresh",
+								refresh: "rotated",
+								expires: Date.now() + 60_000,
+							};
+						},
+					}),
+				},
+				models: [],
+				fetchModels: async ({ signal }) => {
+					expect(signal?.aborted).not.toBe(true);
+					catalogFetches++;
+					return [testModel("oauth-dynamic", "fresh-catalog-model")];
+				},
+				api: {
+					stream: () => new AssistantMessageEventStream(),
+					streamSimple: () => new AssistantMessageEventStream(),
+				},
+			}),
+		);
+		const firstController = new AbortController();
+		const first = models.refresh({ signal: firstController.signal });
+		await started;
+		const second = models.refresh();
+		firstController.abort();
+		releaseRefresh();
+
+		const [firstResult, secondResult] = await Promise.all([first, second]);
+		expect(firstResult.aborted).toBe(true);
+		expect(secondResult).toMatchObject({ aborted: false });
+		expect(secondResult.errors.size).toBe(0);
+		expect(catalogFetches).toBe(1);
+		expect(models.getModel("oauth-dynamic", "fresh-catalog-model")).toBeDefined();
+		expect(await credentials.read("oauth-dynamic")).toMatchObject({ access: "fresh" });
+	});
+
+	it("atomically invalidates invalid_grant during model-catalog refresh", async () => {
+		const credentials = new InMemoryCredentialStore();
+		let refreshes = 0;
+		await credentials.modify("oauth-dynamic", async () => ({
+			type: "oauth",
+			access: "expired",
+			refresh: "rejected",
+			expires: 0,
+		}));
+		const models = createModels({ credentials });
+		models.setProvider(
+			testProvider({
+				id: "oauth-dynamic",
+				auth: {
+					oauth: testOAuth({
+						refresh: async () => {
+							refreshes++;
+							throw new OAuthTokenError("invalid_grant", 400);
+						},
+					}),
+				},
+				// The offline cache-restore phase runs before auth; only the network phase needs auth.
+				refreshModels: async ({ allowNetwork }) => {
+					if (allowNetwork) throw new Error("must not refresh models without auth");
+				},
+			}),
+		);
+
+		const first = await models.refresh();
+		expect(first.errors.get("oauth-dynamic")).toMatchObject({ code: "auth_required" });
+		expect(await credentials.read("oauth-dynamic")).toBeUndefined();
+		expect(refreshes).toBe(1);
+		expect((await models.refresh()).errors.size).toBe(0);
+		expect(refreshes).toBe(1);
+	});
+
 	it("persists an OAuth refresh that started before the model refresh was cancelled", async () => {
 		const credentials = new InMemoryCredentialStore();
 		await credentials.modify("p1", async () => ({
@@ -979,11 +1080,11 @@ describe("Models runtime", () => {
 		expect(refresh).toHaveBeenCalledOnce();
 	});
 
-	it("rejects with code oauth when refresh fails, preserving the stored credential", async () => {
+	it("preserves credentials after a retryable OAuth refresh failure", async () => {
 		const credentials = new InMemoryCredentialStore();
 		const oauth = testOAuth({
 			refresh: async () => {
-				throw new Error("invalid_grant");
+				throw new Error("temporarily unavailable");
 			},
 		});
 		const models = createModels({ credentials });
@@ -991,8 +1092,177 @@ describe("Models runtime", () => {
 		await credentials.modify("p1", async () => ({ type: "oauth", access: "old", refresh: "r", expires: 0 }));
 
 		await expect(models.getAuth("p1")).rejects.toMatchObject({ code: "oauth" });
-		// credential preserved for retry / re-login
 		expect(((await credentials.read("p1")) as { access: string }).access).toBe("old");
+	});
+
+	it("does not let unstructured invalid_grant text authorize credential deletion", async () => {
+		const credentials = new InMemoryCredentialStore();
+		const models = createModels({ credentials });
+		models.setProvider(
+			testProvider({
+				id: "anthropic",
+				auth: {
+					oauth: testOAuth({
+						refresh: async () => {
+							throw new Error("invalid_grant misleading-extension-diagnostic");
+						},
+					}),
+				},
+			}),
+		);
+		const original = { type: "oauth" as const, access: "old", refresh: "still-valid", expires: 0 };
+		await credentials.modify("anthropic", async () => original);
+
+		let thrown: unknown;
+		try {
+			await models.getAuth("anthropic");
+		} catch (error) {
+			thrown = error;
+		}
+		expect(thrown).toMatchObject({ code: "oauth", authRequired: undefined });
+		expect(thrown).not.toHaveProperty("cause");
+		expect((thrown as Error).message).not.toContain("misleading-extension-diagnostic");
+		expect((thrown as Error).message).not.toContain("invalid_grant");
+		expect(await credentials.read("anthropic")).toEqual(original);
+	});
+
+	it.each([
+		[
+			"throwing oauthErrorCode accessor",
+			() => {
+				const error = new Error("sentinel-accessor-container");
+				Object.defineProperty(error, "oauthErrorCode", {
+					get: () => {
+						throw new Error("sentinel-accessor-detail");
+					},
+				});
+				return error;
+			},
+		],
+		[
+			"hostile getOwnPropertyDescriptor proxy",
+			() =>
+				new Proxy(new Error("sentinel-proxy-container"), {
+					getOwnPropertyDescriptor: () => {
+						throw new Error("sentinel-proxy-detail");
+					},
+				}),
+		],
+	] as const)("scrubs %s failures without deleting the credential", async (_name, createError) => {
+		const credentials = new InMemoryCredentialStore();
+		const original = { type: "oauth" as const, access: "old", refresh: "still-valid", expires: 0 };
+		await credentials.modify("p1", async () => original);
+		const models = createModels({ credentials });
+		models.setProvider(
+			testProvider({
+				id: "p1",
+				auth: { oauth: testOAuth({ refresh: async () => Promise.reject(createError()) }) },
+			}),
+		);
+
+		let thrown: unknown;
+		try {
+			await models.getAuth("p1");
+		} catch (error) {
+			thrown = error;
+		}
+		expect(thrown).toMatchObject({ code: "oauth", message: "OAuth refresh failed for p1" });
+		expect(thrown).not.toHaveProperty("cause");
+		expect(JSON.stringify(thrown)).not.toContain("sentinel");
+		expect(await credentials.read("p1")).toEqual(original);
+	});
+
+	it("invalidates an invalid_grant credential once and emits typed login guidance", async () => {
+		const credentials = new InMemoryCredentialStore();
+		let refreshes = 0;
+		const models = createModels({ credentials });
+		models.setProvider(
+			testProvider({
+				id: "anthropic",
+				auth: {
+					oauth: testOAuth({
+						refresh: async () => {
+							refreshes++;
+							throw new OAuthTokenError("invalid_grant", 400);
+						},
+					}),
+				},
+			}),
+		);
+		await credentials.modify("anthropic", async () => ({
+			type: "oauth",
+			access: "old",
+			refresh: "stale",
+			expires: 0,
+		}));
+
+		const [first, second] = await Promise.all([
+			models.completeSimple(testModel("anthropic", "model-a"), context),
+			models.completeSimple(testModel("anthropic", "model-a"), context),
+		]);
+		expect(refreshes).toBe(1);
+		expect(await credentials.read("anthropic")).toBeUndefined();
+		for (const result of [first, second]) {
+			expect(result.stopReason).toBe("error");
+			expect(isRetryableAssistantError(result)).toBe(false);
+			expect(isProviderUnavailableAssistantError(result)).toBe(false);
+			expect(result.errorMessage).toContain("Run `phi`, enter `/login anthropic`");
+			expect(result.errorMessage).not.toContain("stale");
+			expect(result.authRequired).toEqual({
+				provider: "anthropic",
+				reason: "invalid_grant",
+				loginCommand: "phi",
+				interactiveCommand: "/login anthropic",
+				credentialInvalidated: true,
+			});
+		}
+	});
+
+	it("does not delete a newer OAuth login that wins the invalid_grant race", async () => {
+		const credentials = new InMemoryCredentialStore();
+		let rejectRefresh: (() => void) | undefined;
+		const refreshStarted = new Promise<void>((resolve) => {
+			rejectRefresh = resolve;
+		});
+		let failRefresh: (() => void) | undefined;
+		const refreshBlocked = new Promise<void>((resolve) => {
+			failRefresh = resolve;
+		});
+		const models = createModels({ credentials });
+		models.setProvider(
+			testProvider({
+				id: "anthropic",
+				auth: {
+					oauth: testOAuth({
+						refresh: async () => {
+							rejectRefresh?.();
+							await refreshBlocked;
+							throw new OAuthTokenError("invalid_grant", 400);
+						},
+					}),
+				},
+			}),
+		);
+		await credentials.modify("anthropic", async () => ({
+			type: "oauth",
+			access: "old",
+			refresh: "stale",
+			expires: 0,
+		}));
+
+		const request = models.getAuth("anthropic");
+		await refreshStarted;
+		const login = credentials.modify("anthropic", async () => ({
+			type: "oauth",
+			access: "new-access",
+			refresh: "new-refresh",
+			expires: Date.now() + 60 * 60_000,
+		}));
+		failRefresh?.();
+
+		await login;
+		await expect(request).rejects.toMatchObject({ code: "auth_required" });
+		expect(await credentials.read("anthropic")).toMatchObject({ refresh: "new-refresh" });
 	});
 
 	it("serializes concurrent OAuth refreshes through store.modify (no double refresh)", async () => {
@@ -1070,7 +1340,7 @@ describe("Models runtime", () => {
 		await expect(oauthModels.getAuth("p1")).rejects.toMatchObject({ code: "auth" });
 	});
 
-	it("keeps the underlying reason in wrapped oauth refresh errors", async () => {
+	it("does not retain untrusted OAuth refresh failure details", async () => {
 		const credentials = new InMemoryCredentialStore();
 		await credentials.modify("p1", async () => ({ type: "oauth", access: "old", refresh: "r", expires: 0 }));
 		const models = createModels({ credentials });
@@ -1080,16 +1350,22 @@ describe("Models runtime", () => {
 				auth: {
 					oauth: testOAuth({
 						refresh: async () => {
-							throw new Error("token refresh failed (400): invalid_grant");
+							throw new Error("token endpoint unavailable sentinel-secret");
 						},
 					}),
 				},
 			}),
 		);
 
-		await expect(models.getAuth("p1")).rejects.toThrow(
-			"OAuth refresh failed for p1: token refresh failed (400): invalid_grant",
-		);
+		let thrown: unknown;
+		try {
+			await models.getAuth("p1");
+		} catch (error) {
+			thrown = error;
+		}
+		expect(thrown).toMatchObject({ code: "oauth", message: "OAuth refresh failed for p1" });
+		expect(thrown).not.toHaveProperty("cause");
+		expect(JSON.stringify(thrown)).not.toContain("sentinel-secret");
 	});
 
 	it("wraps api-key auth failures in ModelsError", async () => {

@@ -1,4 +1,4 @@
-# Pi
+# phi
 
 Pi is an extensible AI agent that works from your terminal. Give it a goal and a working folder, and it can inspect files, run commands, edit content, and work through multi-step tasks.
 
@@ -13,6 +13,7 @@ If Pi is already installed, choose what you want to do:
 - [Use Pi interactively](usage.md) to add files, run commands, direct ongoing work, and export results.
 - [Choose a model](models.md) or connect a subscription, API key, local model, or compatible endpoint.
 - [Continue or branch a session](sessions.md) to resume work or explore another approach without losing history.
+- [Run bounded autonomous work with `/loop`](loop.md), with verification and live visibility.
 - [Configure Pi](configuration.md) for your preferences, working folders, instructions, and reusable resources.
 - [Understand how Pi works](how-pi-works.md), including tools, context, sessions, and the agent loop.
 
@@ -26,6 +27,7 @@ Use the [Quickstart customization chooser](quickstart.md#choose-how-to-customize
 - Use [print mode](cli.md#invocation-and-output) for one-off and scripted tasks.
 - Use [JSON event stream mode](json.md) to consume structured events from one run.
 - Use [RPC mode](rpc.md) to control a separate Pi process.
+- Use [phi remote](remote.md) to see and drive every phi session on this machine from the phi iPhone app.
 - Use the [TypeScript SDK](sdk.md) to run Pi inside an application.
 
 ## Find reference and setup information
@@ -33,6 +35,8 @@ Use the [Quickstart customization chooser](quickstart.md#choose-how-to-customize
 Use the reference pages to look up [CLI options](cli.md), [settings](settings.md), [providers](providers.md), [keybindings](keybindings.md), and [environment variables](environment-variables.md).
 
 For platform-specific help, see [Terminal Setup](terminal-setup.md), [Windows](windows.md), [tmux](tmux.md), [Termux on Android](termux.md), or [Containerization](containerization.md).
+
+The [phi remote protocol](remote-protocol.md) is the hub ↔ app WebSocket contract (v1).
 
 ## Work safely
 

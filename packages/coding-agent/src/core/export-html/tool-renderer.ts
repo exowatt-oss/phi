@@ -90,6 +90,8 @@ export function createToolHtmlRenderer(deps: ToolHtmlRendererDeps): ToolHtmlRend
 			argsComplete: true,
 			isPartial,
 			expanded,
+			// HTML export keeps upstream density; the minimal TUI mode does not apply here.
+			display: "compact",
 			showImages: false,
 			isError,
 			durationMs: undefined,
@@ -144,7 +146,7 @@ export function createToolHtmlRenderer(deps: ToolHtmlRendererDeps): ToolHtmlRend
 				// Render collapsed
 				const collapsedComponent = toolDef.renderResult(
 					agentToolResult,
-					{ expanded: false, isPartial: false },
+					{ expanded: false, isPartial: false, display: "compact" },
 					theme,
 					createRenderContext(toolCallId, renderedResultComponents.get(toolCallId), false, false, isError),
 				);
@@ -154,7 +156,7 @@ export function createToolHtmlRenderer(deps: ToolHtmlRendererDeps): ToolHtmlRend
 				// Render expanded
 				const expandedComponent = toolDef.renderResult(
 					agentToolResult,
-					{ expanded: true, isPartial: false },
+					{ expanded: true, isPartial: false, display: "compact" },
 					theme,
 					createRenderContext(toolCallId, renderedResultComponents.get(toolCallId), true, false, isError),
 				);

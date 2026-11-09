@@ -28,9 +28,13 @@ import type {
 	AgentToolCall,
 	AgentToolCallOutcome,
 	AgentToolResult,
+	CompactionRequest,
+	NewContextRequest,
 	PrepareNextTurnContext,
 	StreamFn,
 } from "./types.ts";
+
+const MAX_CONSECUTIVE_TRUNCATED_TOOL_CALLS = 3;
 
 export type AgentEventSink = (event: AgentEvent) => Promise<void> | void;
 
@@ -180,6 +184,7 @@ async function runLoop(
 	let currentContext = initialContext;
 	let config = initialConfig;
 	let lastCompletedTurn: PrepareNextTurnContext | undefined;
+	let consecutiveTruncatedToolCallResponses = 0;
 	let explicitContinuation = false;
 	// Check for steering messages at start (user may have typed while waiting)
 	let pendingMessages: AgentMessage[] = (await config.getSteeringMessages?.()) || [];
@@ -266,19 +271,30 @@ async function runLoop(
 
 			// Check for tool calls
 			const toolCalls = message.content.filter((c) => c.type === "toolCall");
+			const isTruncatedToolCallResponse = message.stopReason === "length" && toolCalls.length > 0;
+			consecutiveTruncatedToolCallResponses = isTruncatedToolCallResponse
+				? consecutiveTruncatedToolCallResponses + 1
+				: 0;
 
 			const toolResults: ToolResultMessage[] = [];
+			let newContext: NewContextRequest | undefined;
+			let compaction: CompactionRequest | undefined;
 			hasMoreToolCalls = false;
 			if (toolCalls.length > 0) {
 				// A "length" stop means the output was cut off by the token limit, so
 				// every tool call in the message may carry truncated arguments. Fail
 				// them all instead of executing potentially borked calls.
-				const executedToolBatch =
-					message.stopReason === "length"
-						? await failToolCallsFromTruncatedMessage(toolCalls, emit)
-						: await executeToolCalls(currentContext, message, config, signal, emit);
+				const executedToolBatch = isTruncatedToolCallResponse
+					? await failToolCallsFromTruncatedMessage(
+							toolCalls,
+							emit,
+							consecutiveTruncatedToolCallResponses >= MAX_CONSECUTIVE_TRUNCATED_TOOL_CALLS,
+						)
+					: await executeToolCalls(currentContext, message, config, signal, emit);
 				toolResults.push(...executedToolBatch.messages);
-				hasMoreToolCalls = !executedToolBatch.terminate;
+				newContext = executedToolBatch.newContext;
+				compaction = executedToolBatch.compaction;
+				hasMoreToolCalls = !executedToolBatch.terminate || newContext !== undefined || compaction !== undefined;
 
 				for (const result of toolResults) {
 					currentContext.messages.push(result);
@@ -291,11 +307,15 @@ async function runLoop(
 				toolResults,
 				context: currentContext,
 				newMessages,
+				newContext,
+				compaction,
 			};
 			const decision = await config.finishTurn?.(lastCompletedTurn, signal);
 			await emit({ type: "turn_end", message, toolResults });
 
-			if (decision?.action === "end") {
+			// phi: a tool result that asked for a fresh context window or a compaction must reach
+			// prepareNextTurn, so the run continues even when the turn would otherwise end.
+			if (decision?.action === "end" && !newContext && !compaction) {
 				await emit({ type: "agent_end", messages: newMessages });
 				return;
 			}
@@ -488,6 +508,7 @@ async function streamAssistantResponse(
 async function failToolCallsFromTruncatedMessage(
 	toolCalls: AgentToolCall[],
 	emit: AgentEventSink,
+	terminate: boolean,
 ): Promise<ExecutedToolCallBatch> {
 	const messages: ToolResultMessage[] = [];
 	for (const toolCall of toolCalls) {
@@ -500,7 +521,7 @@ async function failToolCallsFromTruncatedMessage(
 		const finalized: FinalizedToolCallOutcome = {
 			toolCall,
 			result: createErrorToolResult(
-				`Tool call "${toolCall.name}" was not executed: the response hit the output token limit, so its arguments may be truncated. Re-issue the tool call with complete arguments.`,
+				`Tool call "${toolCall.name}" was not executed because the response hit the output token limit. Do not re-issue the same call unchanged; emit a strictly smaller call instead, splitting file writes into smaller chunks (create the file first, then append or edit).`,
 			),
 			isError: true,
 		};
@@ -509,7 +530,7 @@ async function failToolCallsFromTruncatedMessage(
 		await emitToolResultMessage(toolResultMessage, emit);
 		messages.push(toolResultMessage);
 	}
-	return { messages, terminate: false };
+	return { messages, terminate };
 }
 
 /**
@@ -523,24 +544,37 @@ async function executeToolCalls(
 	emit: AgentEventSink,
 ): Promise<ExecutedToolCallBatch> {
 	const toolCalls = assistantMessage.content.filter((c) => c.type === "toolCall");
-	const hasSequentialToolCall = toolCalls.some(
-		(tc) => currentContext.tools?.find((t) => t.name === tc.name)?.executionMode === "sequential",
-	);
+	// Resolve before selecting the execution mode. A resolver may return a tool
+	// whose mode must serialize the whole batch, even though it is not in the
+	// provider-visible tool list yet.
+	const resolvedTools = await resolveToolCalls(currentContext, toolCalls, config, signal);
+	const hasSequentialToolCall = resolvedTools.some((resolved) => resolved.tool?.executionMode === "sequential");
 	if (config.toolExecution === "sequential" || hasSequentialToolCall) {
-		return executeToolCallsSequential(currentContext, assistantMessage, toolCalls, config, signal, emit);
+		return executeToolCallsSequential(
+			currentContext,
+			assistantMessage,
+			toolCalls,
+			resolvedTools,
+			config,
+			signal,
+			emit,
+		);
 	}
-	return executeToolCallsParallel(currentContext, assistantMessage, toolCalls, config, signal, emit);
+	return executeToolCallsParallel(currentContext, assistantMessage, toolCalls, resolvedTools, config, signal, emit);
 }
 
 type ExecutedToolCallBatch = {
 	messages: ToolResultMessage[];
 	terminate: boolean;
+	newContext?: NewContextRequest;
+	compaction?: CompactionRequest;
 };
 
 async function executeToolCallsSequential(
 	currentContext: AgentContext,
 	assistantMessage: AssistantMessage,
 	toolCalls: AgentToolCall[],
+	resolvedTools: ResolvedToolCall[],
 	config: AgentLoopConfig,
 	signal: AbortSignal | undefined,
 	emit: AgentEventSink,
@@ -548,7 +582,7 @@ async function executeToolCallsSequential(
 	const finalizedCalls: FinalizedToolCallOutcome[] = [];
 	const messages: ToolResultMessage[] = [];
 
-	for (const toolCall of toolCalls) {
+	for (const [i, toolCall] of toolCalls.entries()) {
 		await emit({
 			type: "tool_execution_start",
 			toolCallId: toolCall.id,
@@ -556,7 +590,14 @@ async function executeToolCallsSequential(
 			args: toolCall.arguments,
 		});
 
-		const preparation = await prepareToolCall(currentContext, assistantMessage, toolCall, config, signal);
+		const preparation = await prepareToolCall(
+			currentContext,
+			assistantMessage,
+			toolCall,
+			resolvedTools[i]!,
+			config,
+			signal,
+		);
 		let finalized: FinalizedToolCallOutcome;
 		if (preparation.kind === "immediate") {
 			finalized = {
@@ -590,6 +631,8 @@ async function executeToolCallsSequential(
 	return {
 		messages,
 		terminate: shouldTerminateToolBatch(finalizedCalls),
+		newContext: getNewContextRequest(finalizedCalls, toolCalls.length, signal),
+		compaction: getCompactionRequest(finalizedCalls, toolCalls.length, signal),
 	};
 }
 
@@ -597,13 +640,14 @@ async function executeToolCallsParallel(
 	currentContext: AgentContext,
 	assistantMessage: AssistantMessage,
 	toolCalls: AgentToolCall[],
+	resolvedTools: ResolvedToolCall[],
 	config: AgentLoopConfig,
 	signal: AbortSignal | undefined,
 	emit: AgentEventSink,
 ): Promise<ExecutedToolCallBatch> {
 	const finalizedCalls: FinalizedToolCallEntry[] = [];
 
-	for (const toolCall of toolCalls) {
+	for (const [i, toolCall] of toolCalls.entries()) {
 		await emit({
 			type: "tool_execution_start",
 			toolCallId: toolCall.id,
@@ -611,7 +655,14 @@ async function executeToolCallsParallel(
 			args: toolCall.arguments,
 		});
 
-		const preparation = await prepareToolCall(currentContext, assistantMessage, toolCall, config, signal);
+		const preparation = await prepareToolCall(
+			currentContext,
+			assistantMessage,
+			toolCall,
+			resolvedTools[i]!,
+			config,
+			signal,
+		);
 		if (preparation.kind === "immediate") {
 			const finalized = {
 				toolCall,
@@ -666,8 +717,15 @@ async function executeToolCallsParallel(
 	return {
 		messages,
 		terminate: shouldTerminateToolBatch(orderedFinalizedCalls),
+		newContext: getNewContextRequest(orderedFinalizedCalls, toolCalls.length, signal),
+		compaction: getCompactionRequest(orderedFinalizedCalls, toolCalls.length, signal),
 	};
 }
+
+type ResolvedToolCall = {
+	tool?: AgentTool<any>;
+	error?: string;
+};
 
 type PreparedToolCall = {
 	kind: "prepared";
@@ -701,6 +759,36 @@ function shouldTerminateToolBatch(finalizedCalls: FinalizedToolCallOutcome[]): b
 	return finalizedCalls.length > 0 && finalizedCalls.every((finalized) => finalized.result.terminate === true);
 }
 
+function getNewContextRequest(
+	finalizedCalls: FinalizedToolCallOutcome[],
+	expectedCount: number,
+	signal: AbortSignal | undefined,
+): NewContextRequest | undefined {
+	if (
+		signal?.aborted ||
+		finalizedCalls.length !== expectedCount ||
+		finalizedCalls.some((finalized) => finalized.isError)
+	) {
+		return undefined;
+	}
+	return finalizedCalls.find((finalized) => finalized.result.newContext)?.result.newContext;
+}
+
+function getCompactionRequest(
+	finalizedCalls: FinalizedToolCallOutcome[],
+	expectedCount: number,
+	signal: AbortSignal | undefined,
+): CompactionRequest | undefined {
+	if (
+		signal?.aborted ||
+		finalizedCalls.length !== expectedCount ||
+		finalizedCalls.some((finalized) => finalized.isError)
+	) {
+		return undefined;
+	}
+	return finalizedCalls.find((finalized) => finalized.result.compaction)?.result.compaction;
+}
+
 function prepareToolCallArguments(tool: AgentTool<any>, toolCall: AgentToolCall): AgentToolCall {
 	if (!tool.prepareArguments) {
 		return toolCall;
@@ -715,22 +803,47 @@ function prepareToolCallArguments(tool: AgentTool<any>, toolCall: AgentToolCall)
 	};
 }
 
+async function resolveToolCalls(
+	currentContext: AgentContext,
+	toolCalls: AgentToolCall[],
+	config: AgentLoopConfig,
+	signal: AbortSignal | undefined,
+): Promise<ResolvedToolCall[]> {
+	const resolvedTools: ResolvedToolCall[] = [];
+	for (const toolCall of toolCalls) {
+		let tool = currentContext.tools?.find((candidate) => candidate.name === toolCall.name);
+		if (!tool && config.resolveToolCall && !signal?.aborted) {
+			try {
+				tool = await config.resolveToolCall(toolCall.name, currentContext, signal);
+			} catch (error) {
+				resolvedTools.push({ error: error instanceof Error ? error.message : String(error) });
+				continue;
+			}
+		}
+		resolvedTools.push({
+			tool,
+			error: signal?.aborted ? "Operation aborted" : tool ? undefined : `Tool ${toolCall.name} not found`,
+		});
+	}
+	return resolvedTools;
+}
+
 async function prepareToolCall(
 	currentContext: AgentContext,
 	assistantMessage: AssistantMessage,
 	toolCall: AgentToolCall,
+	resolved: ResolvedToolCall,
 	config: ToolCallHooks,
 	signal: AbortSignal | undefined,
-	tools: readonly AgentTool<any>[] = currentContext.tools ?? [],
 ): Promise<PreparedToolCall | ImmediateToolCallOutcome> {
-	const tool = tools.find((t) => t.name === toolCall.name);
-	if (!tool) {
+	if (resolved.error || !resolved.tool) {
 		return {
 			kind: "immediate",
-			result: createErrorToolResult(`Tool ${toolCall.name} not found`),
+			result: createErrorToolResult(resolved.error ?? `Tool ${toolCall.name} not found`),
 			isError: true,
 		};
 	}
+	const tool = resolved.tool;
 
 	try {
 		const preparedToolCall = prepareToolCallArguments(tool, toolCall);
@@ -820,7 +933,10 @@ export interface RunToolCallOptions extends ToolCallHooks {
  */
 export async function runToolCall(toolCall: AgentToolCall, options: RunToolCallOptions): Promise<AgentToolCallOutcome> {
 	const { assistantMessage, context, signal } = options;
-	const preparation = await prepareToolCall(context, assistantMessage, toolCall, options, signal, options.tools);
+	// phi: callable tools are resolved up front (see resolveToolCalls); nested calls look the tool up here.
+	const tool = options.tools.find((candidate) => candidate.name === toolCall.name);
+	const resolved: ResolvedToolCall = tool ? { tool } : { error: `Tool ${toolCall.name} not found` };
+	const preparation = await prepareToolCall(context, assistantMessage, toolCall, resolved, options, signal);
 	if (preparation.kind === "immediate") {
 		return { toolCall, result: preparation.result, isError: preparation.isError };
 	}

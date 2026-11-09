@@ -243,6 +243,13 @@ describe.skipIf(!process.env.ANTHROPIC_API_KEY && !process.env.ANTHROPIC_OAUTH_T
 			expect(model.id).toBeDefined();
 			expect(model.contextWindow).toBeGreaterThan(0);
 			expect(typeof model.reasoning).toBe("boolean");
+			// Resolved levels travel with the model so a host picker does not have to
+			// reimplement thinkingLevelMap semantics. This whole file needs a real key;
+			// test/suite/rpc-model-selection-wiring.test.ts covers the same wiring without
+			// one, so the assertion is not lost on a machine with no Anthropic auth.
+			expect(Array.isArray(model.thinkingLevels)).toBe(true);
+			expect(model.thinkingLevels.length).toBeGreaterThan(0);
+			if (!model.reasoning) expect(model.thinkingLevels).toEqual(["off"]);
 		}
 	}, 30000);
 

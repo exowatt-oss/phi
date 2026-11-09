@@ -138,6 +138,9 @@
 
 ### Added
 
+- Added tool-result compaction requests carrying checkpoint notes, pinned constraints, and a summary-or-fresh-context mode alongside the existing `newContext` request.
+- Added an optional missing-tool resolver to the agent loop, allowing hosts to explicitly activate registered deferred tools while preserving the default not-found behavior for inactive tools.
+- Added ephemeral custom-message payloads for harness reminders. An `ephemeral` message is retained in the session for display and forensics, removed from later LLM context once a later assistant message exists, and omitted from compaction summaries.
 - Added typed AI-request and harness telemetry schemas, their combined schema tuple, callback helpers, and a generated schema reference.
 - Added bounded `Session.findEntriesOnBranch()` and `findEntryOnBranch()` queries with explicit traversal, filtering, ordering, and limit options.
 - Added a compile-complete `AgentHarness` v2 scaffold; unfinished operation paths reject with `HarnessNotImplemented` while durable execution is implemented.

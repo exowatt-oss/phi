@@ -89,6 +89,81 @@ describe("AgentSession queue characterization", () => {
 		expect(harness.session.messages).toEqual([]);
 	});
 
+	it("forwards trailing text as the prompt when a command declares acceptsArgs false", async () => {
+		const commandRuns: string[] = [];
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.registerCommand("togglecmd", {
+						description: "Session toggle that takes no arguments",
+						acceptsArgs: false,
+						handler: async (args) => {
+							commandRuns.push(args);
+						},
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+
+		harness.setResponses([fauxAssistantMessage("hi there")]);
+		await harness.session.prompt("/togglecmd say hello back");
+
+		expect(commandRuns).toEqual([""]);
+		expect(getUserTexts(harness)).toEqual(["say hello back"]);
+		expect(getAssistantTexts(harness)).toEqual(["hi there"]);
+	});
+
+	it("bare acceptsArgs-false command still consumes the whole line", async () => {
+		const commandRuns: string[] = [];
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.registerCommand("togglecmd", {
+						description: "Session toggle that takes no arguments",
+						acceptsArgs: false,
+						handler: async (args) => {
+							commandRuns.push(args);
+						},
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+
+		await harness.session.prompt("/togglecmd");
+
+		expect(commandRuns).toEqual([""]);
+		expect(harness.getPendingResponseCount()).toBe(0);
+		expect(harness.session.messages).toEqual([]);
+	});
+
+	it("chains acceptsArgs-false commands before the remainder becomes the prompt", async () => {
+		const commandRuns: string[] = [];
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					for (const name of ["first", "second"]) {
+						pi.registerCommand(name, {
+							description: `Toggle ${name}`,
+							acceptsArgs: false,
+							handler: async () => {
+								commandRuns.push(name);
+							},
+						});
+					}
+				},
+			],
+		});
+		harnesses.push(harness);
+
+		harness.setResponses([fauxAssistantMessage("done")]);
+		await harness.session.prompt("/first /second actual prompt");
+
+		expect(commandRuns).toEqual(["first", "second"]);
+		expect(getUserTexts(harness)).toEqual(["actual prompt"]);
+	});
+
 	it("delivers extension-origin steering messages before the next LLM call", async () => {
 		let extensionApi: ExtensionAPI | undefined;
 		const waiting = await createWaitingHarness({

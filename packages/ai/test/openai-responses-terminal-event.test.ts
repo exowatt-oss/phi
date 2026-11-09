@@ -143,6 +143,25 @@ async function* createIncompleteEvents(reason = "max_output_tokens"): AsyncItera
 	} as ResponseStreamEvent;
 }
 
+async function* createTerminalThenDisconnectEvents(
+	terminal: "completed" | "incomplete",
+): AsyncIterable<ResponseStreamEvent> {
+	yield {
+		type: `response.${terminal}`,
+		sequence_number: 0,
+		response: {
+			id: `resp_${terminal}`,
+			status: terminal,
+			// Only max_output_tokens truncation maps to a length stop; an incomplete response
+			// without a provider reason is an error (upstream v1.x mapStopReason).
+			...(terminal === "incomplete" ? { incomplete_details: { reason: "max_output_tokens" } } : {}),
+		},
+	} as unknown as ResponseStreamEvent;
+	throw new TypeError("socket disconnected after terminal response", {
+		cause: Object.assign(new Error("socket failure"), { code: "UND_ERR_SOCKET" }),
+	});
+}
+
 async function* createFailedEvents(): AsyncIterable<ResponseStreamEvent> {
 	yield {
 		type: "response.failed",
@@ -412,6 +431,20 @@ describe("OpenAI Responses terminal event handling", () => {
 		});
 	});
 
+	it.each(["completed", "incomplete"] as const)(
+		"stops consuming after a %s terminal event before a later disconnect",
+		async (terminal) => {
+			const model = createModel();
+			const output = createOutput(model);
+			const stream = new AssistantMessageEventStream();
+
+			await processResponsesStream(createTerminalThenDisconnectEvents(terminal), output, stream, model);
+
+			expect(output.responseId).toBe(`resp_${terminal}`);
+			expect(output.stopReason).toBe(terminal === "completed" ? "stop" : "length");
+			expect(output.rawStopReason).toBe(terminal === "completed" ? "completed" : "incomplete.max_output_tokens");
+		},
+	);
 	it("finalizes content-filtered incomplete responses as non-retryable errors", async () => {
 		const model = createModel();
 		const output = createOutput(model);

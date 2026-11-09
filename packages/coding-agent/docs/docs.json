@@ -36,6 +36,18 @@
               "path": "sessions.md"
             },
             {
+              "title": "Run Bounded Loops with /loop",
+              "path": "loop.md"
+            },
+            {
+              "title": "Use Memory",
+              "path": "memory.md"
+            },
+            {
+              "title": "Control Tool Display",
+              "path": "tool-display.md"
+            },
+            {
               "title": "Run Pi Safely",
               "path": "security.md"
             },
@@ -108,6 +120,10 @@
             {
               "title": "Build Extensions",
               "path": "extensions.md"
+            },
+            {
+              "title": "Feads Agent Extension",
+              "path": "feads-agent.md"
             },
             {
               "title": "Add Custom Providers",

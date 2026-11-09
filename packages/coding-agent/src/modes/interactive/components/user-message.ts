@@ -15,6 +15,8 @@ export class UserMessageComponent extends Container {
 	private markdownTheme: MarkdownTheme;
 	private outputPad: number;
 	private markdownTransformers: readonly MarkdownTransformer[];
+	private cachedRenderWidth?: number;
+	private cachedRenderLines?: string[];
 
 	constructor(
 		text: string,
@@ -36,6 +38,8 @@ export class UserMessageComponent extends Container {
 	}
 
 	private rebuild(): void {
+		this.cachedRenderWidth = undefined;
+		this.cachedRenderLines = undefined;
 		this.clear();
 		// The Markdown pads and colors its own background: a Box around it would keep a second full-width copy of every
 		// line, with identical output.
@@ -58,14 +62,22 @@ export class UserMessageComponent extends Container {
 		);
 	}
 
-	override render(width: number): string[] {
-		const lines = super.render(width);
-		if (lines.length === 0) {
-			return lines;
-		}
+	override invalidate(): void {
+		this.cachedRenderWidth = undefined;
+		this.cachedRenderLines = undefined;
+		super.invalidate();
+	}
 
-		lines[0] = OSC133_ZONE_START + lines[0];
-		lines[lines.length - 1] = OSC133_ZONE_END + OSC133_ZONE_FINAL + lines[lines.length - 1];
+	override render(width: number): string[] {
+		if (this.cachedRenderLines && this.cachedRenderWidth === width) return this.cachedRenderLines;
+
+		const lines = [...super.render(width)];
+		if (lines.length > 0) {
+			lines[0] = OSC133_ZONE_START + lines[0];
+			lines[lines.length - 1] = OSC133_ZONE_END + OSC133_ZONE_FINAL + lines[lines.length - 1];
+		}
+		this.cachedRenderWidth = width;
+		this.cachedRenderLines = lines;
 		return lines;
 	}
 }

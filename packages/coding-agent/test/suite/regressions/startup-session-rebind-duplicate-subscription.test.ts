@@ -3,6 +3,8 @@ import { InteractiveMode } from "../../../src/modes/interactive/interactive-mode
 
 type RebindContext = {
 	session: object;
+	// Installed before the rebind, so the fake context must provide it.
+	registerBuiltinBtwRenderer: (runner: unknown) => void;
 	unsubscribe?: () => void;
 	applyRuntimeSettings: () => void;
 	programStatus: { reset(): void };
@@ -40,6 +42,7 @@ describe("overlapping startup and replacement session rebinds", () => {
 
 		const context: RebindContext = {
 			session: startupSession,
+			registerBuiltinBtwRenderer: () => {},
 			applyRuntimeSettings: () => {},
 			programStatus: { reset: () => {} },
 			renderCurrentSessionState: () => {},

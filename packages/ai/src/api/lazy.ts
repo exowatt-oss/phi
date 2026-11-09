@@ -1,7 +1,23 @@
+import { ModelsError } from "../auth/resolve.ts";
 import type { Api, AssistantMessage, AssistantMessageEvent, Model, ProviderStreams } from "../types.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 
-function createSetupErrorMessage(model: Model<Api>, error: unknown, timestamp: number): AssistantMessage {
+/**
+ * A setup that failed because the caller aborted (for example `signal.throwIfAborted()` during
+ * auth resolution, or the agent loop's next request after an aborted tool call) is an abort, not
+ * an error: callers and UIs treat `stopReason: "error"` as a failure worth reporting.
+ */
+function isAbortFailure(error: unknown, signal: AbortSignal | undefined): boolean {
+	if (signal?.aborted) return true;
+	return !!error && typeof error === "object" && (error as { name?: unknown }).name === "AbortError";
+}
+
+function createSetupErrorMessage(
+	model: Model<Api>,
+	error: unknown,
+	timestamp: number,
+	aborted: boolean,
+): AssistantMessage {
 	return {
 		role: "assistant",
 		content: [],
@@ -16,8 +32,9 @@ function createSetupErrorMessage(model: Model<Api>, error: unknown, timestamp: n
 			totalTokens: 0,
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 		},
-		stopReason: "error",
+		stopReason: aborted ? "aborted" : "error",
 		errorMessage: error instanceof Error ? error.message : String(error),
+		authRequired: error instanceof ModelsError ? error.authRequired : undefined,
 		timestamp,
 	};
 }
@@ -61,6 +78,7 @@ export function lazyStream(
 	model: Model<Api>,
 	setup: () => Promise<AsyncIterable<AssistantMessageEvent>>,
 	observer?: LazyStreamObserver,
+	signal?: AbortSignal,
 ): AssistantMessageEventStream {
 	const startedAt = Date.now();
 	const outer = new AssistantMessageEventStream();
@@ -74,8 +92,9 @@ export function lazyStream(
 	setup()
 		.then((inner) => forwardStream(outer, inner, observer, observeResult))
 		.catch((error) => {
-			const message = createSetupErrorMessage(model, error, startedAt);
-			const event: AssistantMessageEvent = { type: "error", reason: "error", error: message };
+			const aborted = isAbortFailure(error, signal);
+			const message = createSetupErrorMessage(model, error, startedAt, aborted);
+			const event: AssistantMessageEvent = { type: "error", reason: aborted ? "aborted" : "error", error: message };
 			outer.push(event);
 			observer?.onEvent?.(event);
 			outer.end(message);
@@ -98,9 +117,14 @@ export interface LazyApiCapabilities {
 export function lazyApi(load: () => Promise<ProviderStreams>, capabilities?: LazyApiCapabilities): ProviderStreams {
 	const api: ProviderStreams = {
 		stream: (model, context, options) =>
-			lazyStream(model, async () => (await load()).stream(model, context, options)),
+			lazyStream(model, async () => (await load()).stream(model, context, options), undefined, options?.signal),
 		streamSimple: (model, context, options) =>
-			lazyStream(model, async () => (await load()).streamSimple(model, context, options)),
+			lazyStream(
+				model,
+				async () => (await load()).streamSimple(model, context, options),
+				undefined,
+				options?.signal,
+			),
 	};
 
 	if (capabilities?.fetchDeferred) {

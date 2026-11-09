@@ -9,6 +9,7 @@ import { getModel, streamSimple } from "../src/compat.ts";
 const mockState = vi.hoisted(() => ({
 	lastParams: undefined as unknown,
 	lastClientOptions: undefined as unknown,
+	responseServiceTier: undefined as "default" | "flex" | "priority" | undefined,
 }));
 
 vi.mock("openai", () => {
@@ -25,6 +26,7 @@ vi.mock("openai", () => {
 						async *[Symbol.asyncIterator]() {
 							yield {
 								choices: [{ delta: {}, finish_reason: "stop" }],
+								service_tier: mockState.responseServiceTier,
 								usage: {
 									prompt_tokens: 1,
 									completion_tokens: 1,
@@ -57,6 +59,7 @@ describe("openai-completions empty tools handling", () => {
 	beforeEach(() => {
 		mockState.lastParams = undefined;
 		mockState.lastClientOptions = undefined;
+		mockState.responseServiceTier = undefined;
 	});
 
 	it("omits tools field when context.tools is an empty array", async () => {
@@ -107,6 +110,80 @@ describe("openai-completions empty tools handling", () => {
 		const params = mockState.lastParams as { max_tokens?: number; max_completion_tokens?: number };
 		expect(params.max_tokens).toBeUndefined();
 		expect(params.max_completion_tokens).toBe(model.maxTokens);
+	});
+
+	it.each(["fast", "default", "flex", "ultrafast"] as const)("serializes the %s service tier", async (serviceTier) => {
+		const { compat: _compat, ...baseModel } = getModel("openai", "gpt-4o-mini")!;
+		const model = { ...baseModel, api: "openai-completions" } as const;
+
+		await streamSimple(
+			model,
+			{
+				messages: [{ role: "user", content: "hi", timestamp: Date.now() }],
+			},
+			{ apiKey: "test", serviceTier },
+		).result();
+
+		expect((mockState.lastParams as { service_tier?: string }).service_tier).toBe(serviceTier);
+	});
+
+	it("omits service_tier for github-copilot models", async () => {
+		const { compat: _compat, ...baseModel } = getModel("openai", "gpt-4o-mini")!;
+		const model = {
+			...baseModel,
+			api: "openai-completions",
+			provider: "github-copilot",
+			baseUrl: "https://api.individual.githubcopilot.com",
+		} as const;
+
+		await streamSimple(
+			model,
+			{
+				messages: [{ role: "user", content: "hi", timestamp: Date.now() }],
+			},
+			{ apiKey: "test", serviceTier: "fast" },
+		).result();
+
+		expect("service_tier" in (mockState.lastParams as object)).toBe(false);
+	});
+
+	it("refuses fast on an Amazon Bedrock OpenAI endpoint without a fast tier instead of sending it", async () => {
+		const { compat: _compat, ...baseModel } = getModel("openai", "gpt-4o-mini")!;
+		const model = {
+			...baseModel,
+			id: "openai.gpt-6-sol",
+			api: "openai-completions",
+			provider: "bedrock-mantle",
+			baseUrl: "https://bedrock-mantle.us-east-1.api.aws/openai/v1",
+		} as const;
+		mockState.lastParams = undefined;
+
+		const result = await streamSimple(
+			model,
+			{ messages: [{ role: "user", content: "hi", timestamp: Date.now() }] },
+			{ apiKey: "test", serviceTier: "fast" },
+		).result();
+
+		expect(mockState.lastParams).toBeUndefined();
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toContain("Fast mode is not supported for Amazon Bedrock model openai.gpt-6-sol");
+	});
+
+	it("uses the actual returned tier for local cost accounting", async () => {
+		const { compat: _compat, ...baseModel } = getModel("openai", "gpt-4o-mini")!;
+		const model = { ...baseModel, api: "openai-completions" } as const;
+		const standardInputCost = model.cost.input / 1_000_000;
+
+		mockState.responseServiceTier = "default";
+		const result = await streamSimple(
+			model,
+			{
+				messages: [{ role: "user", content: "hi", timestamp: Date.now() }],
+			},
+			{ apiKey: "test", serviceTier: "fast" },
+		).result();
+
+		expect(result.usage.cost.input).toBe(standardInputCost);
 	});
 
 	it("sends explicit maxTokens", async () => {

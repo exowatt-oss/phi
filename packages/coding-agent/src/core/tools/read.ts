@@ -61,7 +61,10 @@ const defaultReadOperations: ReadOperations = {
 };
 
 export interface ReadToolOptions {
-	/** Whether to auto-resize images. Default: true */
+	/**
+	 * Whether to auto-resize images. Uses the model's `inputLimits.images.resize` profile when set, otherwise fits
+	 * to Claude's native resolution (2576px long edge, 4784 visual tokens). Default: true
+	 */
 	autoResizeImages?: boolean;
 	/** Fallback resize profile when the execution context has no model metadata. */
 	resizeOptions?: ModelImageResizeOptions;

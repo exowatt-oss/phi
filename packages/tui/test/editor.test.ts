@@ -2481,6 +2481,141 @@ describe("Editor component", () => {
 			assert.strictEqual(editor.isShowingAutocomplete(), false);
 		});
 
+		it("triggers slash autocomplete after existing prose and updates it", async () => {
+			const editor = new Editor(createTestTUI(), defaultEditorTheme);
+			const requests: string[] = [];
+
+			const mockProvider: AutocompleteProvider = {
+				getSuggestions: async (lines, _cursorLine, cursorCol) => {
+					const before = (lines[0] || "").slice(0, cursorCol);
+					requests.push(before);
+					const match = before.match(/(?:^|\s)(\/\S*)$/);
+					if (!match) return null;
+					return {
+						items: [{ value: "/help", label: "/help" }],
+						prefix: match[1]!,
+					};
+				},
+				applyCompletion,
+			};
+
+			editor.setAutocompleteProvider(mockProvider);
+			for (const ch of "existing prose ") editor.handleInput(ch);
+
+			editor.handleInput("/");
+			await flushAutocomplete();
+			assert.strictEqual(editor.isShowingAutocomplete(), true);
+			assert.deepStrictEqual(requests, ["existing prose /"]);
+
+			editor.handleInput("h");
+			await flushAutocomplete();
+			assert.strictEqual(editor.getText(), "existing prose /h");
+			assert.strictEqual(editor.isShowingAutocomplete(), true);
+			assert.deepStrictEqual(requests, ["existing prose /", "existing prose /h"]);
+		});
+
+		it("does not trigger slash autocomplete inside a word or path", async () => {
+			const editor = new Editor(createTestTUI(), defaultEditorTheme);
+			let suggestionCalls = 0;
+
+			const mockProvider: AutocompleteProvider = {
+				getSuggestions: async () => {
+					suggestionCalls += 1;
+					return { items: [{ value: "/help", label: "/help" }], prefix: "/" };
+				},
+				applyCompletion,
+			};
+
+			editor.setAutocompleteProvider(mockProvider);
+			for (const ch of "word/path") editor.handleInput(ch);
+			await flushAutocomplete();
+
+			assert.strictEqual(suggestionCalls, 0);
+			assert.strictEqual(editor.isShowingAutocomplete(), false);
+		});
+
+		it("uses slash completion for Tab inside a slash token after prose", async () => {
+			const editor = new Editor(createTestTUI(), defaultEditorTheme);
+			const forceModes: boolean[] = [];
+			let requestCount = 0;
+
+			const mockProvider: AutocompleteProvider = {
+				getSuggestions: async (_lines, _cursorLine, _cursorCol, options) => {
+					forceModes.push(options.force === true);
+					requestCount += 1;
+					if (requestCount === 1) return null;
+					return {
+						items: [{ value: "/help", label: "/help" }],
+						prefix: "/",
+					};
+				},
+				applyCompletion,
+			};
+
+			editor.setAutocompleteProvider(mockProvider);
+			for (const ch of "existing prose /") editor.handleInput(ch);
+			await flushAutocomplete();
+			assert.strictEqual(editor.isShowingAutocomplete(), false);
+
+			editor.handleInput("\t");
+			await flushAutocomplete();
+
+			assert.deepStrictEqual(forceModes, [false, false]);
+			assert.strictEqual(editor.isShowingAutocomplete(), true);
+		});
+
+		it("inserts inline slash completion on Enter without submitting", async () => {
+			const editor = new Editor(createTestTUI(), defaultEditorTheme);
+			const provider = new CombinedAutocompleteProvider(
+				[{ name: "skill:alpha", description: "Load a skill" }],
+				process.cwd(),
+			);
+			const changes: string[] = [];
+			let submitted: string | undefined;
+
+			editor.setAutocompleteProvider(provider);
+			editor.setText("existing prose /skill: then continue");
+			for (let i = 0; i < " then continue".length; i++) editor.handleInput("\x1b[D");
+			editor.onChange = (text) => changes.push(text);
+			editor.onSubmit = (text) => {
+				submitted = text;
+			};
+
+			editor.handleInput("\t");
+			await flushAutocomplete();
+			assert.strictEqual(editor.isShowingAutocomplete(), true);
+
+			editor.handleInput("\r");
+
+			assert.strictEqual(editor.getText(), "existing prose /skill:alpha then continue");
+			assert.strictEqual(submitted, undefined);
+			assert.deepStrictEqual(changes, ["existing prose /skill:alpha then continue"]);
+		});
+
+		it("submits a start-of-message slash completion on Enter", async () => {
+			const editor = new Editor(createTestTUI(), defaultEditorTheme);
+			const provider = new CombinedAutocompleteProvider(
+				[{ name: "skill:alpha", description: "Load a skill" }],
+				process.cwd(),
+			);
+			let submitted: string | undefined;
+
+			editor.setAutocompleteProvider(provider);
+			editor.setText("  /skill:");
+			editor.onSubmit = (text) => {
+				submitted = text;
+			};
+
+			editor.handleInput("\t");
+			await flushAutocomplete();
+			assert.strictEqual(editor.isShowingAutocomplete(), true);
+
+			editor.handleInput("\r");
+
+			assert.strictEqual(submitted, "/skill:alpha");
+			assert.strictEqual(editor.getText(), "");
+		});
+
 		it("debounces @ autocomplete while typing", async () => {
 			const editor = new Editor(createTestTUI(), defaultEditorTheme);
 			let suggestionCalls = 0;

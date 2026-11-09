@@ -1,5 +1,6 @@
 import { crc32, deflateSync } from "node:zlib";
 import { describe, expect, it } from "vitest";
+import { CLAUDE_NATIVE_IMAGE_LIMITS, countVisualTokens } from "../src/utils/image-resize-core.ts";
 import type { ToolResultContent } from "../src/utils/tool-result-images.ts";
 import { normalizeToolResultImages } from "../src/utils/tool-result-images.ts";
 
@@ -86,8 +87,11 @@ describe("normalizeToolResultImages", () => {
 		expect(image.type).toBe("image");
 		if (image.type !== "image") return;
 		const { width, height } = readPngDimensions(image.data);
-		expect(width).toBeLessThanOrEqual(2000);
-		expect(height).toBeLessThanOrEqual(2000);
+		// phi fits images to Claude's native view (2576px long edge, 4784 visual tokens) instead of upstream's flat 2000px.
+		expect(width).toBeLessThanOrEqual(CLAUDE_NATIVE_IMAGE_LIMITS.maxWidth);
+		expect(height).toBeLessThanOrEqual(CLAUDE_NATIVE_IMAGE_LIMITS.maxHeight);
+		expect(height).toBeLessThan(4800);
+		expect(countVisualTokens(width, height)).toBeLessThanOrEqual(CLAUDE_NATIVE_IMAGE_LIMITS.maxVisualTokens);
 		const note = normalized[1];
 		expect(note.type).toBe("text");
 		if (note.type !== "text") return;
@@ -124,7 +128,8 @@ describe("normalizeToolResultImages", () => {
 	it("preserves surrounding text blocks and their order", async () => {
 		const content: ToolResultContent[] = [
 			{ type: "text", text: "before" },
-			imageBlock(createPng(2400, 100), "image/png"),
+			// Wider than phi's 2576px native long edge, so it is resized and gains a note.
+			imageBlock(createPng(3000, 100), "image/png"),
 			{ type: "text", text: "after" },
 		];
 

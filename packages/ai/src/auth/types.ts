@@ -78,14 +78,17 @@ export interface CredentialStore {
 	/**
 	 * Serialized write — the only write path. `fn` sees the current credential
 	 * because correct writes (refresh, login-during-refresh) depend on it;
-	 * return the new credential, or undefined to leave the entry unchanged.
-	 * Mutual exclusion per provider id, cross-process too where the backing
+	 * return the new credential, `null` to remove the current entry, or
+	 * undefined to leave it unchanged. Removal inside this transaction lets a
+	 * terminal rotating-token failure invalidate the exact credential it read
+	 * before releasing the lock. Mutual exclusion per provider id, cross-process
+	 * too where the backing
 	 * store supports it (e.g. a file lock). Resolves with the post-write
 	 * credential. Rejections from `fn` propagate.
 	 */
 	modify(
 		providerId: string,
-		fn: (current: Credential | undefined) => Promise<Credential | undefined>,
+		fn: (current: Credential | undefined) => Promise<Credential | null | undefined>,
 		options?: AuthOperationOptions,
 	): Promise<Credential | undefined>;
 
@@ -136,7 +139,17 @@ export interface AuthInfoLink {
 
 export type AuthEvent =
 	| { type: "info"; message: string; links?: readonly AuthInfoLink[] }
-	| { type: "auth_url"; url: string; instructions?: string }
+	| {
+			type: "auth_url";
+			/** URL opened automatically in the local browser. */
+			url: string;
+			instructions?: string;
+			/**
+			 * URL to display and copy instead of `url` when the browser may not reach the local
+			 * callback server; finishing it there shows a code the user pastes back.
+			 */
+			copyUrl?: string;
+	  }
 	| {
 			type: "device_code";
 			userCode: string;

@@ -8,7 +8,12 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
-import type { AuthEvent, AuthPrompt } from "@earendil-works/pi-ai";
+import {
+	type AuthEvent,
+	type AuthPrompt,
+	getOpenAIResponsesFastServiceTier,
+	getUnsupportedFastServiceTierError,
+} from "@earendil-works/pi-ai";
 import {
 	type AssistantMessage,
 	type ImageContent,
@@ -54,6 +59,7 @@ import {
 } from "@earendil-works/pi-tui";
 import chalk from "chalk";
 import { spawn } from "child_process";
+import type { StartupProgressHandle } from "../../cli/startup-ui.ts";
 import {
 	APP_NAME,
 	APP_TITLE,
@@ -78,6 +84,7 @@ import {
 import { formatCacheWarmingStatus, formatCacheWarmingUsage } from "../../core/cache-warmer.ts";
 import { findExtensionStackMatches, recordCrash, takeUnnotifiedCrash } from "../../core/crash-log.ts";
 import { DEFAULT_THINKING_LEVEL, THINKING_LEVEL_OPTIONS } from "../../core/defaults.ts";
+import { isSessionShareEnabled, SESSION_SHARE_DISABLED_MESSAGE } from "../../core/exowatt-hardening.ts";
 import type {
 	AutocompleteProviderFactory,
 	EditorFactory,
@@ -95,25 +102,32 @@ import type {
 import { FooterDataProvider, type ReadonlyFooterDataProvider } from "../../core/footer-data-provider.ts";
 import { configureHttpDispatcher, formatHttpIdleTimeoutMs } from "../../core/http-dispatcher.ts";
 import { type AppKeybinding, KeybindingsManager } from "../../core/keybindings.ts";
-import type { McpHttpServerConfig } from "../../core/mcp-servers.ts";
 import { createCompactionSummaryMessage, createCustomMessage } from "../../core/messages.ts";
 import {
 	defaultModelPerProvider,
 	findExactModelReferenceMatch,
+	resolveModelReference,
 	resolveModelScopeFromModels,
 } from "../../core/model-resolver.ts";
 import { CredentialSynchronizationError } from "../../core/model-runtime.ts";
 import { DefaultPackageManager } from "../../core/package-manager.ts";
-import { RADIUS_MCP_URL, RADIUS_PROVIDER_ID } from "../../core/radius.ts";
+import { RADIUS_PROVIDER_ID } from "../../core/radius.ts";
 import type { ResourceDiagnostic } from "../../core/resource-loader.ts";
+import { formatUsd, getRoutingBreakdown } from "../../core/routing.ts";
 import { formatMissingSessionCwdPrompt, MissingSessionCwdError } from "../../core/session-cwd.ts";
 import {
 	type SessionEntry,
 	SessionManager,
-	sessionEntryToContextMessages,
+	sessionEntryToDisplayMessages,
 	type UsageEntry,
 } from "../../core/session-manager.ts";
 import type { FullscreenExitOutput, TuiMode } from "../../core/settings-manager.ts";
+import {
+	buildSideQuestionContextMessages,
+	buildSideQuestionMessages,
+	createSideQuestionHistory,
+	runSideQuestion,
+} from "../../core/side-question.ts";
 import { BUILTIN_SLASH_COMMANDS } from "../../core/slash-commands.ts";
 import type { SourceInfo } from "../../core/source-info.ts";
 import { isInstallTelemetryEnabled } from "../../core/telemetry.ts";
@@ -121,7 +135,6 @@ import { withBuiltInRenderers } from "../../core/tools/renderers/index.ts";
 import type { TruncationResult } from "../../core/tools/truncate.ts";
 import { hasTrustRequiringProjectResources, ProjectTrustStore } from "../../core/trust-manager.ts";
 import { getUsageCostBreakdown } from "../../core/usage-totals.ts";
-import { addMcpServerConfig, loadMcpConfig } from "../../extensions/mcp/config.ts";
 import { getChangelogPath, getNewEntries, normalizeChangelogLinks, parseChangelog } from "../../utils/changelog.ts";
 import { copyToClipboard, readClipboardFilePaths, readClipboardText } from "../../utils/clipboard.ts";
 import { extensionForImageMimeType, readClipboardImage } from "../../utils/clipboard-image.ts";
@@ -139,6 +152,7 @@ import { ArminComponent } from "./components/armin.ts";
 import { AssistantMessageComponent } from "./components/assistant-message.ts";
 import { BashExecutionComponent } from "./components/bash-execution.ts";
 import { BranchSummaryMessageComponent } from "./components/branch-summary-message.ts";
+import { type BtwHistoryItem, BtwPanel, type BtwUsage } from "./components/btw-panel.ts";
 import { CompactionSummaryMessageComponent } from "./components/compaction-summary-message.ts";
 import { CustomEditor } from "./components/custom-editor.ts";
 import { CustomEntryComponent } from "./components/custom-entry.ts";
@@ -160,12 +174,13 @@ import {
 	formatAuthSelectorProviderType,
 	OAuthSelectorComponent,
 } from "./components/oauth-selector.ts";
-import { piLogoLines, piWordmark, supportsPiLogo } from "./components/pi-logo.ts";
+import { phiLogoLines, piLogoLines, piWordmark, supportsPiLogo } from "./components/pi-logo.ts";
 import { createLoginMenuSelector } from "./components/radius-login-selector.ts";
 import { ScopedModelsSelectorComponent } from "./components/scoped-models-selector.ts";
 import { SessionSelectorComponent } from "./components/session-selector.ts";
 import { SettingsSelectorComponent } from "./components/settings-selector.ts";
 import { SkillInvocationMessageComponent } from "./components/skill-invocation-message.ts";
+import { StartupProgressComponent } from "./components/startup-progress.ts";
 import {
 	BranchSummaryStatusIndicator,
 	CompactionStatusIndicator,
@@ -253,7 +268,10 @@ class ExpandableText extends ThemedText implements Expandable {
 	}
 }
 
-/** The built-in header. Clicking its logo (the first two lines, after one column of padding) plays an easter egg. */
+/**
+ * The built-in header. Clicking its logo (the first two lines, after one column of padding) plays an easter egg.
+ * phi draws its φ logo instead of the pi logo and never sets `onLogoClick`.
+ */
 class BuiltInHeader extends ExpandableText {
 	onLogoClick: ((column: number, row: number) => void) | undefined;
 
@@ -428,6 +446,8 @@ function formatLoginProviderCompletionDescription(provider: LoginProviderComplet
 export interface InteractiveModeOptions {
 	/** Providers that were migrated to auth.json (shows warning) */
 	migratedProviders?: string[];
+	/** Hub bundles whose unloadable `packages` entry the startup migration dropped. */
+	unlinkedHubBundles?: string[];
 	/** Diagnostics collected before the interactive TUI was initialized. */
 	startupDiagnostics?: AgentSessionRuntimeDiagnostic[];
 	/** Warning message if session model couldn't be restored */
@@ -444,6 +464,8 @@ export interface InteractiveModeOptions {
 	verbose?: boolean;
 	/** TUI layout mode. */
 	tuiMode?: TuiMode;
+	/** @internal */
+	startupProgress?: StartupProgressHandle;
 	/** Initial interactive theme setting for this invocation. */
 	initialThemeSetting?: string;
 	/** Terminal implementation. Defaults to the current process terminal. */
@@ -500,6 +522,8 @@ export class InteractiveMode {
 	private lastStatusSpacer: Spacer | undefined = undefined;
 	private lastStatusText: ThemedText | undefined = undefined;
 	private lastStatusMessage = "";
+	/** A fast-mode downgrade notice was already shown for the current standard-speed streak. */
+	private fastModeFallbackNoticeShown = false;
 	private managedToolStatusStarted = false;
 
 	// Streaming message tracking
@@ -546,9 +570,16 @@ export class InteractiveMode {
 	// Messages queued while compaction is running
 	private compactionQueuedMessages: CompactionQueuedMessage[] = [];
 
+	// /btw side-question state
+	private btwPanel: BtwPanel | undefined = undefined;
+	private btwPanelSession: AgentSession | undefined = undefined;
+	private readonly btwHistory = createSideQuestionHistory();
+
 	// Shutdown state
 	private shutdownRequested = false;
 
+	// Startup progress shown while extensions and provider state are initialized.
+	private startupProgressComponent: StartupProgressComponent | undefined;
 	/** Reports working, blocked, done, and error states to terminals that support OSC 7501. */
 	private readonly programStatus = new ProgramStatusReporter(
 		() => this.ui.terminal,
@@ -607,6 +638,59 @@ export class InteractiveMode {
 		return this.session.settingsManager;
 	}
 
+	private restoreEditorContainer(): void {
+		this.editorContainer.clear();
+		// An open extension dialog stays on top of phi's startup progress, which stays on top of the editor.
+		const component =
+			this.extensionDialogs.at(-1)?.component ?? this.startupProgressComponent ?? (this.editor as Component);
+		this.editorContainer.addChild(component);
+		this.ui.setFocus(component);
+		this.ui.requestRender();
+	}
+
+	private mountStartupProgress(): void {
+		const component = new StartupProgressComponent(
+			this.ui,
+			{ current: 6, total: 6, message: "Activating commands and autocomplete" },
+			() => {
+				this.shutdownRequested = true;
+				void this.shutdown();
+			},
+		);
+		this.startupProgressComponent = component;
+		this.restoreEditorContainer();
+	}
+
+	private finishStartupProgress(): void {
+		const component = this.startupProgressComponent;
+		this.startupProgressComponent = undefined;
+		try {
+			component?.dispose();
+		} finally {
+			this.restoreEditorContainer();
+		}
+	}
+
+	private disposeStartupProgress(): void {
+		const component = this.startupProgressComponent;
+		this.startupProgressComponent = undefined;
+		try {
+			component?.dispose();
+		} finally {
+			if (component && this.editorContainer.children.includes(component)) {
+				this.editorContainer.removeChild(component);
+			}
+		}
+	}
+
+	private async closeStartupProgress(): Promise<void> {
+		try {
+			await this.options.startupProgress?.close();
+		} catch {
+			// Startup progress cleanup must not hide the actual initialization result.
+		}
+	}
+
 	constructor(runtimeHost: AgentSessionRuntime, options: InteractiveModeOptions = {}) {
 		this.runtimeHost = runtimeHost;
 		setCapabilityOverrides(this.settingsManager.getTerminalCapabilityOverrides());
@@ -663,6 +747,8 @@ export class InteractiveMode {
 
 		// Load hide thinking block setting
 		this.hideThinkingBlock = this.settingsManager.getHideThinkingBlock();
+		// `toolDisplay: "full"` means the session starts with tool output expanded.
+		this.toolOutputExpanded = this.settingsManager.getToolDisplay() === "full";
 		this.outputPad = this.settingsManager.getOutputPad();
 
 		// Register themes from resource loader and initialize
@@ -950,6 +1036,10 @@ export class InteractiveMode {
 		// Load changelog (only show new entries, skip for resumed sessions)
 		this.changelogMarkdown = this.getChangelogForDisplay();
 
+		// Close the pre-TUI CLI startup progress before anything else writes to the terminal.
+		// fd/rg setup now runs after the TUI is mounted (see below).
+		await this.closeStartupProgress();
+
 		if (this.session.scopedModels.length > 0 && this.shouldShowStartupDetails()) {
 			const modelList = this.session.scopedModels
 				.map((sm) => {
@@ -995,6 +1085,7 @@ export class InteractiveMode {
 		this.defaultEditor.onCtrlD = () => this.handleCtrlD();
 		this.defaultEditor.onSubmit = (text) => this.handleStartupSubmit(text);
 		this.ui.setFocus(this.editor);
+		this.mountStartupProgress();
 
 		// Start the UI before initializing extensions so session_start handlers can use interactive dialogs
 		this.ui.start();
@@ -1011,13 +1102,28 @@ export class InteractiveMode {
 		if (this.shouldShowStartupHeader()) {
 			const showDetails = this.shouldShowStartupDetails();
 			// Built on demand so the header follows theme changes. The logo's first line carries the version,
-			// its second line the first line of key hints. Terminals that cannot render the logo get a
-			// "Pi vX" line instead, with the key hints below it.
+			// the next lines the first lines of key hints. Terminals that cannot render the logo get a
+			// wordmark line instead, with the key hints below it. phi draws its φ logo; upstream builds keep
+			// the pi logo and its logo-click animation.
 			const showLogo = supportsPiLogo();
+			const isPhi = APP_NAME === "phi";
 			const withLogo = (hints: string) => {
-				if (!showLogo) return `${piWordmark()} ${theme.fg("dim", `v${this.version}`)}\n${hints}`;
+				const version = theme.fg("dim", `v${this.version}`);
+				if (isPhi) {
+					const wordmark = `${theme.bold(theme.fg("accent", APP_NAME))} ${version}`;
+					if (!showLogo) return `${wordmark}\n${hints}`;
+					const [top, middle, bottom] = phiLogoLines();
+					const [first = "", second, ...rest] = hints.split("\n");
+					return [
+						`${top} ${wordmark}`,
+						`${middle} ${first}`,
+						second === undefined ? bottom : `${bottom} ${second}`,
+						...rest,
+					].join("\n");
+				}
+				if (!showLogo) return `${piWordmark()} ${version}\n${hints}`;
 				const [top, bottom] = piLogoLines();
-				return `${top} ${theme.fg("dim", `v${this.version}`)}\n${bottom} ${hints}`;
+				return `${top} ${version}\n${bottom} ${hints}`;
 			};
 
 			// Build startup instructions using keybinding hint helpers
@@ -1062,7 +1168,10 @@ export class InteractiveMode {
 					`Press ${keyText("app.tools.expand")} to show full startup help${showDetails ? " and loaded resources" : ""}.`,
 				);
 			const onboarding = () =>
-				theme.fg("dim", `Pi can explain its own features and look up its docs. Ask it how to use or extend Pi.`);
+				theme.fg(
+					"dim",
+					`${APP_NAME} can explain its own features and look up its docs. Ask it how to use or extend ${APP_NAME}.`,
+				);
 			const header = new BuiltInHeader(
 				() => `${withLogo(compactInstructions())}\n${compactOnboarding()}\n\n${onboarding()}`,
 				() => `${withLogo(expandedInstructions())}\n\n${onboarding()}`,
@@ -1070,7 +1179,7 @@ export class InteractiveMode {
 				1,
 				0,
 			);
-			if (showLogo) header.onLogoClick = (column, row) => playPiLogo3d(this.renderer, column, row);
+			if (showLogo && !isPhi) header.onLogoClick = (column, row) => playPiLogo3d(this.renderer, column, row);
 			this.builtInHeader = header;
 
 			// Setup UI layout
@@ -1084,40 +1193,49 @@ export class InteractiveMode {
 		}
 		this.ui.requestRender();
 
-		// Ensure fd and rg are available after mounting the TUI (downloads if missing, adds to PATH via getBinDir)
-		// so slow downloads do not make startup appear frozen.
-		// Both are needed: fd for autocomplete, rg for grep tool and bash commands.
-		const [fdPath] = await Promise.all([
-			ensureTool("fd", (status) => this.showManagedToolStatus(status)),
-			ensureTool("rg", (status) => this.showManagedToolStatus(status)),
-		]);
-		this.fdPath = fdPath;
+		try {
+			// Ensure fd and rg are available after mounting the TUI (downloads if missing, adds to PATH via getBinDir)
+			// so slow downloads do not make startup appear frozen.
+			// Both are needed: fd for autocomplete, rg for grep tool and bash commands.
+			const [fdPath] = await Promise.all([
+				ensureTool("fd", (status) => this.showManagedToolStatus(status)),
+				ensureTool("rg", (status) => this.showManagedToolStatus(status)),
+			]);
+			this.fdPath = fdPath;
 
-		// Enable the remaining input handlers only after managed-tool setup completes.
-		this.setupKeyHandlers();
-		this.setupEditorSubmitHandler();
-		this.ui.requestRender();
-
-		// Initialize extensions first so resources are shown before messages
-		await this.rebindCurrentSession();
-
-		// Render initial messages AFTER showing loaded resources
-		this.renderInitialMessages();
-
-		// Set up theme file watcher
-		onThemeChange(() => {
-			this.ui.invalidate();
-			this.updateEditorBorderColor();
+			// Enable the remaining input handlers only after managed-tool setup completes.
+			this.setupKeyHandlers();
+			this.setupEditorSubmitHandler();
 			this.ui.requestRender();
-		});
 
-		// Set up git branch watcher (uses provider instead of footer)
-		this.footerDataProvider.onBranchChange(() => {
-			this.ui.requestRender();
-		});
+			// Initialize extensions first so resources are shown before messages
+			await this.rebindCurrentSession();
 
-		// Initialize available provider count for footer display
-		await this.updateAvailableProviderCount();
+			// Render initial messages AFTER showing loaded resources
+			this.renderInitialMessages();
+
+			// Set up theme file watcher
+			onThemeChange(() => {
+				this.ui.invalidate();
+				this.updateEditorBorderColor();
+				this.ui.requestRender();
+			});
+
+			// Set up git branch watcher (uses provider instead of footer)
+			this.footerDataProvider.onBranchChange(() => {
+				this.ui.requestRender();
+			});
+
+			// Initialize available provider count for footer display
+			await this.updateAvailableProviderCount();
+		} finally {
+			if (!this.isShuttingDown && !this.shutdownRequested) {
+				this.finishStartupProgress();
+			} else {
+				this.disposeStartupProgress();
+			}
+		}
+		if (this.isShuttingDown || this.shutdownRequested) return;
 
 		// Flush the completed startup state before loading the remaining syntax grammars.
 		this.ui.renderNow();
@@ -1189,6 +1307,7 @@ export class InteractiveMode {
 		// Show startup warnings
 		const {
 			migratedProviders,
+			unlinkedHubBundles,
 			startupDiagnostics,
 			modelFallbackMessage,
 			initialMessage,
@@ -1208,6 +1327,12 @@ export class InteractiveMode {
 
 		if (migratedProviders && migratedProviders.length > 0) {
 			this.showWarning(`Migrated credentials to auth.json: ${migratedProviders.join(", ")}`);
+		}
+
+		if (unlinkedHubBundles && unlinkedHubBundles.length > 0) {
+			this.showWarning(
+				`Removed stale packages entr${unlinkedHubBundles.length === 1 ? "y" : "ies"} for hub bundle(s) with no loadable resources: ${unlinkedHubBundles.join(", ")}. They stay enabled and load from hub state.`,
+			);
 		}
 
 		const modelsJsonError = this.session.modelRuntime.getError();
@@ -1321,7 +1446,7 @@ export class InteractiveMode {
 		}
 
 		if (extendedKeysFormat === "xterm") {
-			return "tmux extended-keys-format is xterm. Pi works best with csi-u. Add `set -g extended-keys-format csi-u` to ~/.tmux.conf and restart tmux.";
+			return `tmux extended-keys-format is xterm. ${APP_NAME} works best with csi-u. Add \`set -g extended-keys-format csi-u\` to ~/.tmux.conf and restart tmux.`;
 		}
 
 		return undefined;
@@ -1429,6 +1554,15 @@ export class InteractiveMode {
 	/** Startup details (model scope, loaded resources). Hidden by quietStartup: true or "header". */
 	private shouldShowStartupDetails(): boolean {
 		return this.options.verbose === true || this.settingsManager.getQuietStartup() === false;
+	}
+
+	/**
+	 * Collapsed density handed to tool components. `"full"` is not a renderer mode:
+	 * it renders like `"compact"` and instead starts the session expanded.
+	 */
+	private getCollapsedDisplay(): "minimal" | "compact" {
+		const mode = this.settingsManager.getToolDisplay();
+		return mode === "full" ? "compact" : mode;
 	}
 
 	/**
@@ -2042,6 +2176,7 @@ export class InteractiveMode {
 		this.setupAutocompleteProvider();
 
 		const extensionRunner = this.session.extensionRunner;
+		this.registerBuiltinBtwRenderer(extensionRunner);
 		this.setupExtensionShortcuts(extensionRunner);
 		this.showLoadedResources({ force: false, showDiagnosticsWhenQuiet: true });
 		this.showStartupNoticesIfNeeded();
@@ -2096,6 +2231,9 @@ export class InteractiveMode {
 		this.unsubscribe = undefined;
 		this.programStatus.reset();
 		this.applyRuntimeSettings();
+		// Session replacement renders the transcript before extensions are rebound;
+		// install built-in renderers first so persisted /btw entries appear immediately.
+		this.registerBuiltinBtwRenderer(session.extensionRunner);
 
 		if (options.renderBeforeBind) {
 			this.renderCurrentSessionState();
@@ -2238,6 +2376,42 @@ export class InteractiveMode {
 	}
 
 	/**
+	 * Register the built-in renderer for `btw`-typed custom entries.
+	 * Called once after each session start (and after reload) so the renderer
+	 * is always present without requiring a user extension.
+	 * Extension renderers registered under the same type override this one.
+	 */
+	private registerBuiltinBtwRenderer(extensionRunner: ExtensionRunner): void {
+		extensionRunner.registerBuiltinEntryRenderer("btw", (entry, _options, entryTheme) => {
+			const data = entry.data as
+				| {
+						question?: string;
+						answer?: string;
+						promoted?: boolean;
+						usage?: { input?: number; output?: number; cost?: { total?: number } };
+				  }
+				| undefined;
+			if (!data?.question || !data.answer) return undefined;
+			const label = data.promoted ? ` btw (promoted): ${data.question}` : ` btw: ${data.question}`;
+			const box = new Container();
+			box.addChild(new Text(entryTheme.fg("accent", label), 0, 0));
+			box.addChild(new Markdown(data.answer, 1, 0, this.getMarkdownThemeWithSettings()));
+			if (data.usage) {
+				const cost = data.usage.cost?.total;
+				const costText = cost === undefined ? "" : `$${cost.toFixed(4)} · `;
+				box.addChild(
+					new Text(
+						entryTheme.fg("dim", `${costText}${data.usage.input ?? 0} in / ${data.usage.output ?? 0} out`),
+						1,
+						0,
+					),
+				);
+			}
+			return box;
+		});
+	}
+
+	/**
 	 * Set up keyboard shortcuts registered by extensions.
 	 */
 	private setupExtensionShortcuts(extensionRunner: ExtensionRunner): void {
@@ -2266,10 +2440,16 @@ export class InteractiveMode {
 				this.shutdownRequested = true;
 			},
 			getContextUsage: () => this.session.getContextUsage(),
+			getCompactionSettings: () => this.settingsManager.getCompactionSettings(),
+			newContext: (options) => this.session.newContext(options),
 			compact: (options) => {
 				void (async () => {
 					try {
-						const result = await this.session.compact(options?.customInstructions);
+						const result = await this.session.requestCompaction(options?.customInstructions);
+						if (result === "queued") {
+							this.showStatus("Compaction queued — runs at the next step boundary without interrupting work");
+							return;
+						}
 						options?.onComplete?.(result);
 					} catch (error) {
 						const err = error instanceof Error ? error : new Error(String(error));
@@ -2278,6 +2458,7 @@ export class InteractiveMode {
 				})();
 			},
 			getSystemPrompt: () => this.session.systemPrompt,
+			getContextBreakdown: () => this.session.getContextBreakdown(),
 		});
 
 		// Set up the extension shortcut handler on the default editor
@@ -2448,6 +2629,10 @@ export class InteractiveMode {
 		}
 		this.extensionWidgetsAbove.clear();
 		this.extensionWidgetsBelow.clear();
+		// Abort any detached side request before invalidating its session runtime.
+		this.btwPanel?.abort();
+		this.btwPanel = undefined;
+		this.btwPanelSession = undefined;
 		this.renderWidgets();
 	}
 
@@ -2706,7 +2891,8 @@ export class InteractiveMode {
 
 	private showTopExtensionDialog(): void {
 		const top = this.extensionDialogs.at(-1);
-		const component = top?.component ?? this.editor;
+		// phi: with no dialog left, return to the startup progress while it is still capturing input.
+		const component = top?.component ?? this.startupProgressComponent ?? (this.editor as Component);
 		this.editorContainer.clear();
 		this.editorContainer.addChild(component);
 		this.ui.setFocus(component);
@@ -2898,16 +3084,15 @@ export class InteractiveMode {
 			this.editor = this.defaultEditor;
 		}
 
-		this.editorContainer.addChild(this.editor as Component);
+		this.restoreEditorContainer();
 		if (this.activeStatusIndicator) {
 			this.statusContainer.clear();
 			this.activeWorkingIndicatorEmbedded = this.setEditorWorkingStatusIndicator(this.activeStatusIndicator);
 			if (!this.activeWorkingIndicatorEmbedded) {
 				this.statusContainer.addChild(this.activeStatusIndicator);
 			}
+			this.ui.requestRender();
 		}
-		this.ui.setFocus(this.editor as Component);
-		this.ui.requestRender();
 	}
 
 	/**
@@ -3159,7 +3344,7 @@ export class InteractiveMode {
 			if (!text) return;
 
 			// Handle commands
-			if (text === "/settings") {
+			if (text === "/settings" || text === "/config") {
 				this.showSettingsSelector();
 				this.editor.setText("");
 				return;
@@ -3214,6 +3399,16 @@ export class InteractiveMode {
 			}
 			if (text === "/session") {
 				this.handleSessionCommand();
+				this.editor.setText("");
+				return;
+			}
+			if (text === "/fast" || text.startsWith("/fast ")) {
+				this.handleFastCommand(text.slice(5).trim());
+				this.editor.setText("");
+				return;
+			}
+			if (text === "/routing") {
+				this.handleRoutingCommand();
 				this.editor.setText("");
 				return;
 			}
@@ -3297,6 +3492,14 @@ export class InteractiveMode {
 			if (text === "/quit") {
 				this.editor.setText("");
 				await this.shutdown();
+				return;
+			}
+
+			// /btw — fires a detached side-question call, never awaited, never blocks main turn
+			if (text === "/btw" || text.startsWith("/btw ")) {
+				const question = text.startsWith("/btw ") ? text.slice(5).trim() : "";
+				this.editor.setText("");
+				this.handleBtwCommand(question);
 				return;
 			}
 
@@ -3454,6 +3657,11 @@ export class InteractiveMode {
 				this.updateEditorBorderColor();
 				break;
 
+			case "service_tier_changed":
+				this.footer.invalidate();
+				this.ui.requestRender();
+				break;
+
 			case "message_start":
 				if (event.message.role === "custom") {
 					this.addMessageToChat(event.message);
@@ -3493,6 +3701,8 @@ export class InteractiveMode {
 									{
 										showImages: this.settingsManager.getShowImages(),
 										imageWidthCells: this.settingsManager.getImageWidthCells(),
+										collapsedLines: this.settingsManager.getToolOutputLines(),
+										display: this.getCollapsedDisplay(),
 										outputPad: this.outputPad,
 									},
 									this.getRegisteredToolDefinition(content.name),
@@ -3548,6 +3758,7 @@ export class InteractiveMode {
 						}
 						this.maybeShowThinkingDropNotice(this.streamingMessage);
 						this.maybeShowCacheMissNotice(this.streamingMessage);
+						this.maybeShowFastModeFallbackNotice(this.streamingMessage);
 					}
 					this.streamingComponent = undefined;
 					this.streamingMessage = undefined;
@@ -3572,6 +3783,8 @@ export class InteractiveMode {
 						{
 							showImages: this.settingsManager.getShowImages(),
 							imageWidthCells: this.settingsManager.getImageWidthCells(),
+							collapsedLines: this.settingsManager.getToolOutputLines(),
+							display: this.getCollapsedDisplay(),
 							outputPad: this.outputPad,
 						},
 						this.getRegisteredToolDefinition(event.toolName),
@@ -3655,20 +3868,26 @@ export class InteractiveMode {
 					this.autoCompactionEscapeHandler = undefined;
 				}
 				this.clearStatusIndicator("compaction");
-				if (event.aborted) {
+				if (event.aborted && !event.contextWindowStarted) {
 					if (event.reason === "manual") {
 						this.showError("Compaction cancelled");
 					} else {
 						this.showStatus("Auto-compaction cancelled");
 					}
+				} else if (event.prune && event.result) {
+					// Tool-result pruning: nothing was summarized away, so no card and
+					// no "compacted" language — one quiet line is the whole story.
+					const after = event.result.estimatedTokensAfter;
+					this.showStatus(
+						`Pruned old tool output from model context (${formatTokens(event.result.tokensBefore)}${
+							after !== undefined ? ` → ~${formatTokens(after)}` : ""
+						} tokens; transcript unchanged)`,
+					);
+					this.footer.invalidate();
 				} else if (event.result) {
-					const entries = this.sessionManager.buildContextEntries();
-					if (entries[0]?.type !== "compaction") {
-						throw new Error("Completed compaction is missing from the session context");
-					}
-					this.chatContainer.clear();
-					// The latest compaction is prepended for model context; append it below at its chronological position.
-					this.renderSessionEntries(entries.slice(1));
+					// Compaction changes what the MODEL sees, not what the user saw
+					// happen: keep the transcript scrollback intact and append the
+					// summary card where the compaction occurred.
 					this.addMessageToChat(
 						createCompactionSummaryMessage(
 							event.result.summary,
@@ -3683,6 +3902,16 @@ export class InteractiveMode {
 							usage: event.result.usage,
 						});
 					}
+					const after = event.result.estimatedTokensAfter;
+					this.showStatus(
+						after !== undefined
+							? `Context compacted: ${formatTokens(event.result.tokensBefore)} → ~${formatTokens(after)} tokens (transcript view unchanged)`
+							: `Context compacted: ${formatTokens(event.result.tokensBefore)} tokens before (transcript view unchanged)`,
+					);
+					for (const message of event.pendingMessages ?? []) this.addMessageToChat(message);
+					this.footer.invalidate();
+				} else if (event.contextWindowStarted) {
+					for (const message of event.pendingMessages ?? []) this.addMessageToChat(message);
 					this.footer.invalidate();
 				} else if (event.errorMessage) {
 					if (event.reason === "manual") {
@@ -3722,6 +3951,56 @@ export class InteractiveMode {
 				if (!event.success) {
 					this.showError(`Retry failed after ${event.attempt} attempts: ${event.finalError || "Unknown error"}`);
 				}
+				this.ui.requestRender();
+				break;
+			}
+
+			case "refusal_fallback": {
+				// The turn is being replayed on another model, so this is a notice, not an
+				// error: the transcript records which model declined and who took over.
+				const category = event.category ? ` (${event.category})` : "";
+				this.showWarning(
+					`Safety classifier declined${category} on ${event.from} — escalating to ${event.to} (rung ${event.rung}/${event.chainLength})`,
+				);
+				this.ui.requestRender();
+				break;
+			}
+
+			case "refusal_fallback_exhausted": {
+				const category = event.category ? ` (${event.category})` : "";
+				this.showError(
+					`Safety classifier declined${category} on ${event.from} and the fallback chain is exhausted (tried: ${event.tried.join(", ")}). Edit the request, or extend refusalFallback.chain in settings.`,
+				);
+				this.ui.requestRender();
+				break;
+			}
+
+			case "refusal_fallback_restored": {
+				this.showWarning(`Back on ${event.to} after the escalated turn (refusalFallback.sticky is false)`);
+				this.ui.requestRender();
+				break;
+			}
+
+			case "error_fallback": {
+				// The turn is being replayed on another model, so this is a notice, not an
+				// error: the transcript records which provider was down and who took over.
+				this.showWarning(
+					`${event.from} is unavailable — rerouting to ${event.to} (rung ${event.rung}/${event.chainLength}): ${event.reason}`,
+				);
+				this.ui.requestRender();
+				break;
+			}
+
+			case "error_fallback_exhausted": {
+				this.showError(
+					`${event.from} is unavailable and the error-fallback chain is exhausted (tried: ${event.tried.join(", ")}). Switch models with /model, or extend errorFallback.chain in settings.`,
+				);
+				this.ui.requestRender();
+				break;
+			}
+
+			case "error_fallback_restored": {
+				this.showWarning(`Back on ${event.to} after the rerouted turn (errorFallback.sticky is false)`);
 				this.ui.requestRender();
 				break;
 			}
@@ -4002,6 +4281,8 @@ export class InteractiveMode {
 							{
 								showImages: this.settingsManager.getShowImages(),
 								imageWidthCells: this.settingsManager.getImageWidthCells(),
+								collapsedLines: this.settingsManager.getToolOutputLines(),
+								display: this.getCollapsedDisplay(),
 								outputPad: this.outputPad,
 							},
 							this.getRegisteredToolDefinition(content.name),
@@ -4067,7 +4348,8 @@ export class InteractiveMode {
 			if (entry.type === "custom" || (entry.type === "usage" && entry.kind === "cache_warm")) {
 				return [entry];
 			}
-			const messages = sessionEntryToContextMessages(entry);
+			// Display keeps the full transcript (phi); compaction usage still gets its cost notice.
+			const messages = sessionEntryToDisplayMessages(entry);
 			if ((entry.type === "compaction" || entry.type === "branch_summary") && entry.usage && messages.length > 0) {
 				return [...messages, { type: "compaction_cost", kind: entry.type, usage: entry.usage }];
 			}
@@ -4159,6 +4441,134 @@ export class InteractiveMode {
 		if (miss) this.addCacheMissNotice(miss);
 	}
 
+	/**
+	 * Fast mode was on but the provider served this turn at standard speed: the
+	 * fast-mode rate limit or capacity turned the request down (the ai layer
+	 * retried at standard speed and started a cooldown), the organization has fast
+	 * mode switched off, or the model has no fast tier. Said once per downgrade
+	 * streak so a long cooldown does not spam. An organization-level refusal also
+	 * turns fast mode off for the session, as Claude Code does: only an admin can
+	 * change that, so leaving the toggle on would just mislabel every turn.
+	 */
+	private maybeShowFastModeFallbackNotice(message: AssistantMessage): void {
+		if (!this.session.fastMode || message.speed !== "standard") {
+			this.fastModeFallbackNoticeShown = false;
+			return;
+		}
+		if (this.fastModeFallbackNoticeShown) return;
+		this.fastModeFallbackNoticeShown = true;
+		const fallback = message.diagnostics?.find((d) => d.type === "anthropic_fast_mode_fallback");
+		const reason = fallback?.details?.reason;
+		const apiMessage = typeof fallback?.details?.message === "string" ? fallback.details.message : undefined;
+		const cooldownMs = typeof fallback?.details?.cooldownMs === "number" ? fallback.details.cooldownMs : undefined;
+		const retry = cooldownMs ? ` Fast mode is retried in ~${Math.max(1, Math.round(cooldownMs / 1000))}s.` : "";
+		let text: string;
+		if (reason === "disabled") {
+			this.session.setFastMode(false);
+			text =
+				`Fast mode OFF: ${apiMessage ?? "fast mode is not enabled for your Anthropic organization"} ` +
+				"(Claude Team/Enterprise: Admin settings > Claude Code on claude.ai; Console: Claude Code preferences on platform.claude.com, plus provisioned access). " +
+				"This turn ran at standard speed and price; run /fast again once it is enabled.";
+		} else if (reason === "unsupported") {
+			text = `Fast mode unavailable: ${apiMessage ?? `${message.model} rejected fast mode`}. Served at standard speed and price.${retry}`;
+		} else if (reason === "capacity") {
+			text = `Fast mode unavailable (fast-mode rate limit or capacity${apiMessage ? `: ${apiMessage}` : ""}). Served at standard speed and price.${retry}`;
+		} else {
+			text = "Fast mode requested, but the provider served this turn at standard speed and price.";
+		}
+		this.chatContainer.addChild(new Spacer(1));
+		this.chatContainer.addChild(new Text(theme.fg("warning", text), 1, 0));
+		this.footer.invalidate();
+	}
+
+	/**
+	 * `/fast [on|off|status]`: toggle the session's fast tier. Anthropic fast
+	 * mode on Claude Opus 5.5 / 5 / 4.8, the fast (priority) tier on OpenAI-style
+	 * APIs. Session-scoped by design: never written to settings, so it does not
+	 * leak into subagents or later sessions; `--service-tier fast` or
+	 * `/settings` are the always-on paths.
+	 */
+	private handleFastCommand(arg: string): void {
+		const current = this.session.fastMode;
+		let next: boolean;
+		switch (arg.toLowerCase()) {
+			case "":
+			case "toggle":
+				next = !current;
+				break;
+			case "on":
+				next = true;
+				break;
+			case "off":
+				next = false;
+				break;
+			case "status":
+				this.showStatus(this.describeFastMode(current));
+				this.ui.requestRender();
+				return;
+			default:
+				this.showWarning("Usage: /fast [on|off|status]");
+				return;
+		}
+		const unsupported = next && this.session.model && getUnsupportedFastServiceTierError(this.session.model, "fast");
+		if (unsupported) {
+			this.showWarning(unsupported);
+			return;
+		}
+		if (next !== current) {
+			this.session.setFastMode(next);
+		}
+		this.fastModeFallbackNoticeShown = false;
+		this.chatContainer.addChild(new Spacer(1));
+		this.chatContainer.addChild(new Text(this.describeFastMode(next), 1, 0));
+		if (next && this.session.isStreaming) {
+			this.chatContainer.addChild(
+				new Text(
+					theme.fg(
+						"dim",
+						"The running request finishes at its current speed; fast mode applies from the next request.",
+					),
+					1,
+					0,
+				),
+			);
+		}
+		this.footer.invalidate();
+		this.ui.requestRender();
+	}
+
+	private describeFastMode(enabled: boolean): string {
+		const model = this.session.model;
+		const modelName = model ? `${model.provider}/${model.id}` : "no model";
+		if (!enabled) {
+			return `${theme.bold("Fast mode OFF")} ${theme.fg("dim", `— ${modelName} at standard speed and price`)}`;
+		}
+		if (this.session.serviceTier === "ultrafast") {
+			const wireTier = model ? getOpenAIResponsesFastServiceTier(model) : undefined;
+			const price =
+				wireTier?.tier === "ultrafast" && model
+					? ` at ${wireTier.costMultiplier}× price ($${(model.cost.input * wireTier.costMultiplier).toFixed(0)}/$${(model.cost.output * wireTier.costMultiplier).toFixed(0)} per MTok in/out)`
+					: "; the provider decides whether this model accepts it";
+			return `${theme.bold("Fast mode ON")} ${theme.fg("dim", `— ${modelName}: explicit ultrafast processing tier${price}`)}`;
+		}
+		const kind = this.session.fastTierKind;
+		if (kind === "anthropic" && model) {
+			const multiplier =
+				(model.compat as { fastModeCostMultiplier?: number } | undefined)?.fastModeCostMultiplier ?? 2;
+			const price = `$${(model.cost.input * multiplier).toFixed(0)}/$${(model.cost.output * multiplier).toFixed(0)} per MTok in/out`;
+			return `${theme.bold("Fast mode ON")} ${theme.fg("dim", `— ${modelName}: Anthropic fast mode, up to 2.5× output speed at ${multiplier}× price (${price})`)}`;
+		}
+		if (kind === "openai") {
+			const wireTier = model ? getOpenAIResponsesFastServiceTier(model) : undefined;
+			if (wireTier && model) {
+				const price = `$${(model.cost.input * wireTier.costMultiplier).toFixed(0)}/$${(model.cost.output * wireTier.costMultiplier).toFixed(0)} per MTok in/out`;
+				return `${theme.bold("Fast mode ON")} ${theme.fg("dim", `— ${modelName}: ${wireTier.tier} processing tier at ${wireTier.costMultiplier}× price (${price})`)}`;
+			}
+			return `${theme.bold("Fast mode ON")} ${theme.fg("dim", `— ${modelName}: fast (priority) processing tier at ~2× price`)}`;
+		}
+		return `${theme.bold("Fast mode ON")} ${theme.fg("warning", `— ${modelName} has no fast tier; requests run at standard speed until you switch to Claude Opus 5.5 / 5 / 4.8 on Anthropic (or an OpenAI model)`)}`;
+	}
+
 	private addCacheMissNotice(miss: CacheMiss): void {
 		if (miss.missedTokens < 20_000 && miss.missedCost < 0.1) return;
 
@@ -4175,16 +4585,29 @@ export class InteractiveMode {
 	}
 
 	renderInitialMessages(): void {
-		const entries = this.sessionManager.buildContextEntries();
-		this.renderSessionEntries(entries, {
+		// Render the session as it happened, not the model's compacted view:
+		// compaction rewrites LLM context, never the visible history. Compaction
+		// entries render inline as summary cards at the position they occurred.
+		// Cap the tail for startup performance on very large sessions.
+		const MAX_INITIAL_RENDER_ENTRIES = 500;
+		const branch = this.sessionManager.getBranch();
+		const start = Math.max(0, branch.length - MAX_INITIAL_RENDER_ENTRIES);
+		if (start > 0) {
+			this.chatContainer.addChild(
+				new Text(theme.fg("muted", `… ${start} older entries not shown (full history in the session file)`), 1, 0),
+			);
+			this.chatContainer.addChild(new Spacer(1));
+		}
+		this.renderSessionEntries(branch.slice(start), {
 			updateFooter: true,
 			populateHistory: true,
 		});
 		this.renderProjectTrustWarningIfNeeded();
 
-		// Show compaction info if session was compacted
+		// Show compaction info if session was compacted (prune markers don't count —
+		// they summarize nothing away)
 		const allEntries = this.sessionManager.getEntries();
-		const compactionCount = allEntries.filter((e) => e.type === "compaction").length;
+		const compactionCount = allEntries.filter((e) => e.type === "compaction" && e.mode !== "prune").length;
 		if (compactionCount > 0) {
 			const times = compactionCount === 1 ? "1 time" : `${compactionCount} times`;
 			this.showStatus(`Session compacted ${times}`);
@@ -4204,7 +4627,7 @@ export class InteractiveMode {
 				() =>
 					theme.fg(
 						"warning",
-						`This project is not trusted. Project ${CONFIG_DIR_NAME} resources and packages are ignored. Use /trust to save a trust decision, then restart pi.`,
+						`This project is not trusted. Project ${CONFIG_DIR_NAME} resources and packages are ignored. Use /trust to save a trust decision, then restart ${APP_NAME}.`,
 					),
 				1,
 				0,
@@ -4248,6 +4671,311 @@ export class InteractiveMode {
 	private handleCtrlD(): void {
 		// Only called when editor is empty (enforced by CustomEditor)
 		void this.shutdown();
+	}
+
+	/**
+	 * Handle the /btw command.
+	 *
+	 * If question is empty, reopen the last panel without a new query.
+	 * Otherwise, mount the BtwPanel immediately and fire the side call detached
+	 * (never awaited) so the main turn is unaffected.
+	 */
+	private handleBtwCommand(question: string): void {
+		this.btwHistory.setMaxHistory(this.settingsManager.getBtwMaxHistory());
+		// Bare /btw — reopen the last panel without a new query
+		if (question === "") {
+			if (this.btwHistory.getAll().length === 0) return;
+			const allHistory = this.btwHistory.getAll();
+			const last = allHistory[allHistory.length - 1];
+			if (!last) return;
+			this.mountBtwPanel(last.question, allHistory, last.answer, undefined, undefined);
+			return;
+		}
+		// Mount panel immediately in pending state
+		const historySnapshot = [...this.btwHistory.getAll()];
+		this.mountBtwPanel(question, historySnapshot, undefined, undefined, undefined);
+		// Fire the side call detached — never awaited, never blocks main turn
+		void this.runBtwSideCall(question, historySnapshot);
+	}
+
+	/**
+	 * Mount (or replace) the BtwPanel in the widgetContainerAbove.
+	 * The panel is given focus so keys are consumed here, not by the editor.
+	 * M1: abort the old panel's side call before replacing it.
+	 */
+	private mountBtwPanel(
+		question: string,
+		history: readonly import("../../core/side-question.ts").SideQuestionPair[],
+		answer: string | undefined,
+		error: string | undefined,
+		usage: BtwUsage | undefined,
+	): void {
+		// M1: abort in-flight side call on the old panel before replacing.
+		if (this.btwPanel) {
+			this.btwPanel.abort();
+			this.extensionWidgetsAbove.delete("btw");
+			this.btwPanel = undefined;
+		}
+
+		const historyItems: BtwHistoryItem[] = history.map((p) => ({
+			question: p.question,
+			answer: p.answer,
+			state: "answer" as const,
+			usage: { inputTokens: p.usage.input, outputTokens: p.usage.output, cost: p.usage.cost?.total },
+		}));
+
+		const panel = new BtwPanel({
+			question,
+			answer,
+			error,
+			usage,
+			history: historyItems,
+			onClose: () => this.closeBtwPanel(),
+			onAbort: () => {
+				// Panel abort only aborts the side call (handled via panel.signal).
+				// The main turn is unaffected.
+			},
+			// H1: Esc fires the main stream abort when streaming, so the user can
+			// interrupt the main turn without closing the panel. When idle, Esc
+			// closes the panel as normal.
+			onEscape: () => {
+				if (this.session.isStreaming) {
+					this.restoreQueuedMessagesToEditor({ abort: true });
+				} else {
+					this.closeBtwPanel();
+				}
+			},
+			onCopy: (item) => {
+				if (item.answer) {
+					copyToClipboard(item.answer).catch(() => {
+						// best-effort
+					});
+				}
+			},
+			onClear: () => {
+				this.btwHistory.clear();
+			},
+			onPromote: (item) => {
+				void this.handleBtwPromote(item);
+			},
+			onAdopt: (item) => {
+				void this.handleBtwAdopt(item);
+			},
+		});
+
+		this.btwPanel = panel;
+		this.btwPanelSession = this.session;
+		this.extensionWidgetsAbove.set("btw", panel);
+		this.renderWidgets();
+		this.ui.setFocus(panel);
+	}
+
+	private closeBtwPanel(): void {
+		if (!this.btwPanel) return;
+		this.extensionWidgetsAbove.delete("btw");
+		this.btwPanel = undefined;
+		this.btwPanelSession = undefined;
+		this.renderWidgets();
+		// Restore focus to the editor
+		this.ui.setFocus(this.editor);
+		this.ui.requestRender();
+	}
+
+	/**
+	 * Run the side question call. Detached — must not be awaited by the caller.
+	 * The panel is already mounted in pending state.
+	 */
+	private async runBtwSideCall(
+		question: string,
+		historySnapshot: readonly import("../../core/side-question.ts").SideQuestionPair[],
+	): Promise<void> {
+		if (!this.btwPanel) return;
+		const panel = this.btwPanel;
+		const ownerSession = this.btwPanelSession ?? this.session;
+
+		// M2: resolve btw.model (optional `:thinking` suffix) against the owner session's catalog.
+		const btwModelRef = this.settingsManager.getBtwModel();
+		const available = ownerSession.modelRuntime.getModels();
+		let model = ownerSession.model;
+		// pi-ai's request-level ThinkingLevel has no "off" (absence means off).
+		let thinkingLevel: Exclude<ThinkingLevel, "off"> | undefined;
+		if (btwModelRef) {
+			const resolved = resolveModelReference(
+				{ text: btwModelRef, thinkingSuffix: "lenient", fuzzy: false },
+				[...available],
+				() => true,
+			);
+			const parsed =
+				resolved.status === "resolved"
+					? { model: resolved.model, thinkingLevel: resolved.thinkingLevel }
+					: { model: undefined, thinkingLevel: undefined };
+			if (!parsed.model) {
+				panel.setError(`Configured btw.model was not found: ${btwModelRef}`);
+				this.ui.requestRender();
+				return;
+			}
+			model = parsed.model;
+			// parsed.thinkingLevel includes "off" (agent-core type); absence of a
+			// reasoning option is the pi-ai representation of off/default.
+			if (parsed.thinkingLevel && parsed.thinkingLevel !== "off") thinkingLevel = parsed.thinkingLevel;
+		}
+
+		if (!model) {
+			panel.setError("No model configured — select a model with /model first");
+			this.ui.requestRender();
+			return;
+		}
+
+		// Snapshot context at dispatch time; drop trailing partial assistant
+		const contextEntries = ownerSession.sessionManager.buildContextEntries();
+		const maxHistory = this.settingsManager.getBtwMaxHistory();
+		const messages = buildSideQuestionMessages(contextEntries, model, question, historySnapshot, maxHistory);
+
+		try {
+			const result = await runSideQuestion(
+				model,
+				ownerSession.modelRuntime,
+				messages,
+				ownerSession.systemPrompt,
+				panel.signal,
+				thinkingLevel,
+				ownerSession.settingsManager.getStreamIdleTimeoutMs(),
+			);
+
+			// A replaced/closed panel owns an aborted request; never leak its result into
+			// history or persistence even if a provider races the abort.
+			if (panel.signal.aborted || this.btwPanel !== panel) return;
+
+			const pair = { question, answer: result.answer, usage: result.usage };
+			this.btwHistory.append(pair);
+
+			const usageDisplay: BtwUsage = {
+				inputTokens: result.usage.input,
+				outputTokens: result.usage.output,
+				cost: result.usage.cost?.total,
+			};
+
+			// Update the panel if still mounted
+			if (this.btwPanel === panel) {
+				panel.setAnswer(result.answer, usageDisplay);
+				this.ui.requestRender();
+			}
+
+			// H2: persist only when the session is idle. If streaming, defer until
+			// after the active turn ends to avoid appending mid-turn.
+			if (this.settingsManager.getBtwPersist()) {
+				const persist = () => {
+					const entryId = ownerSession.sessionManager.appendCustomEntry("btw", {
+						question,
+						answer: result.answer,
+						usage: result.usage,
+					});
+					const entry = ownerSession.sessionManager.getEntry(entryId);
+					if (entry?.type === "custom" && ownerSession === this.session) {
+						this.addCustomEntryToChat(entry);
+						this.ui.requestRender();
+					}
+				};
+				if (!ownerSession.isStreaming) persist();
+				else {
+					const unsubscribeDeferred = ownerSession.subscribe((event) => {
+						if (event.type !== "agent_settled") return;
+						unsubscribeDeferred();
+						if (this.settingsManager.getBtwPersist()) persist();
+					});
+				}
+			}
+		} catch (error) {
+			if (panel.signal.aborted) return; // panel was closed — not an error
+			const msg = error instanceof Error ? error.message : String(error);
+			if (this.btwPanel === panel) {
+				panel.setError(msg);
+				this.ui.requestRender();
+			}
+		}
+	}
+
+	/**
+	 * H4: Promote — copy the Q&A into a **new session file** without switching the
+	 * current session or aborting the active main turn.
+	 *
+	 * The new session file is created in the background via SessionManager.create +
+	 * the same setup logic used by runtimeHost.newSession, but we never call
+	 * runtimeHost.newSession (which would teardown the running session).
+	 * The Q&A is stored as real LLM-visible user+assistant messages so the new
+	 * session opens with full conversational context.
+	 * Title is set to "btw: <question>".
+	 */
+	private async handleBtwPromote(item: BtwHistoryItem): Promise<void> {
+		if (!item.answer) return;
+		const question = item.question;
+		const answer = item.answer;
+
+		try {
+			// Build a new persisted SessionManager in the same session dir — without
+			// switching the current runtime session.
+			const cwd = this.sessionManager.getCwd();
+			const sessionDir = this.sessionManager.isPersisted() ? this.sessionManager.getSessionDir() : undefined;
+			const newSm = SessionManager.create(cwd, sessionDir, {
+				parentSession: this.sessionManager.getSessionFile(),
+			});
+
+			// Copy the exact sanitized, compaction-aware LLM context, including the
+			// compaction summary and custom messages rather than only raw message entries.
+			const currentEntries = this.sessionManager.buildContextEntries();
+			for (const message of buildSideQuestionContextMessages(currentEntries)) newSm.appendMessage(message);
+
+			// Append the Q&A as LLM-visible user+assistant messages.
+			newSm.appendMessage({ role: "user", content: question, timestamp: Date.now() });
+			newSm.appendMessage({
+				role: "assistant",
+				content: [{ type: "text", text: answer }],
+				api: this.session.model?.api ?? "anthropic-messages",
+				provider: this.session.model?.provider ?? "anthropic",
+				model: this.session.model?.id ?? "unknown",
+				usage: {
+					input: 0,
+					output: 0,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 0,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				stopReason: "stop",
+				timestamp: Date.now(),
+			});
+
+			// Append the btw custom entry so the transcript identifies this as a promoted Q&A.
+			newSm.appendCustomEntry("btw", { question, answer, promoted: true });
+			newSm.appendSessionInfo(`btw: ${question}`);
+
+			const newFile = newSm.getSessionFile();
+			if (newFile) {
+				this.showStatus(`btw promoted — session created: ${newFile}`);
+			} else {
+				this.showStatus("btw promoted to new session");
+			}
+		} catch (error) {
+			this.showError(`btw promote failed: ${error instanceof Error ? error.message : String(error)}`);
+		}
+	}
+
+	/**
+	 * Adopt: inject the Q&A into the current session as a custom message
+	 * with deliverAs:"nextTurn" so the main model sees it on the next turn.
+	 */
+	private async handleBtwAdopt(item: BtwHistoryItem): Promise<void> {
+		if (!item.answer) return;
+		await this.session.sendCustomMessage(
+			{
+				customType: "btw",
+				content: `[/btw Q: ${item.question}]\n\n${item.answer}`,
+				display: false,
+				details: { question: item.question, answer: item.answer },
+			},
+			{ deliverAs: "nextTurn" },
+		);
+		this.showStatus(`/btw answer injected — available on next turn`);
 	}
 
 	/**
@@ -4899,6 +5627,7 @@ export class InteractiveMode {
 					httpIdleTimeoutMs: this.settingsManager.getHttpIdleTimeoutMs(),
 					cacheWarmingMode: this.settingsManager.getCacheWarmingMode(),
 					thinkingLevel: this.settingsManager.getDefaultThinkingLevel() ?? DEFAULT_THINKING_LEVEL,
+					serviceTier: this.settingsManager.getServiceTier(),
 					availableThinkingLevels: [...THINKING_LEVEL_OPTIONS],
 					modelThinkingLevels: this.settingsManager.getAllModelThinkingLevels(),
 					currentTheme: this.themeController.getThemeSelection() || SYSTEM_THEME_NAME,
@@ -4907,6 +5636,7 @@ export class InteractiveMode {
 					hideThinkingBlock: this.hideThinkingBlock,
 					mermaidRenderingMode: this.settingsManager.getMermaidRenderingMode(),
 					collapseChangelog: this.settingsManager.getCollapseChangelog(),
+					autoUpdate: this.settingsManager.getAutoUpdate(),
 					enableInstallTelemetry: this.settingsManager.getEnableInstallTelemetry(),
 					doubleEscapeAction: this.settingsManager.getDoubleEscapeAction(),
 					treeFilterMode: this.settingsManager.getTreeFilterMode(),
@@ -4915,6 +5645,7 @@ export class InteractiveMode {
 					defaultProjectTrust: this.settingsManager.getDefaultProjectTrust(),
 					editorPaddingX: this.settingsManager.getEditorPaddingX(),
 					outputPad: this.settingsManager.getOutputPad(),
+					toolDisplay: this.settingsManager.getToolDisplay(),
 					autocompleteMaxVisible: this.settingsManager.getAutocompleteMaxVisible(),
 					quietStartup: this.settingsManager.getQuietStartup(),
 					clearOnShrink: this.settingsManager.getClearOnShrink(),
@@ -5000,6 +5731,15 @@ export class InteractiveMode {
 							this.updateEditorBorderColor();
 						}
 					},
+					onServiceTierChange: (tier) => {
+						this.settingsManager.setServiceTier(tier);
+						// The setting is the new default; drop any `/fast` or --service-tier
+						// override so the change is what the session actually sends.
+						this.session.setServiceTier(undefined);
+						this.showStatus(`Service tier: ${tier}`);
+						this.footer.invalidate();
+						this.ui.requestRender();
+					},
 					onThemeChange: (themeSetting) => {
 						this.settingsManager.setTheme(themeSetting);
 						this.themeController.setThemeSetting(themeSetting);
@@ -5021,6 +5761,14 @@ export class InteractiveMode {
 					},
 					onCollapseChangelogChange: (collapsed) => {
 						this.settingsManager.setCollapseChangelog(collapsed);
+					},
+					onAutoUpdateChange: (enabled) => {
+						this.settingsManager.setAutoUpdate(enabled);
+						this.showStatus(
+							enabled
+								? "Auto-update on: new phi releases install themselves (restart to use them)"
+								: "Auto-update off",
+						);
 					},
 					onEnableInstallTelemetryChange: (enabled) => {
 						this.settingsManager.setEnableInstallTelemetry(enabled);
@@ -5058,6 +5806,17 @@ export class InteractiveMode {
 								}
 							}
 						}
+						this.ui.requestRender();
+					},
+					onToolDisplayChange: (mode) => {
+						this.settingsManager.setToolDisplay(mode);
+						const collapsed = mode === "full" ? "compact" : mode;
+						for (const child of this.chatContainer.children) {
+							if (child instanceof ToolExecutionComponent) {
+								child.setDisplay(collapsed);
+							}
+						}
+						if (mode === "full") this.setToolsExpanded(true);
 						this.ui.requestRender();
 					},
 					onAutocompleteMaxVisibleChange: (maxVisible) => {
@@ -5100,7 +5859,10 @@ export class InteractiveMode {
 					},
 					onFullscreenWheelScrollLinesChange: (lines) => {
 						this.settingsManager.setFullscreenWheelScrollLines(lines);
-						if (this.renderer instanceof TuiAltScreen) this.renderer.setWheelScrollLines(lines);
+						// Apply the clamped value the setting stored, not the raw selection.
+						if (this.renderer instanceof TuiAltScreen) {
+							this.renderer.setWheelScrollLines(this.settingsManager.getFullscreenWheelScrollLines());
+						}
 					},
 					onWarningsChange: (warnings) => {
 						this.settingsManager.setWarnings(warnings);
@@ -6274,7 +7036,7 @@ export class InteractiveMode {
 
 	private notifyAuthDialog(dialog: LoginDialogComponent, event: AuthEvent): void {
 		if (event.type === "auth_url") {
-			dialog.showAuth(event.url, event.instructions);
+			dialog.showAuth(event.url, event.instructions, event.copyUrl);
 		} else if (event.type === "device_code") {
 			dialog.showDeviceCode(event);
 			dialog.showWaiting("Waiting for authentication...");
@@ -6327,7 +7089,6 @@ export class InteractiveMode {
 			await this.loginProvider(dialog, providerId, providerName, "oauth");
 			restoreEditor();
 			await this.completeProviderAuthentication(providerId, providerName, "oauth", previousModel);
-			if (providerId === RADIUS_PROVIDER_ID) this.offerRadiusMcpServer(providerId, providerName);
 		} catch (error: unknown) {
 			restoreEditor();
 			const errorMsg = error instanceof Error ? error.message : String(error);
@@ -6341,59 +7102,6 @@ export class InteractiveMode {
 				this.showError(`Failed to login to ${providerName}: ${errorMsg}`);
 			}
 		}
-	}
-
-	/**
-	 * Offer to point the Radius MCP server in the global mcp.json at the Radius login, adding the server
-	 * when missing. Nothing is asked when a global server already uses this login.
-	 */
-	private offerRadiusMcpServer(providerId: string, providerName: string): void {
-		const mcpPath = path.join(getAgentDir(), "mcp.json");
-		const normalizeUrl = (url: string) => url.replace(/\/+$/u, "");
-		const { servers } = loadMcpConfig({
-			agentDir: getAgentDir(),
-			cwd: this.sessionManager.getCwd(),
-			projectTrusted: false,
-		});
-		const existing = servers.find(
-			(server) => "url" in server.config && normalizeUrl(server.config.url) === normalizeUrl(RADIUS_MCP_URL),
-		);
-		if (existing && "url" in existing.config && existing.config.auth?.provider === providerId) return;
-
-		let name = existing?.name ?? "radius";
-		if (!existing && servers.some((server) => server.name === name)) name = "radius-mcp";
-		const config: McpHttpServerConfig =
-			existing && "url" in existing.config
-				? { ...existing.config, auth: { provider: providerId } }
-				: { url: RADIUS_MCP_URL, auth: { provider: providerId } };
-		// `auth` replaces the MCP OAuth sign-in.
-		delete config.oauth;
-
-		this.showSelector((done) => {
-			const selector = new ExtensionSelectorComponent(
-				`Configure ${providerName} MCP in ${mcpPath}?`,
-				["Yes", "No"],
-				(option) => {
-					done();
-					if (option !== "Yes") return;
-					try {
-						addMcpServerConfig(mcpPath, name, config);
-					} catch (error: unknown) {
-						this.showError(
-							`Could not update ${mcpPath}: ${error instanceof Error ? error.message : String(error)}`,
-						);
-						return;
-					}
-					// The MCP extension reads mcp.json when the session starts.
-					void this.handleReloadCommand();
-				},
-				() => {
-					done();
-					this.ui.requestRender();
-				},
-			);
-			return { component: selector, focus: selector };
-		});
 	}
 
 	// =========================================================================
@@ -6465,6 +7173,7 @@ export class InteractiveMode {
 			this.themeController.applyFromSettings();
 			this.setupAutocompleteProvider();
 			const runner = this.session.extensionRunner;
+			this.registerBuiltinBtwRenderer(runner);
 			this.setupExtensionShortcuts(runner);
 			this.showLoadedResources({
 				force: false,
@@ -6582,6 +7291,14 @@ export class InteractiveMode {
 	}
 
 	private async handleShareCommand(): Promise<void> {
+		// /share uploads the whole transcript to an external host
+		// (Radius, falling back to a GitHub gist). Off unless deliberately enabled —
+		// see core/exowatt-hardening.ts.
+		if (!isSessionShareEnabled()) {
+			this.showError(SESSION_SHARE_DISABLED_MESSAGE);
+			return;
+		}
+
 		await shareSession({
 			session: this.session,
 			ui: this.ui,
@@ -6741,6 +7458,66 @@ export class InteractiveMode {
 
 		this.chatContainer.addChild(new Spacer(1));
 		this.chatContainer.addChild(new ThemedText(renderInfo, 1, 0));
+		this.ui.requestRender();
+	}
+
+	private handleRoutingCommand(): void {
+		const breakdown = getRoutingBreakdown(this.sessionManager.getEntries(), (provider, id) =>
+			this.session.modelRuntime.getModel(provider, id),
+		);
+		if (breakdown.requests === 0) {
+			this.chatContainer.addChild(new Spacer(1));
+			this.chatContainer.addChild(
+				new Text(
+					theme.fg(
+						"dim",
+						"No gateway/auto requests in this session yet. Ctrl+P → gateway/auto, then send a prompt.",
+					),
+					1,
+					0,
+				),
+			);
+			this.ui.requestRender();
+			return;
+		}
+
+		const estimatedCost = `~${formatUsd(breakdown.totalCostUsd)}`;
+		const unpriced = breakdown.unpriced > 0 ? ` (${breakdown.unpriced} unpriced)` : "";
+		let info = `${theme.bold("Routing (gateway/auto)")}\n`;
+		info += `${theme.fg("dim", "Requests:")} ${breakdown.requests}   ${theme.fg("dim", "Cost:")} ${estimatedCost}${unpriced}\n`;
+		info += `${theme.fg("dim", "By served model:")}\n`;
+
+		const modelWidth = Math.max("model".length, ...breakdown.buckets.map((bucket) => bucket.servedModel.length));
+		const requestWidth = Math.max(
+			"requests".length,
+			...breakdown.buckets.map((bucket) => `${bucket.count} req`.length),
+		);
+		const costWidth = Math.max(
+			"cost".length,
+			...breakdown.buckets.map((bucket) => `~${formatUsd(bucket.costUsd)}`.length),
+		);
+		for (const bucket of breakdown.buckets) {
+			const model = `  ${bucket.servedModel.padEnd(modelWidth)}`;
+			const requests = `${bucket.count} req`.padStart(requestWidth);
+			const cost = `~${formatUsd(bucket.costUsd)}`.padStart(costWidth);
+			const tokens = `↑${formatTokens(bucket.input)} ↓${formatTokens(bucket.output)}`;
+			info += `${theme.fg("dim", `${model}${requests}   ${cost}   ${tokens}`)}\n`;
+		}
+
+		for (const counterfactual of breakdown.counterfactuals) {
+			if (!counterfactual.available) {
+				info += `${theme.fg("dim", `Saved vs all-${counterfactual.model}:`)} n/a (gateway/${counterfactual.model} not in catalog)\n`;
+				continue;
+			}
+			const savings = formatUsd(Math.abs(counterfactual.savedUsd));
+			const savingsText = counterfactual.savedUsd < 0 ? `-${savings}` : savings;
+			const savingsColor = counterfactual.savedUsd < 0 ? "warning" : "success";
+			info += `${theme.fg("dim", `Saved vs all-${counterfactual.model}:`)} ${theme.fg(savingsColor, savingsText)} ${theme.fg("dim", `(would have cost ${formatUsd(counterfactual.costUsd)})`)}\n`;
+		}
+		info += theme.fg("dim", "Costs are estimates from catalog prices × actual tokens.");
+
+		this.chatContainer.addChild(new Spacer(1));
+		this.chatContainer.addChild(new Text(info, 1, 0));
 		this.ui.requestRender();
 	}
 
@@ -7054,13 +7831,19 @@ export class InteractiveMode {
 		this.clearStatusIndicator();
 
 		try {
-			await this.session.compact(customInstructions);
+			// Never aborts running work: mid-run the request queues and executes at
+			// the next step boundary; idle it compacts immediately.
+			const result = await this.session.requestCompaction(customInstructions);
+			if (result === "queued") {
+				this.showStatus("Compaction queued — runs at the next step boundary without interrupting work");
+			}
 		} catch {
 			// Ignore, will be emitted as an event
 		}
 	}
 
 	stop(fullscreenExitOutput = this.settingsManager.getFullscreenExitOutput()): void {
+		this.disposeStartupProgress();
 		this.disposeActiveSelector();
 		if (this.settingsManager.getShowTerminalProgress()) {
 			this.ui.terminal.setProgress(false);

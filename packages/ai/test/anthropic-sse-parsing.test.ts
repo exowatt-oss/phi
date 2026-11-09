@@ -196,7 +196,10 @@ describe("Anthropic raw SSE parsing", () => {
 		expect(result.usage.cost.output).toBeCloseTo(0.0001, 10);
 	});
 
-	it("fails safely when Anthropic falls back after output begins", async () => {
+	it("continues a mid-output fallback on the serving model and keeps the declining model's text", async () => {
+		// phi handles a mid-stream refusal handoff instead of failing the turn: the
+		// fallback model finishes it, `responseModel` names it, and only the declining
+		// model's text (not its thinking/tool_use) is kept for replay.
 		const model = getModel("anthropic", "claude-opus-5");
 		const response = createSseResponse([
 			{
@@ -231,6 +234,25 @@ describe("Anthropic raw SSE parsing", () => {
 					},
 				}),
 			},
+			{ event: "content_block_stop", data: JSON.stringify({ type: "content_block_stop", index: 1 }) },
+			{
+				event: "content_block_start",
+				data: JSON.stringify({
+					type: "content_block_start",
+					index: 2,
+					content_block: { type: "text", text: " continued" },
+				}),
+			},
+			{ event: "content_block_stop", data: JSON.stringify({ type: "content_block_stop", index: 2 }) },
+			{
+				event: "message_delta",
+				data: JSON.stringify({
+					type: "message_delta",
+					delta: { stop_reason: "end_turn" },
+					usage: { output_tokens: 2 },
+				}),
+			},
+			{ event: "message_stop", data: JSON.stringify({ type: "message_stop" }) },
 		]);
 
 		const result = await streamAnthropic(
@@ -239,8 +261,13 @@ describe("Anthropic raw SSE parsing", () => {
 			{ client: createFakeAnthropicClient(response) },
 		).result();
 
-		expect(result.stopReason).toBe("error");
-		expect(result.errorMessage).toContain("unsupported mid-output model fallback");
+		expect(result.stopReason).toBe("stop");
+		expect(result.model).toBe("claude-opus-5");
+		expect(result.responseModel).toBe("claude-opus-4-8");
+		expect(result.content.map((block) => (block.type === "text" ? block.text : block.type))).toEqual([
+			"partial",
+			" continued",
+		]);
 	});
 
 	it("forces streaming after an onPayload replacement", async () => {
@@ -540,6 +567,62 @@ describe("Anthropic raw SSE parsing", () => {
 		]);
 	});
 
+	it("does not double a content_block_start seed that the first delta repeats (LiteLLM Bedrock shape)", async () => {
+		// Captured from a self-hosted LiteLLM gateway (LiteLLM, Bedrock Converse → Anthropic):
+		// the first thinking chunk arrives both on content_block_start and as the
+		// first thinking_delta. phi used to store "Counting primCounting primes…".
+		const model = getModel("anthropic", "claude-opus-5");
+		const context = normalizeContext({
+			messages: [{ role: "user", content: "Count primes.", timestamp: Date.now() }],
+		});
+		const delta = (index: number, d: Record<string, string>) => ({
+			event: "content_block_delta",
+			data: JSON.stringify({ type: "content_block_delta", index, delta: d }),
+		});
+		const response = createSseResponse([
+			minimalAnthropicEvents[0],
+			{
+				event: "content_block_start",
+				data: JSON.stringify({
+					type: "content_block_start",
+					index: 0,
+					content_block: { type: "thinking", thinking: "Counting prim", signature: "" },
+				}),
+			},
+			delta(0, { type: "thinking_delta", thinking: "Counting prim" }),
+			delta(0, { type: "thinking_delta", thinking: "es below 100" }),
+			delta(0, { type: "signature_delta", signature: "sig" }),
+			{ event: "content_block_stop", data: JSON.stringify({ type: "content_block_stop", index: 0 }) },
+			{
+				event: "content_block_start",
+				data: JSON.stringify({
+					type: "content_block_start",
+					index: 1,
+					content_block: { type: "text", text: "There" },
+				}),
+			},
+			delta(1, { type: "text_delta", text: "There are 25." }),
+			{ event: "content_block_stop", data: JSON.stringify({ type: "content_block_stop", index: 1 }) },
+			...minimalAnthropicEvents.slice(-2),
+		]);
+
+		const stream = streamAnthropic(model, context, { client: createFakeAnthropicClient(response) });
+		const thinkingDeltas: string[] = [];
+		const ends: string[] = [];
+		for await (const event of stream) {
+			if (event.type === "thinking_delta") thinkingDeltas.push(event.delta);
+			if (event.type === "thinking_end" || event.type === "text_end") ends.push(event.content);
+		}
+		const result = await stream.result();
+
+		expect(thinkingDeltas).toEqual(["Counting prim", "es below 100"]);
+		expect(ends).toEqual(["Counting primes below 100", "There are 25."]);
+		expect(result.content).toEqual([
+			{ type: "thinking", thinking: "Counting primes below 100", thinkingSignature: "sig" },
+			{ type: "text", text: "There are 25." },
+		]);
+	});
+
 	it("preserves refusal stop details from message_delta", async () => {
 		const model = getModel("anthropic", "claude-fable-5");
 		const context = normalizeContext({
@@ -596,7 +679,11 @@ describe("Anthropic raw SSE parsing", () => {
 
 		expect(result.stopReason).toBe("error");
 		expect(result.rawStopReason).toBe("refusal");
-		expect(result.errorMessage).toBe(explanation);
+		// The refusal error names the category, carries the classifier's own
+		// explanation verbatim, and points at the way through (another model).
+		expect(result.errorMessage).toContain("category: cyber");
+		expect(result.errorMessage).toContain(explanation);
+		expect(result.errorMessage).toContain("different model");
 	});
 
 	it("preserves sensitive stop reasons with a descriptive error message", async () => {
@@ -646,7 +733,8 @@ describe("Anthropic raw SSE parsing", () => {
 
 		expect(result.stopReason).toBe("error");
 		expect(result.rawStopReason).toBe("sensitive");
-		expect(result.errorMessage).toBe("Provider stopped with: sensitive");
+		// Attributed to the requested model; the provider's own wording is kept intact after it.
+		expect(result.errorMessage).toBe(`anthropic/${model.id}: Provider stopped with: sensitive`);
 	});
 
 	it("treats message_delta without usage as a no-op for usage accumulation", async () => {

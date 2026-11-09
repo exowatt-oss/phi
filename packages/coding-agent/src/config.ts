@@ -342,7 +342,7 @@ export function getSelfUpdateUnavailableInstruction(
 	const method = detectInstallMethod();
 	const target = normalizeSelfUpdatePackageTarget(updatePackageTarget);
 	if (method === "bun-binary") {
-		return `Download from: https://github.com/earendil-works/pi/releases/latest`;
+		return `Run ${APP_NAME} update self with a configured PHI_UPDATE_BASE_URL, or update this binary from its distributor.`;
 	}
 	const command = getSelfUpdateCommandForMethod(method, packageName, target, npmCommand);
 	if (command) {
@@ -585,6 +585,31 @@ export const VERSION: string = pkg.version || "0.0.0";
 export const ENV_AGENT_DIR = `${APP_NAME.toUpperCase()}_CODING_AGENT_DIR`;
 export const ENV_SESSION_DIR = `${APP_NAME.toUpperCase()}_CODING_AGENT_SESSION_DIR`;
 
+// The display name is "phi", so the derived names above are PHI_*.
+// Forca (managed extensions, per-pane overlays, session scanning) and existing
+// docs/wrappers set the upstream PI_* names, so those keep working as a fallback.
+const COMPAT_ENV_AGENT_DIR = "PI_CODING_AGENT_DIR";
+const COMPAT_ENV_SESSION_DIR = "PI_CODING_AGENT_SESSION_DIR";
+
+/** Read an env var, falling back to its upstream PI_* spelling. Primary wins. */
+function readBrandedEnv(primary: string, compat: string): string | undefined {
+	const value = process.env[primary];
+	if (value) {
+		return value;
+	}
+	return primary === compat ? undefined : process.env[compat];
+}
+
+/** Agent-dir override from the environment (PHI_CODING_AGENT_DIR, then PI_*). */
+export function getEnvAgentDir(): string | undefined {
+	return readBrandedEnv(ENV_AGENT_DIR, COMPAT_ENV_AGENT_DIR);
+}
+
+/** Session-dir override from the environment (PHI_CODING_AGENT_SESSION_DIR, then PI_*). */
+export function getEnvSessionDir(): string | undefined {
+	return readBrandedEnv(ENV_SESSION_DIR, COMPAT_ENV_SESSION_DIR);
+}
+
 export function expandTildePath(path: string): string {
 	return normalizePath(path);
 }
@@ -598,12 +623,39 @@ export function getShareViewerUrl(gistId: string): string {
 }
 
 // =============================================================================
+// Session Interactivity
+// =============================================================================
+
+/**
+ * Whether this process can put a prompt in front of a human.
+ *
+ * True only for the interactive TUI. `-p`, `--mode json` and rpc runs have
+ * nobody to answer, so anything that would block on a person — most concretely
+ * an OAuth login that has to complete in a browser — must degrade to a fast,
+ * explanatory failure rather than opening a window nobody sees and holding a
+ * socket until it times out.
+ *
+ * TTY detection is not a substitute: `phi -p` from a terminal has a TTY on both
+ * ends and still cannot wait for a login.
+ */
+let sessionInteractive = false;
+
+/** Set once by `main.ts` from the resolved app mode, before any session starts. */
+export function setSessionInteractive(interactive: boolean): void {
+	sessionInteractive = interactive;
+}
+
+export function isSessionInteractive(): boolean {
+	return sessionInteractive;
+}
+
+// =============================================================================
 // User Config Paths (~/.pi/agent/*)
 // =============================================================================
 
 /** Get the agent config directory (e.g., ~/.pi/agent/) */
 export function getAgentDir(): string {
-	const envDir = process.env[ENV_AGENT_DIR];
+	const envDir = getEnvAgentDir();
 	if (envDir) {
 		return expandTildePath(envDir);
 	}

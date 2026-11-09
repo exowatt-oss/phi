@@ -1,5 +1,5 @@
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
-import type { Model } from "@earendil-works/pi-ai";
+import { MAX_STREAM_IDLE_TIMEOUT_MS, type Model, type ServiceTier } from "@earendil-works/pi-ai";
 import type { ScrollViewScrollbar, TerminalCapabilities, WheelScrollLines } from "@earendil-works/pi-tui";
 import { randomUUID } from "crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
@@ -8,8 +8,9 @@ import lockfile from "proper-lockfile";
 import { CONFIG_DIR_NAME, getAgentDir } from "../config.ts";
 import { normalizePath, resolvePath } from "../utils/paths.ts";
 import { stripBom } from "../utils/text.ts";
+import { contextAwareCompactionEnabled, softCeilingTokensFromEnv } from "./context-aware-compaction.ts";
 import { DEFAULT_HTTP_IDLE_TIMEOUT_MS, parseHttpIdleTimeoutMs } from "./http-dispatcher.ts";
-import { SETTINGS_DEFAULTS } from "./settings-defaults.ts";
+import { PHI_SETTINGS_DEFAULTS, SETTINGS_DEFAULTS } from "./settings-defaults.ts";
 import type {
 	CacheWarmingMode,
 	CompactionModelOverride,
@@ -19,44 +20,52 @@ import type {
 	PackageSource,
 	QuietStartup,
 	SessionShareDestination,
+	SessionStateSettings,
 	Settings,
+	SubagentsSettings,
 	ThinkingBudgetsSettings,
+	ToolDisplayMode,
 	TransportSetting,
 	TuiMode,
 	WarningSettings,
 } from "./settings-schema.ts";
 
 export type {
+	AgentMailSettings,
 	BranchSummarySettings,
+	BtwSettings,
 	CacheWarmingMode,
 	CodemodeMode,
 	CodemodeSettings,
 	CompactionModelOverride,
 	CompactionSettings,
 	DefaultProjectTrust,
+	ErrorFallbackSettings,
 	FullscreenExitOutput,
 	ImageSettings,
+	LoopSettings,
 	MarkdownSettings,
 	MermaidRenderingMode,
 	PackageSource,
 	ProviderRetrySettings,
 	QuietStartup,
+	RefusalFallbackSettings,
 	RetrySettings,
 	SessionShareDestination,
+	SessionStateSettings,
 	Settings,
+	SubagentsSettings,
 	TerminalSettings,
 	ThinkingBudgetsSettings,
+	ToolDisplayMode,
 	TransportSetting,
 	TuiMode,
 	WarningSettings,
 } from "./settings-schema.ts";
+/** Legacy spelling from phi 0.83 (early port of fullscreen mode); `tuiMode` is the upstream name. */
+export type UiMode = TuiMode;
 /** Cache-warming profile. "idle" also warms between agent runs. */
 export const CACHE_WARMING_MODES = ["off", "streaming", "idle"] as const satisfies readonly CacheWarmingMode[];
-
-const DEFAULT_COMPACTION_TOKEN_SETTINGS: Required<CompactionModelOverride> = {
-	reserveTokens: SETTINGS_DEFAULTS.compaction.reserveTokens,
-	keepRecentTokens: SETTINGS_DEFAULTS.compaction.keepRecentTokens,
-};
 
 function isMergeableObject(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -146,9 +155,12 @@ function deepMergeSettings(base: Settings, overrides: Settings): Settings {
 	return defaultTools === undefined ? merged : { ...merged, defaultTools };
 }
 
-function parseTimeoutSetting(value: unknown, settingName: string): number | undefined {
+function parseTimeoutSetting(value: unknown, settingName: string, max = Number.MAX_SAFE_INTEGER): number | undefined {
 	const timeoutMs = parseHttpIdleTimeoutMs(value);
 	if (timeoutMs !== undefined) {
+		if (timeoutMs > max) {
+			throw new Error(`Invalid ${settingName} setting: ${timeoutMs} exceeds maximum ${max}`);
+		}
 		return timeoutMs;
 	}
 	if (value !== undefined) {
@@ -275,6 +287,8 @@ export class SettingsManager {
 	private projectSettings: Settings;
 	private settings: Settings;
 	private projectTrusted: boolean;
+	/** Set by RPC mode: a host UI owns model selection, so nothing may switch models behind its back. */
+	private hostManagedModelSelection = false;
 	private modifiedFields = new Set<keyof Settings>(); // Track global fields modified during session
 	private modifiedNestedFields = new Map<keyof Settings, Set<string>>(); // Track global nested field modifications
 	private modifiedProjectFields = new Set<keyof Settings>(); // Track project fields modified during session
@@ -767,6 +781,22 @@ export class SettingsManager {
 		this.save();
 	}
 
+	getServiceTier(): ServiceTier {
+		const tier = this.settings.serviceTier;
+		return tier === "fast" || tier === "flex" || tier === "ultrafast" ? tier : PHI_SETTINGS_DEFAULTS.serviceTier;
+	}
+
+	getServiceTierForModel(modelId: string | undefined): ServiceTier {
+		if (modelId?.endsWith("-fast")) return "fast";
+		return this.getServiceTier();
+	}
+
+	setServiceTier(tier: ServiceTier): void {
+		this.globalSettings.serviceTier = tier;
+		this.markModified("serviceTier");
+		this.save();
+	}
+
 	getModelThinkingLevel(provider: string, modelId: string): ThinkingLevel | undefined {
 		return this.settings.modelThinkingLevels?.[`${provider}/${modelId}`];
 	}
@@ -833,7 +863,7 @@ export class SettingsManager {
 	private getCompactionTokenSetting(
 		field: keyof CompactionModelOverride,
 		model?: Pick<Model<string>, "provider" | "id">,
-	): number {
+	): number | undefined {
 		const compaction = this.settings.compaction;
 		const ordinary = compaction?.[field];
 		if (ordinary !== undefined && (typeof ordinary !== "number" || !Number.isSafeInteger(ordinary) || ordinary < 0)) {
@@ -855,27 +885,52 @@ export class SettingsManager {
 				`Invalid compaction.modelOverrides["${modelKey}"].${field} setting: ${String(override)}. Expected a non-negative safe integer.`,
 			);
 		}
-		return override ?? ordinary ?? DEFAULT_COMPACTION_TOKEN_SETTINGS[field];
+		return override ?? ordinary;
 	}
 
 	getCompactionReserveTokens(model?: Pick<Model<string>, "provider" | "id">): number {
-		return this.getCompactionTokenSetting("reserveTokens", model);
+		return this.getCompactionTokenSetting("reserveTokens", model) ?? SETTINGS_DEFAULTS.compaction.reserveTokens;
 	}
 
-	getCompactionKeepRecentTokens(model?: Pick<Model<string>, "provider" | "id">): number {
+	/**
+	 * Explicit keep-recent override, per model then global; undefined = adaptive
+	 * (10% of the effective window, min 20k).
+	 */
+	getCompactionKeepRecentTokens(model?: Pick<Model<string>, "provider" | "id">): number | undefined {
 		return this.getCompactionTokenSetting("keepRecentTokens", model);
 	}
 
-	/** Resolve each token setting through model override, ordinary setting, then built-in default. */
+	/** Soft ceiling for compaction thresholds; 0 disables. Settings, then PI_COMPACTION_SOFT_CEILING_TOKENS, then 300k. */
+	getCompactionSoftCeilingTokens(): number {
+		return (
+			this.settings.compaction?.softCeilingTokens ??
+			softCeilingTokensFromEnv() ??
+			PHI_SETTINGS_DEFAULTS.compaction.softCeilingTokens
+		);
+	}
+
+	/** Model override for summarization requests, as "provider/modelId[:thinkingLevel]". */
+	getCompactionModel(sessionModelProvider?: string): string | undefined {
+		const configuredModel = this.settings.compaction?.model;
+		if (configuredModel !== undefined) return configuredModel;
+		if (!contextAwareCompactionEnabled()) return undefined;
+		return sessionModelProvider === "anthropic" ? "anthropic/claude-sonnet-5:low" : undefined;
+	}
+
+	/** Resolve each token setting through model override, ordinary setting, then built-in default (adaptive keep-recent). */
 	getCompactionSettings(model?: Pick<Model<string>, "provider" | "id">): {
 		enabled: boolean;
 		reserveTokens: number;
-		keepRecentTokens: number;
+		keepRecentTokens?: number;
+		softCeilingTokens: number;
+		model?: string;
 	} {
 		return {
 			enabled: this.getCompactionEnabled(),
 			reserveTokens: this.getCompactionReserveTokens(model),
 			keepRecentTokens: this.getCompactionKeepRecentTokens(model),
+			softCeilingTokens: this.getCompactionSoftCeilingTokens(),
+			model: this.getCompactionModel(),
 		};
 	}
 
@@ -910,6 +965,111 @@ export class SettingsManager {
 			baseDelayMs: this.settings.retry?.baseDelayMs ?? SETTINGS_DEFAULTS.retry.baseDelayMs,
 			maxAgentDelayMs: this.settings.retry?.maxAgentDelayMs ?? SETTINGS_DEFAULTS.retry.maxAgentDelayMs,
 		};
+	}
+
+	/** Model-stream raw-data inactivity timeout in milliseconds. Default 420s; 0 disables. */
+	getStreamIdleTimeoutMs(): number {
+		return (
+			parseTimeoutSetting(this.settings.streamIdleTimeoutMs, "streamIdleTimeoutMs", MAX_STREAM_IDLE_TIMEOUT_MS) ??
+			PHI_SETTINGS_DEFAULTS.streamIdleTimeoutMs
+		);
+	}
+
+	/** Raw subagent watchdog/budget settings (minutes); resolution happens in the subagents extension. */
+	getSubagentsSettings(): SubagentsSettings {
+		return this.settings.subagents ?? {};
+	}
+
+	getAgentMailEnabled(): boolean {
+		return this.settings.agentMail?.enabled !== false;
+	}
+
+	/** Resolved workspace-state classifier settings. */
+	getSessionStateSettings(): SessionStateSettings {
+		return { ...PHI_SETTINGS_DEFAULTS.sessionState, ...this.settings.sessionState };
+	}
+
+	/**
+	 * Resolved refusal-escalation config. `PI_REFUSAL_FALLBACK_CHAIN` overrides the
+	 * settings chain for one run (`"off"`/`"none"` disables escalation entirely),
+	 * which is how a session opts out without editing settings.json.
+	 */
+	getRefusalFallbackSettings(): { enabled: boolean; chain: string[]; sticky: boolean } {
+		const configured = this.settings.refusalFallback;
+		const envChain = process.env.PI_REFUSAL_FALLBACK_CHAIN?.trim();
+		if (envChain === "off" || envChain === "none") {
+			return {
+				enabled: false,
+				chain: [],
+				sticky: configured?.sticky ?? PHI_SETTINGS_DEFAULTS.refusalFallback.sticky,
+			};
+		}
+		const chain =
+			envChain && envChain.length > 0
+				? envChain
+						.split(",")
+						.map((ref) => ref.trim())
+						.filter((ref) => ref.length > 0)
+				: (configured?.chain ?? []);
+		return {
+			enabled: configured?.enabled ?? PHI_SETTINGS_DEFAULTS.refusalFallback.enabled,
+			chain,
+			sticky: configured?.sticky ?? PHI_SETTINGS_DEFAULTS.refusalFallback.sticky,
+		};
+	}
+
+	/**
+	 * Resolved provider-outage rerouting config. `PI_ERROR_FALLBACK_CHAIN`
+	 * overrides the settings chain for one run (`"off"`/`"none"` disables
+	 * rerouting entirely), mirroring `PI_REFUSAL_FALLBACK_CHAIN`. An unset chain
+	 * falls back to `PHI_SETTINGS_DEFAULTS.errorFallback.chain` (settings-defaults.ts).
+	 */
+	getErrorFallbackSettings(): { enabled: boolean; chain: string[]; sticky: boolean } {
+		const configured = this.settings.errorFallback;
+		const envChain = process.env.PI_ERROR_FALLBACK_CHAIN?.trim();
+		if (envChain === "off" || envChain === "none") {
+			return { enabled: false, chain: [], sticky: configured?.sticky ?? PHI_SETTINGS_DEFAULTS.errorFallback.sticky };
+		}
+		const envRefs =
+			envChain && envChain.length > 0
+				? envChain
+						.split(",")
+						.map((ref) => ref.trim())
+						.filter((ref) => ref.length > 0)
+				: [];
+		const chain =
+			envRefs.length > 0 ? envRefs : (configured?.chain ?? [...PHI_SETTINGS_DEFAULTS.errorFallback.chain]);
+		// Setting a chain in the environment is as explicit as writing one in
+		// settings.json: the same variable spells "off"/"none" to disable, so naming
+		// rungs means asking for them. Without this, an RPC host that exported
+		// PI_ERROR_FALLBACK_CHAIN got the host-managed default (off) and its chain was
+		// read, parsed, and then ignored.
+		const enabled =
+			configured?.enabled ??
+			(envRefs.length > 0 || ((configured?.chain?.length ?? 0) > 0 && !this.hostManagedModelSelection));
+		return {
+			enabled,
+			chain,
+			sticky: configured?.sticky ?? PHI_SETTINGS_DEFAULTS.errorFallback.sticky,
+		};
+	}
+
+	/**
+	 * Declare that a host UI owns model selection for this process (RPC mode).
+	 *
+	 * A silent reroute is a defensible default when the human watching the
+	 * transcript is the one who picked the model: they see the reroute line and
+	 * can switch back. A host driving phi over RPC has its own model picker and
+	 * its own idea of the selected model, and nothing in the protocol made it
+	 * re-read that state — so a reroute left the host labelling a turn with one
+	 * model that phi served from another, including the thinking level the
+	 * host's picker still believed applied.
+	 *
+	 * `errorFallback` therefore stays off there unless the settings file turns it
+	 * on explicitly; an explicit `errorFallback.enabled` always wins.
+	 */
+	setHostManagedModelSelection(hostManaged: boolean): void {
+		this.hostManagedModelSelection = hostManaged;
 	}
 
 	getHttpIdleTimeoutMs(): number {
@@ -1045,7 +1205,18 @@ export class SettingsManager {
 		this.save();
 	}
 
+	getAutoUpdate(): boolean {
+		return this.settings.autoUpdate ?? SETTINGS_DEFAULTS.autoUpdate;
+	}
+
+	setAutoUpdate(enabled: boolean): void {
+		this.globalSettings.autoUpdate = enabled;
+		this.markModified("autoUpdate");
+		this.save();
+	}
+
 	getEnableInstallTelemetry(): boolean {
+		// Install telemetry is disabled by default; PI_TELEMETRY=1 opts in.
 		return this.settings.enableInstallTelemetry ?? SETTINGS_DEFAULTS.enableInstallTelemetry;
 	}
 
@@ -1254,7 +1425,9 @@ export class SettingsManager {
 	}
 
 	getTuiMode(): TuiMode {
-		return this.settings.tuiMode === "regular" ? "regular" : SETTINGS_DEFAULTS.tuiMode;
+		// `uiMode` is the phi ≤ 0.83 spelling of this key (early port of fullscreen mode).
+		const mode = this.settings.tuiMode ?? this.settings.uiMode;
+		return mode === "regular" ? "regular" : SETTINGS_DEFAULTS.tuiMode;
 	}
 
 	setTuiMode(mode: TuiMode): void {
@@ -1399,6 +1572,38 @@ export class SettingsManager {
 		return this.settings.outputPad === 0 ? 0 : SETTINGS_DEFAULTS.outputPad;
 	}
 
+	/**
+	 * Lines of output a collapsed tool result shows.
+	 *
+	 * Uniform across tools on purpose: before this existed every tool picked its
+	 * own number (read 10, grep 15, ls/find 20, bash 5) and anything without a
+	 * renderer — every MCP and extension tool — printed its entire output, which
+	 * is how one tool call buries a conversation. `ctrl+o` still expands.
+	 */
+	getToolOutputLines(): number {
+		const configured = this.settings.toolOutputLines;
+		if (configured === undefined || !Number.isFinite(configured)) return PHI_SETTINGS_DEFAULTS.toolOutputLines;
+		return Math.max(0, Math.min(200, Math.floor(configured)));
+	}
+
+	setToolOutputLines(lines: number): void {
+		this.globalSettings.toolOutputLines = Math.max(0, Math.min(200, Math.floor(lines)));
+		this.markModified("toolOutputLines");
+		this.save();
+	}
+
+	getToolDisplay(): ToolDisplayMode {
+		const configured = this.settings.toolDisplay;
+		if (configured === "compact" || configured === "full") return configured;
+		return PHI_SETTINGS_DEFAULTS.toolDisplay;
+	}
+
+	setToolDisplay(mode: ToolDisplayMode): void {
+		this.globalSettings.toolDisplay = mode;
+		this.markModified("toolDisplay");
+		this.save();
+	}
+
 	setOutputPad(padding: 0 | 1): void {
 		this.globalSettings.outputPad = padding;
 		this.markModified("outputPad");
@@ -1438,6 +1643,143 @@ export class SettingsManager {
 	setWarnings(warnings: WarningSettings): void {
 		this.globalSettings.warnings = { ...warnings };
 		this.markModified("warnings");
+		this.save();
+	}
+
+	getLoopMaxIterations(): number {
+		const configured = this.settings.loop?.maxIterations;
+		if (configured === undefined || !Number.isFinite(configured)) return PHI_SETTINGS_DEFAULTS.loop.maxIterations;
+		return Math.max(1, Math.min(100, Math.floor(configured)));
+	}
+
+	setLoopMaxIterations(maxIterations: number): void {
+		const value = Number.isFinite(maxIterations)
+			? Math.max(1, Math.min(100, Math.floor(maxIterations)))
+			: PHI_SETTINGS_DEFAULTS.loop.maxIterations;
+		this.globalSettings.loop = { ...this.globalSettings.loop, maxIterations: value };
+		this.markModified("loop");
+		this.save();
+	}
+
+	getLoopMaxWallTimeMs(): number {
+		const configured = this.settings.loop?.maxWallTimeMs;
+		if (configured === undefined || !Number.isFinite(configured)) return PHI_SETTINGS_DEFAULTS.loop.maxWallTimeMs;
+		return Math.max(1_000, Math.min(86_400_000, Math.floor(configured)));
+	}
+
+	setLoopMaxWallTimeMs(maxWallTimeMs: number): void {
+		const value = Number.isFinite(maxWallTimeMs)
+			? Math.max(1_000, Math.min(86_400_000, Math.floor(maxWallTimeMs)))
+			: PHI_SETTINGS_DEFAULTS.loop.maxWallTimeMs;
+		this.globalSettings.loop = { ...this.globalSettings.loop, maxWallTimeMs: value };
+		this.markModified("loop");
+		this.save();
+	}
+
+	getLoopMaxCostUsd(): number | undefined {
+		const configured = this.settings.loop?.maxCostUsd;
+		if (configured === undefined || !Number.isFinite(configured) || configured <= 0) return undefined;
+		return configured;
+	}
+
+	setLoopMaxCostUsd(maxCostUsd: number): void {
+		const value = Number.isFinite(maxCostUsd) && maxCostUsd > 0 ? maxCostUsd : undefined;
+		this.globalSettings.loop = { ...this.globalSettings.loop, maxCostUsd: value };
+		this.markModified("loop");
+		this.save();
+	}
+
+	getLoopCheckTimeoutMs(): number {
+		const configured = this.settings.loop?.checkTimeoutMs;
+		if (configured === undefined || !Number.isFinite(configured)) return PHI_SETTINGS_DEFAULTS.loop.checkTimeoutMs;
+		return Math.max(1_000, Math.min(86_400_000, Math.floor(configured)));
+	}
+
+	setLoopCheckTimeoutMs(checkTimeoutMs: number): void {
+		const value = Number.isFinite(checkTimeoutMs)
+			? Math.max(1_000, Math.min(86_400_000, Math.floor(checkTimeoutMs)))
+			: PHI_SETTINGS_DEFAULTS.loop.checkTimeoutMs;
+		this.globalSettings.loop = { ...this.globalSettings.loop, checkTimeoutMs: value };
+		this.markModified("loop");
+		this.save();
+	}
+
+	getLoopEvaluatorModel(): string | undefined {
+		const configured = this.settings.loop?.evaluatorModel;
+		return typeof configured === "string" ? configured : undefined;
+	}
+
+	setLoopEvaluatorModel(evaluatorModel: string | undefined): void {
+		this.globalSettings.loop = { ...this.globalSettings.loop, evaluatorModel };
+		this.markModified("loop");
+		this.save();
+	}
+
+	getLoopEvaluatorConfidence(): number {
+		const configured = this.settings.loop?.evaluatorConfidence;
+		if (configured === undefined || !Number.isFinite(configured))
+			return PHI_SETTINGS_DEFAULTS.loop.evaluatorConfidence;
+		return Math.max(0.5, Math.min(1, configured));
+	}
+
+	setLoopEvaluatorConfidence(evaluatorConfidence: number): void {
+		const value = Number.isFinite(evaluatorConfidence)
+			? Math.max(0.5, Math.min(1, evaluatorConfidence))
+			: PHI_SETTINGS_DEFAULTS.loop.evaluatorConfidence;
+		this.globalSettings.loop = { ...this.globalSettings.loop, evaluatorConfidence: value };
+		this.markModified("loop");
+		this.save();
+	}
+
+	getLoopMaxCheckOutputBytes(): number {
+		const configured = this.settings.loop?.maxCheckOutputBytes;
+		if (configured === undefined || !Number.isFinite(configured))
+			return PHI_SETTINGS_DEFAULTS.loop.maxCheckOutputBytes;
+		return Math.max(1_024, Math.min(1_048_576, Math.floor(configured)));
+	}
+
+	setLoopMaxCheckOutputBytes(maxCheckOutputBytes: number): void {
+		const value = Number.isFinite(maxCheckOutputBytes)
+			? Math.max(1_024, Math.min(1_048_576, Math.floor(maxCheckOutputBytes)))
+			: PHI_SETTINGS_DEFAULTS.loop.maxCheckOutputBytes;
+		this.globalSettings.loop = { ...this.globalSettings.loop, maxCheckOutputBytes: value };
+		this.markModified("loop");
+		this.save();
+	}
+
+	/** Model override for /btw side queries. Undefined = use the current main-session model. */
+	getBtwModel(): string | undefined {
+		return this.settings.btw?.model;
+	}
+
+	setBtwModel(model: string | undefined): void {
+		this.globalSettings.btw = { ...this.globalSettings.btw, model };
+		this.markModified("btw");
+		this.save();
+	}
+
+	/** Whether completed /btw answers are persisted to the TUI transcript. Default: true. */
+	getBtwPersist(): boolean {
+		return this.settings.btw?.persist ?? PHI_SETTINGS_DEFAULTS.btw.persist;
+	}
+
+	setBtwPersist(persist: boolean): void {
+		this.globalSettings.btw = { ...this.globalSettings.btw, persist };
+		this.markModified("btw");
+		this.save();
+	}
+
+	/** Maximum Q&A pairs kept in the /btw in-memory history. Default: 20. Clamped to [1, 100]. */
+	getBtwMaxHistory(): number {
+		const configured = this.settings.btw?.maxHistory;
+		if (configured === undefined || !Number.isFinite(configured)) return PHI_SETTINGS_DEFAULTS.btw.maxHistory;
+		return Math.max(1, Math.min(100, Math.floor(configured)));
+	}
+
+	setBtwMaxHistory(maxHistory: number): void {
+		const clamped = Math.max(1, Math.min(100, Math.floor(maxHistory)));
+		this.globalSettings.btw = { ...this.globalSettings.btw, maxHistory: clamped };
+		this.markModified("btw");
 		this.save();
 	}
 }

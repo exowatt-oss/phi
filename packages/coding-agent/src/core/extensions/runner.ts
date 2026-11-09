@@ -13,6 +13,8 @@ import {
 import type { KeyId } from "@earendil-works/pi-tui";
 import { type Theme, theme } from "../../modes/interactive/theme/theme.ts";
 import type { CacheWarmingAction } from "../cache-warmer.ts";
+import type { CompactionSettings, CompactionSettingsWithLines } from "../compaction/index.ts";
+import { compactionLines } from "../compaction/index.ts";
 import type { ResourceDiagnostic } from "../diagnostics.ts";
 import type { KeybindingsConfig } from "../keybindings.ts";
 import type { ModelRegistry } from "../model-registry.ts";
@@ -38,6 +40,7 @@ import type {
 	CacheWarmingDecisionEvent,
 	CacheWarmingDecisionEventResult,
 	CompactOptions,
+	ContextBreakdown,
 	ContextEvent,
 	ContextEventResult,
 	ContextUsage,
@@ -76,12 +79,15 @@ import type {
 	ResolvedCommand,
 	ResourcesDiscoverEvent,
 	ResourcesDiscoverResult,
+	SessionBeforeAutoCompactResult,
 	SessionBeforeCompactResult,
 	SessionBeforeForkResult,
 	SessionBeforeSwitchResult,
 	SessionBeforeTreeResult,
 	SessionBoundaryDraft,
 	SessionShutdownEvent,
+	SideQuestionRequest,
+	SideQuestionResult,
 	ToolCallEvent,
 	ToolCallEventResult,
 	ToolRenderers,
@@ -201,12 +207,20 @@ type RunnerEmitEvent = Exclude<
 
 type SessionBeforeEvent = Extract<
 	RunnerEmitEvent,
-	{ type: "session_before_switch" | "session_before_fork" | "session_before_compact" | "session_before_tree" }
+	{
+		type:
+			| "session_before_switch"
+			| "session_before_fork"
+			| "session_before_auto_compact"
+			| "session_before_compact"
+			| "session_before_tree";
+	}
 >;
 
 type SessionBeforeEventResult =
 	| SessionBeforeSwitchResult
 	| SessionBeforeForkResult
+	| SessionBeforeAutoCompactResult
 	| SessionBeforeCompactResult
 	| SessionBeforeTreeResult;
 
@@ -214,11 +228,13 @@ type RunnerEmitResult<TEvent extends RunnerEmitEvent> = TEvent extends { type: "
 	? SessionBeforeSwitchResult | undefined
 	: TEvent extends { type: "session_before_fork" }
 		? SessionBeforeForkResult | undefined
-		: TEvent extends { type: "session_before_compact" }
-			? SessionBeforeCompactResult | undefined
-			: TEvent extends { type: "session_before_tree" }
-				? SessionBeforeTreeResult | undefined
-				: undefined;
+		: TEvent extends { type: "session_before_auto_compact" }
+			? SessionBeforeAutoCompactResult | undefined
+			: TEvent extends { type: "session_before_compact" }
+				? SessionBeforeCompactResult | undefined
+				: TEvent extends { type: "session_before_tree" }
+					? SessionBeforeTreeResult | undefined
+					: undefined;
 
 export type ExtensionErrorListener = (error: ExtensionError) => void;
 
@@ -379,8 +395,14 @@ export class ExtensionRunner {
 	private abortFn: () => void = () => {};
 	private hasPendingMessagesFn: () => boolean = () => false;
 	private getContextUsageFn: () => ContextUsage | undefined = () => undefined;
+	private getCompactionSettingsFn!: () => CompactionSettings;
+	private newContextFn: NonNullable<ExtensionContextActions["newContext"]> = () => {};
 	private compactFn: (options?: CompactOptions) => void = () => {};
 	private getSystemPromptFn: () => string = () => "";
+	private getContextBreakdownFn: () => ContextBreakdown | undefined = () => undefined;
+	private sideQuestionFn: (request: SideQuestionRequest) => Promise<SideQuestionResult> = async () => {
+		throw new Error("Side questions are not available");
+	};
 	private getSystemPromptOptionsFn: () => BuildSystemPromptOptions = () =>
 		normalizeBuildSystemPromptOptions({ cwd: this.cwd });
 	private executeToolFn: ExtensionContextActions["executeTool"];
@@ -398,6 +420,8 @@ export class ExtensionRunner {
 	private staleMessage: string | undefined;
 	private uiPromptDepth = 0;
 	private activeUIPrompt: { kind: UIPromptKind; title?: string } | undefined;
+	/** Built-in entry renderers registered before extension loading. Extension renderers override these. */
+	private builtinEntryRenderers: Map<string, EntryRenderer> = new Map();
 
 	constructor(
 		extensions: Extension[],
@@ -453,8 +477,16 @@ export class ExtensionRunner {
 		this.hasPendingMessagesFn = contextActions.hasPendingMessages;
 		this.shutdownHandler = contextActions.shutdown;
 		this.getContextUsageFn = contextActions.getContextUsage;
+		this.getCompactionSettingsFn = contextActions.getCompactionSettings;
+		this.newContextFn = contextActions.newContext ?? (() => {});
 		this.compactFn = contextActions.compact;
 		this.getSystemPromptFn = contextActions.getSystemPrompt;
+		this.getContextBreakdownFn = contextActions.getContextBreakdown ?? (() => undefined);
+		this.sideQuestionFn =
+			contextActions.sideQuestion ??
+			(async () => {
+				throw new Error("Side questions are not available");
+			});
 		this.getSystemPromptOptionsFn =
 			contextActions.getSystemPromptOptions ?? (() => normalizeBuildSystemPromptOptions({ cwd: this.cwd }));
 		this.executeToolFn = contextActions.executeTool;
@@ -577,6 +609,10 @@ export class ExtensionRunner {
 	private wrapUIPromptContext(ui: ExtensionUIContext): ExtensionUIContext {
 		return {
 			...ui,
+			// Spreading would snapshot the host's `theme` getter; keep it live.
+			get theme() {
+				return ui.theme;
+			},
 			select: (title, options, opts) => this.withUIPrompt("select", title, () => ui.select(title, options, opts)),
 			confirm: (title, message, opts) => this.withUIPrompt("confirm", title, () => ui.confirm(title, message, opts)),
 			input: (title, placeholder, opts) =>
@@ -615,9 +651,10 @@ export class ExtensionRunner {
 		}
 	}
 
+	/** Notification only: handlers run on a microtask and never delay showing or closing the prompt. */
 	private emitUIPromptEvent(event: Extract<RunnerEmitEvent, { type: "ui_prompt_start" | "ui_prompt_end" }>): void {
 		queueMicrotask(() => {
-			void this.emit(event);
+			this.emit(event).catch(() => {});
 		});
 	}
 
@@ -793,6 +830,14 @@ export class ExtensionRunner {
 		return this.extensions.flatMap((ext) => (ext.markdownTransformer ? [ext.markdownTransformer] : []));
 	}
 
+	/**
+	 * Register a built-in entry renderer for a custom type.
+	 * Extension renderers override built-ins if they register the same type.
+	 */
+	registerBuiltinEntryRenderer(customType: string, renderer: EntryRenderer): void {
+		this.builtinEntryRenderers.set(customType, renderer);
+	}
+
 	/** Renderers of calls to `toolName`: extension resolvers in load order, then `base`. */
 	resolveToolRenderers(toolName: string, base: () => ToolRenderers | undefined): ToolRenderers | undefined {
 		const resolvers = this.extensions.flatMap((ext) => ext.toolRenderers ?? []);
@@ -808,7 +853,7 @@ export class ExtensionRunner {
 				return renderer;
 			}
 		}
-		return undefined;
+		return this.builtinEntryRenderers.get(customType);
 	}
 
 	private resolveRegisteredCommands(): ResolvedCommand[] {
@@ -950,6 +995,16 @@ export class ExtensionRunner {
 				runner.assertActive();
 				return runner.getContextUsageFn();
 			},
+			getCompactionSettings: (): CompactionSettingsWithLines => {
+				runner.assertActive();
+				const settings = runner.getCompactionSettingsFn();
+				const model = runner.getModel();
+				return model ? { ...settings, ...compactionLines(model.contextWindow, settings, model) } : settings;
+			},
+			newContext: (options) => {
+				runner.assertActive();
+				runner.newContextFn(options);
+			},
 			compact: (options) => {
 				runner.assertActive();
 				runner.compactFn(options);
@@ -957,6 +1012,14 @@ export class ExtensionRunner {
 			getSystemPrompt: () => {
 				runner.assertActive();
 				return runner.getSystemPromptFn();
+			},
+			getContextBreakdown: () => {
+				runner.assertActive();
+				return runner.getContextBreakdownFn();
+			},
+			sideQuestion: (request) => {
+				runner.assertActive();
+				return runner.sideQuestionFn(request);
 			},
 		};
 	}
@@ -1088,6 +1151,7 @@ export class ExtensionRunner {
 		return (
 			event.type === "session_before_switch" ||
 			event.type === "session_before_fork" ||
+			event.type === "session_before_auto_compact" ||
 			event.type === "session_before_compact" ||
 			event.type === "session_before_tree"
 		);
@@ -1104,7 +1168,7 @@ export class ExtensionRunner {
 
 					if (this.isSessionBeforeEvent(event) && handlerResult) {
 						result = handlerResult as SessionBeforeEventResult;
-						if (result.cancel) {
+						if ("cancel" in result && result.cancel) {
 							return result as RunnerEmitResult<TEvent>;
 						}
 					}

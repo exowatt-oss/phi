@@ -61,10 +61,19 @@ class RecordingTerminal extends VirtualTerminal {
 	}
 }
 
+class CountingTuiAltScreen extends TuiAltScreen {
+	renderCount = 0;
+
+	protected override doRender(): void {
+		this.renderCount += 1;
+		super.doRender();
+	}
+}
+
 describe("TuiAltScreen", () => {
 	it("renders a terminal-height viewport and preserves manual scroll position", async () => {
 		const terminal = new VirtualTerminal(20, 4);
-		const tui = new TuiAltScreen(terminal);
+		const tui = new TuiAltScreen(terminal, undefined, undefined, { jumpToBottom: { enabled: false } });
 		const text = new Text(Array.from({ length: 10 }, (_, index) => `line ${index + 1}`).join("\n"), 0, 0);
 		tui.addChild(text);
 		tui.start();
@@ -230,7 +239,7 @@ describe("TuiAltScreen", () => {
 
 	it("keeps an explicit dock fixed while the transcript scrolls", async () => {
 		const terminal = new VirtualTerminal(20, 6);
-		const tui = new TuiAltScreen(terminal);
+		const tui = new TuiAltScreen(terminal, undefined, undefined, { jumpToBottom: { enabled: false } });
 		const transcriptText = new Text(Array.from({ length: 8 }, (_, index) => `line ${index + 1}`).join("\n"), 0, 0);
 		const transcript = new ScrollView(transcriptText, { follow: "end", primary: true });
 		const dock = new VStack([new Text("editor", 0, 0), new Text("footer", 0, 0)]);
@@ -555,7 +564,7 @@ describe("TuiAltScreen", () => {
 
 	it("supports configurable keyboard viewport navigation with four rows of page overlap", async () => {
 		const terminal = new VirtualTerminal(20, 8);
-		const tui = new TuiAltScreen(terminal);
+		const tui = new TuiAltScreen(terminal, undefined, undefined, { jumpToBottom: { enabled: false } });
 		tui.addChild(new Text(Array.from({ length: 12 }, (_, index) => `line ${index + 1}`).join("\n"), 0, 0));
 		tui.start();
 		await terminal.waitForRender();
@@ -2019,6 +2028,266 @@ describe("TuiAltScreen", () => {
 			assert.ok(restoreEvent.data.includes("sixth"));
 			assert.ok(restoreEvent.data.indexOf("first") < restoreEvent.data.indexOf("sixth"));
 		}
+	});
+
+	it("shows a clickable jump-to-bottom pill once scrolled past the threshold", async () => {
+		const terminal = new RecordingTerminal(30, 6);
+		const tui = new TuiAltScreen(terminal);
+		const transcript = new ScrollView(
+			new Text(Array.from({ length: 20 }, (_, index) => `line ${index + 1}`).join("\n"), 0, 0),
+			{ follow: "end", primary: true },
+		);
+		tui.setLayoutRoot(
+			new VStack([
+				{ component: transcript, basis: 0, grow: 1, minSize: 1 },
+				{ component: new Text("editor", 0, 0), basis: "auto", minSize: 1 },
+			]),
+		);
+		tui.start();
+		await terminal.waitForRender();
+
+		// Following the end: no pill.
+		assert.ok(!terminal.getViewport().join("\n").includes("jump to bottom"));
+
+		// One line up is inside the threshold: still no pill.
+		terminal.sendInput("\x1b[<64;1;1M");
+		await terminal.waitForRender();
+		assert.strictEqual(transcript.isFollowingEnd, false);
+		assert.ok(!terminal.getViewport().join("\n").includes("jump to bottom"));
+
+		// Three lines up crosses the default threshold: pill on the viewport's bottom row.
+		terminal.sendInput("\x1b[<64;1;1M");
+		terminal.sendInput("\x1b[<64;1;1M");
+		await terminal.waitForRender();
+		const pillRow = terminal.getViewport()[4] ?? "";
+		assert.ok(pillRow.includes("↓ jump to bottom (ctrl+end)"), `expected pill, got: ${JSON.stringify(pillRow)}`);
+
+		// Clicking the pill jumps to the bottom and resumes following.
+		const column = pillRow.indexOf("jump") + 1;
+		terminal.sendInput(`\x1b[<0;${column};5M`);
+		terminal.sendInput(`\x1b[<0;${column};5m`);
+		await terminal.waitForRender();
+		assert.strictEqual(transcript.isFollowingEnd, true);
+		assert.deepStrictEqual(
+			terminal.getViewport().map((line) => line.trimEnd()),
+			["line 16", "line 17", "line 18", "line 19", "line 20", "editor"],
+		);
+		// The click was consumed by the pill: no selection copy was emitted.
+		assert.ok(terminal.events.every((event) => event.type !== "write" || !event.data.includes("\x1b]52;c;")));
+		tui.stop();
+	});
+
+	it("honors jump-to-bottom label, threshold, and overlay suppression", async () => {
+		const terminal = new VirtualTerminal(30, 6);
+		const tui = new TuiAltScreen(terminal, undefined, undefined, {
+			jumpToBottom: { threshold: 1, label: " DOWN " },
+		});
+		const transcript = new ScrollView(
+			new Text(Array.from({ length: 20 }, (_, index) => `line ${index + 1}`).join("\n"), 0, 0),
+			{ follow: "end", primary: true },
+		);
+		tui.setLayoutRoot(new VStack([{ component: transcript, basis: 0, grow: 1, minSize: 1 }]));
+		tui.start();
+		await terminal.waitForRender();
+
+		terminal.sendInput("\x1b[<64;1;1M");
+		await terminal.waitForRender();
+		assert.ok(terminal.getViewport().join("\n").includes("DOWN"));
+
+		// An overlay owns the screen: the pill must disappear while it is up.
+		const overlay = tui.showOverlay(new Text("dialog", 0, 0));
+		tui.requestRender();
+		await terminal.waitForRender();
+		assert.ok(!terminal.getViewport().join("\n").includes("DOWN"));
+		overlay.hide();
+		tui.requestRender();
+		await terminal.waitForRender();
+		assert.ok(terminal.getViewport().join("\n").includes("DOWN"));
+		tui.stop();
+	});
+
+	it("keeps the pill disabled when jumpToBottom.enabled is false", async () => {
+		const terminal = new VirtualTerminal(30, 6);
+		const tui = new TuiAltScreen(terminal, undefined, undefined, { jumpToBottom: { enabled: false } });
+		const transcript = new ScrollView(
+			new Text(Array.from({ length: 20 }, (_, index) => `line ${index + 1}`).join("\n"), 0, 0),
+			{ follow: "end", primary: true },
+		);
+		tui.setLayoutRoot(new VStack([{ component: transcript, basis: 0, grow: 1, minSize: 1 }]));
+		tui.start();
+		await terminal.waitForRender();
+		for (let tick = 0; tick < 6; tick++) terminal.sendInput("\x1b[<64;1;1M");
+		await terminal.waitForRender();
+		assert.ok(transcript.scrollDistanceFromEnd >= 3);
+		assert.ok(!terminal.getViewport().join("\n").includes("jump to bottom"));
+		tui.stop();
+	});
+
+	it("applies updated wheel scroll lines live", async () => {
+		const terminal = new VirtualTerminal(20, 4);
+		const tui = new TuiAltScreen(terminal);
+		const primary = new ScrollView(
+			new Text(Array.from({ length: 12 }, (_, index) => `line ${index + 1}`).join("\n"), 0, 0),
+			{ follow: "end", primary: true },
+		);
+		tui.setLayoutRoot(primary);
+		tui.start();
+		await terminal.waitForRender();
+
+		tui.scrollToTop();
+		await terminal.waitForRender();
+		tui.setWheelScrollLines(5);
+		terminal.sendInput("\x1b[<65;1;1M");
+		await terminal.waitForRender();
+		assert.strictEqual(primary.scrollTop, 5);
+
+		tui.stop();
+	});
+
+	it("uses a terminal scroll shift for a large viewport and preserves screen content", async () => {
+		const terminal = new RecordingTerminal(220, 60);
+		const tui = new TuiAltScreen(terminal, undefined, undefined, {
+			wheelScrollLines: 3,
+			jumpToBottom: { enabled: false },
+		});
+		const primary = new ScrollView(
+			new Text(
+				Array.from(
+					{ length: 220 },
+					(_, index) => `line ${String(index + 1).padStart(3, "0")} ${"x".repeat(180)}`,
+				).join("\n"),
+				0,
+				0,
+			),
+			{ follow: "end", primary: true, scrollbar: "auto" },
+		);
+		tui.setLayoutRoot(primary);
+		tui.start();
+		await terminal.waitForRender();
+		assert.strictEqual(primary.isScrollbarVisible, false);
+
+		const bytesSince = (start: number): number =>
+			terminal.events
+				.slice(start)
+				.reduce((total, event) => total + (event.type === "write" ? Buffer.byteLength(event.data) : 0), 0);
+
+		const fastFrameStart = terminal.events.length;
+		terminal.sendInput("\x1b[<64;1;1M");
+		await terminal.waitForRender();
+		const fastFrameBytes = bytesSince(fastFrameStart);
+		assert.strictEqual(primary.scrollTop, 157);
+		assert.strictEqual(primary.isScrollbarVisible, true);
+		assert.ok(
+			terminal.events
+				.slice(fastFrameStart)
+				.some((event) => event.type === "write" && event.data.includes("\x1b[1;60r\x1b[3T\x1b[r\x1b[1;1H")),
+			"scroll frame should use DECSTBM and scroll-down",
+		);
+
+		const reverseFrameStart = terminal.events.length;
+		terminal.sendInput("\x1b[<65;1;1M");
+		await terminal.waitForRender();
+		const reverseViewport = terminal.getViewport();
+		assert.ok(
+			terminal.events
+				.slice(reverseFrameStart)
+				.some((event) => event.type === "write" && event.data.includes("\x1b[1;60r\x1b[3S\x1b[r\x1b[1;1H")),
+			"reverse scroll frame should use DECSTBM and scroll-up",
+		);
+
+		const fullFrameStart = terminal.events.length;
+		tui.requestRender(true);
+		await terminal.waitForRender();
+		const fullFrameBytes = bytesSince(fullFrameStart);
+		assert.deepStrictEqual(terminal.getViewport(), reverseViewport);
+		assert.ok(
+			fastFrameBytes < fullFrameBytes * 0.25,
+			`expected fast scroll frame (${fastFrameBytes} bytes) to be under 25% of full redraw (${fullFrameBytes} bytes)`,
+		);
+		tui.stop();
+	});
+
+	it("uses terminal scroll shift while repainting a visible jump-to-bottom pill", async () => {
+		const terminal = new RecordingTerminal(220, 60);
+		const tui = new TuiAltScreen(terminal, undefined, undefined, { wheelScrollLines: 3 });
+		const primary = new ScrollView(
+			new Text(
+				Array.from(
+					{ length: 220 },
+					(_, index) => `line ${String(index + 1).padStart(3, "0")} ${"x".repeat(180)}`,
+				).join("\n"),
+				0,
+				0,
+			),
+			{ follow: "end", primary: true, scrollbar: "auto" },
+		);
+		tui.setLayoutRoot(primary);
+		tui.start();
+		await terminal.waitForRender();
+
+		const bytesSince = (start: number): number =>
+			terminal.events
+				.slice(start)
+				.reduce((total, event) => total + (event.type === "write" ? Buffer.byteLength(event.data) : 0), 0);
+		const wheel = "\x1b[<64;1;1M";
+
+		// The first scroll reveals the pill, so its geometry change conservatively uses a full diff.
+		terminal.sendInput(wheel);
+		await terminal.waitForRender();
+		assert.ok(terminal.getViewport().join("\n").includes("jump to bottom"));
+
+		const fastFrameStart = terminal.events.length;
+		terminal.sendInput(wheel);
+		await terminal.waitForRender();
+		const fastFrameBytes = bytesSince(fastFrameStart);
+		const fastViewport = terminal.getViewport();
+		assert.ok(
+			terminal.events
+				.slice(fastFrameStart)
+				.some((event) => event.type === "write" && event.data.includes("\x1b[1;60r\x1b[3T\x1b[r\x1b[1;1H")),
+			"stable pill scroll frame should use DECSTBM and scroll-down",
+		);
+		assert.ok(fastViewport.join("\n").includes("jump to bottom"));
+
+		const fullFrameStart = terminal.events.length;
+		tui.requestRender(true);
+		await terminal.waitForRender();
+		const fullFrameBytes = bytesSince(fullFrameStart);
+		assert.deepStrictEqual(terminal.getViewport(), fastViewport);
+		assert.ok(
+			fastFrameBytes < fullFrameBytes * 0.25,
+			`expected pill scroll frame (${fastFrameBytes} bytes) to be under 25% of full redraw (${fullFrameBytes} bytes)`,
+		);
+		tui.stop();
+	});
+
+	it("coalesces same-tick wheel bursts and parses concatenated wheel chunks", async () => {
+		const terminal = new VirtualTerminal(20, 4);
+		const tui = new CountingTuiAltScreen(terminal);
+		const primary = new ScrollView(
+			new Text(Array.from({ length: 20 }, (_, index) => `line ${index + 1}`).join("\n"), 0, 0),
+			{ follow: "end", primary: true },
+		);
+		tui.setLayoutRoot(primary);
+		tui.start();
+		await terminal.waitForRender();
+		tui.scrollToTop();
+		await terminal.waitForRender();
+
+		const burstRenderCount = tui.renderCount;
+		const burstStart = Date.now();
+		for (let index = 0; index < 5; index++) terminal.sendInput("\x1b[<65;1;1M");
+		await terminal.waitForRender();
+		assert.strictEqual(tui.renderCount, burstRenderCount + 1);
+		assert.strictEqual(primary.scrollTop, 5);
+		assert.ok(Date.now() - burstStart < 100, "wheel burst should render without an extra batching delay");
+
+		const concatenatedRenderCount = tui.renderCount;
+		terminal.sendInput("\x1b[<65;1;1M\x1b[<65;1;1M");
+		await terminal.waitForRender();
+		assert.strictEqual(tui.renderCount, concatenatedRenderCount + 1);
+		assert.strictEqual(primary.scrollTop, 7);
+		tui.stop();
 	});
 
 	it("gives viewport keys to a focused overlay", async () => {

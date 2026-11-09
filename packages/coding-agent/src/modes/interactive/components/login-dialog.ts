@@ -1,5 +1,6 @@
 import type { AuthInfoLink, OAuthDeviceCodeInfo } from "@earendil-works/pi-ai";
 import { Container, type Focusable, getKeybindings, Input, Spacer, Text, type TUI } from "@earendil-works/pi-tui";
+import { copyToClipboard } from "../../../utils/clipboard.ts";
 import { openBrowser } from "../../../utils/open-browser.ts";
 import { theme } from "../theme/theme.ts";
 import { AuthUrlComponent } from "./auth-url.ts";
@@ -19,6 +20,7 @@ export class LoginDialogComponent extends Container implements Focusable {
 	private inputResolver?: (value: string) => void;
 	private inputRejecter?: (error: Error) => void;
 	private onComplete: (success: boolean, message?: string) => void;
+	private copyStatus?: Text;
 
 	// Focusable implementation - propagate to input for IME cursor positioning
 	private _focused = false;
@@ -78,9 +80,11 @@ export class LoginDialogComponent extends Container implements Focusable {
 	}
 
 	private replaceInputWithSubmittedText(value: string): void {
-		this.contentContainer.children = this.contentContainer.children.map((child) =>
+		const children = this.contentContainer.children.map((child) =>
 			child === this.input ? new Text(`> ${value}`, 0, 0) : child,
 		);
+		this.contentContainer.clear();
+		for (const child of children) this.contentContainer.addChild(child);
 	}
 
 	private cancel(): void {
@@ -94,13 +98,18 @@ export class LoginDialogComponent extends Container implements Focusable {
 	}
 
 	/**
-	 * Called by onAuth callback - show URL and optional instructions
+	 * Called by onAuth callback - show URL and optional instructions.
+	 * `url` opens in the local browser; `copyUrl` (when given) is what the user sees, clicks, and copies.
 	 */
-	showAuth(url: string, instructions?: string): void {
+	showAuth(url: string, instructions?: string, copyUrl?: string): void {
+		const shownUrl = copyUrl ?? url;
 		this.contentContainer.clear();
 		this.contentContainer.addChild(new Spacer(1));
-		this.authUrl = new AuthUrlComponent(this.tui, url);
+		this.authUrl = new AuthUrlComponent(this.tui, shownUrl);
 		this.contentContainer.addChild(this.authUrl);
+		// phi: "c" also copies the link while the code field is empty; the status line confirms it.
+		this.copyStatus = new Text(`${theme.fg("accent", theme.bold("c"))} ${theme.fg("dim", "to copy link")}`, 1, 0);
+		this.contentContainer.addChild(this.copyStatus);
 
 		if (instructions) {
 			this.contentContainer.addChild(new Spacer(1));
@@ -108,6 +117,21 @@ export class LoginDialogComponent extends Container implements Focusable {
 		}
 
 		openBrowser(url);
+		this.tui.requestRender();
+	}
+
+	private copyLink(): void {
+		const target = this.authUrl?.url;
+		if (!target) return;
+		copyToClipboard(target).then(
+			() =>
+				this.setCopyStatus(theme.fg("success", "Link copied. Open it in your browser, then paste the code below.")),
+			() => this.setCopyStatus(theme.fg("error", "Could not copy to the clipboard. Cmd+click the link instead.")),
+		);
+	}
+
+	private setCopyStatus(text: string): void {
+		this.copyStatus?.setText(text);
 		this.tui.requestRender();
 	}
 
@@ -229,6 +253,12 @@ export class LoginDialogComponent extends Container implements Focusable {
 		}
 		if (this.authUrl && kb.matches(data, "app.message.copy")) {
 			void this.authUrl.copy();
+			return;
+		}
+
+		// "c" copies the login link while the code field is still empty; pasted codes arrive as one chunk.
+		if ((data === "c" || data === "C") && this.authUrl && this.input.getValue() === "") {
+			this.copyLink();
 			return;
 		}
 

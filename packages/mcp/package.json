@@ -1,6 +1,7 @@
 {
 	"name": "@earendil-works/pi-mcp",
-	"version": "1.4.0",
+	"version": "1.4.0-exo.15",
+	"private": true,
 	"description": "Standalone Model Context Protocol client for pi and other applications",
 	"type": "module",
 	"main": "./dist/index.js",
@@ -32,7 +33,7 @@
 	"scripts": {
 		"clean": "shx rm -rf dist",
 		"build": "tsc -p tsconfig.build.json",
-		"test": "vitest --run",
+		"test": "vitest --run --maxWorkers=4",
 		"prepublishOnly": "npm run clean && npm run build"
 	},
 	"keywords": [
@@ -44,9 +45,11 @@
 	"license": "MIT",
 	"repository": {
 		"type": "git",
-		"url": "git+https://github.com/earendil-works/pi.git",
+		"url": "https://github.com/exowatt-oss/phi",
 		"directory": "packages/mcp"
 	},
+	"bugs": { "url": "https://github.com/exowatt-oss/phi/issues" },
+	"homepage": "https://github.com/exowatt-oss/phi",
 	"engines": {
 		"node": ">=22.19.0"
 	},

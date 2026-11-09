@@ -141,6 +141,20 @@ describe("parseArgs", () => {
 			expect(result.thinking).toBe("high");
 		});
 
+		test.each(["fast", "default", "flex", "ultrafast"] as const)("parses --service-tier %s", (tier) => {
+			const result = parseArgs(["--service-tier", tier]);
+			expect(result.serviceTier).toBe(tier);
+			expect(result.diagnostics).toEqual([]);
+		});
+
+		test("rejects invalid service tiers", () => {
+			const result = parseArgs(["--service-tier", "priority"]);
+			expect(result.serviceTier).toBeUndefined();
+			expect(result.diagnostics).toEqual([
+				{ type: "error", message: 'Invalid service tier "priority". Valid values: fast, default, flex, ultrafast' },
+			]);
+		});
+
 		test("parses --models as comma-separated list", () => {
 			const result = parseArgs(["--models", "gpt-4o,claude-sonnet,gemini-pro"]);
 			expect(result.models).toEqual(["gpt-4o", "claude-sonnet", "gemini-pro"]);

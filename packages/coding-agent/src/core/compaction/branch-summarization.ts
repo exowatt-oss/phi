@@ -15,7 +15,7 @@ import {
 	createCompactionSummaryMessage,
 	createCustomMessage,
 } from "../messages.ts";
-import type { ReadonlySessionManager, SessionEntry } from "../session-manager.ts";
+import { type ReadonlySessionManager, type SessionEntry, sessionEntryToContextMessages } from "../session-manager.ts";
 import { completeSummarization, estimateTokens, getSummarizationFailure } from "./compaction.ts";
 import {
 	computeFileLists,
@@ -23,6 +23,7 @@ import {
 	extractFileOpsFromMessage,
 	type FileOperations,
 	formatFileOperations,
+	isEphemeralCustomMessage,
 	SUMMARIZATION_SYSTEM_PROMPT,
 	serializeConversation,
 } from "./utils.ts";
@@ -156,12 +157,22 @@ export function collectEntriesForBranchSummary(
 function getMessageFromEntry(entry: SessionEntry): AgentMessage | undefined {
 	switch (entry.type) {
 		case "message":
-			// Skip tool results - context is in assistant's tool call
-			if (entry.message.role === "toolResult") return undefined;
-			return entry.message;
+			// Skip tool results - context is in assistant's tool call. Reuse the
+			// persisted-context projection so failed partial assistants never enter
+			// branch-summary prompts as orphaned tool calls.
+			if (entry.message.role === "toolResult" || isEphemeralCustomMessage(entry.message)) return undefined;
+			return sessionEntryToContextMessages(entry)[0];
 
 		case "custom_message":
-			return createCustomMessage(entry.customType, entry.content, entry.display, entry.details, entry.timestamp);
+			if (entry.ephemeral) return undefined;
+			return createCustomMessage(
+				entry.customType,
+				entry.content,
+				entry.display,
+				entry.details,
+				entry.timestamp,
+				entry.ephemeral,
+			);
 
 		case "branch_summary":
 			return createBranchSummaryMessage(entry.summary, entry.fromId, entry.timestamp);
@@ -320,7 +331,7 @@ export async function generateBranchSummary(
 
 	// Transform to LLM-compatible messages, then serialize to text
 	// Serialization prevents the model from treating it as a conversation to continue
-	const llmMessages = convertToLlm(messages);
+	const llmMessages = convertToLlm(messages.filter((message) => !isEphemeralCustomMessage(message)));
 	const conversationText = serializeConversation(llmMessages);
 
 	// Build prompt

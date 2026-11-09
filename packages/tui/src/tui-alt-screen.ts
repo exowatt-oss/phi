@@ -14,6 +14,7 @@ import {
 	getScrollViewBox,
 	getScrollViewsAt,
 	type LayoutFrame,
+	type LayoutRenderCache,
 	renderLayoutFrame,
 	type ScrollbarGeometry,
 } from "./layout.ts";
@@ -129,6 +130,13 @@ interface WheelEvent {
 	button: number;
 }
 
+/** A wheel event's resolved scroll delta (accelerated, Alt-multiplied) at its pointer position. */
+interface WheelDelta {
+	x: number;
+	y: number;
+	delta: number;
+}
+
 interface ScrollbarDrag {
 	scrollView: ScrollView;
 	grabOffset: number;
@@ -139,10 +147,29 @@ interface ScrollbarTarget {
 	geometry: ScrollbarGeometry;
 }
 
-interface ScrollToEndIndicatorRect {
-	row: number;
-	column: number;
+interface JumpToBottomRect {
+	x: number;
+	y: number;
 	width: number;
+}
+
+interface ScrollShift {
+	top: number;
+	bottom: number;
+	delta: number;
+	scrollbarColumn?: number;
+	expectedScreen: string[];
+}
+
+export interface JumpToBottomOptions {
+	/** Disable the pill entirely. */
+	enabled?: boolean;
+	/** Lines scrolled up from the end before the pill appears. */
+	threshold?: number;
+	/** Pill label; defaults to "↓ jump to bottom" plus the bound key hint. */
+	label?: string;
+	/** Style applied to the pill label (default: inverse video). Not applied to `scrollToEndIndicator` text. */
+	style?: (text: string) => string;
 }
 
 type SearchSelectionMode = "query" | "retain" | "next" | "previous";
@@ -181,11 +208,18 @@ export interface TuiAltScreenOptions {
 	searchNavigationButtonStyle?: (text: string, hovered: boolean) => string;
 	/**
 	 * Render a clickable jump-to-end label. It is centered on the last row of a follow-end
-	 * primary scroll view while that view is scrolled away from its end.
+	 * primary scroll view while that view is scrolled away from its end. The text is used
+	 * as-is (already styled) and replaces the default jump-to-bottom pill label; the pill
+	 * then appears from one line away from the end unless `jumpToBottom.threshold` is set.
 	 */
 	scrollToEndIndicator?: () => string;
 	/** Open an OSC 8 hyperlink activated with a primary-button click. */
 	openUrl?: (url: string) => void;
+	/**
+	 * Floating, clickable "jump to bottom" pill shown when a follow-end primary scroll view is
+	 * scrolled up. On by default; `scrollToEndIndicator` supplies its text when set.
+	 */
+	jumpToBottom?: JumpToBottomOptions;
 	/** Handle an unmodified secondary-button press for clipboard paste. Currently enabled on Windows only. */
 	onRightClickPaste?: () => void;
 	/** Automatically copy selected text to the clipboard on mouse release (default: true). */
@@ -206,8 +240,10 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 	private lastDocument: string[] = [];
 	private previousScreenWidth = 0;
 	private previousScreenHeight = 0;
+	private previousPrimaryScrollTop?: number;
 	private layoutRoot: Component | undefined;
 	private currentLayout: LayoutFrame | undefined;
+	private readonly layoutRenderCache: LayoutRenderCache = new Map();
 	private readonly implicitDocument: Component;
 	private readonly implicitScrollView: ScrollView;
 	private readonly flashes: AltScreenFlashContainer;
@@ -226,7 +262,6 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 	private selectionPressActive = false;
 	private scrollbarDrag?: ScrollbarDrag;
 	private scrollbarHover?: ScrollView;
-	private scrollToEndIndicatorRect?: ScrollToEndIndicatorRect;
 	private activeSearch?: ActiveSearch;
 	private pressedUrl?: string;
 	private selectionDragged = false;
@@ -248,6 +283,11 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 	private readonly searchNavigationButtonStyle: (text: string, hovered: boolean) => string;
 	private readonly scrollToEndIndicator?: () => string;
 	private readonly openUrl?: (url: string) => void;
+	private readonly jumpToBottomEnabled: boolean;
+	private readonly jumpToBottomThreshold: number;
+	private readonly jumpToBottomLabel: string | undefined;
+	private readonly jumpToBottomStyle: (text: string) => string;
+	private jumpToBottomRect?: JumpToBottomRect;
 	private readonly onRightClickPaste?: () => void;
 	private copyOnSelect: boolean;
 	private readonly copySelection?: (text: string) => Promise<boolean | string>;
@@ -275,6 +315,13 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 		this.searchNavigationButtonStyle = options.searchNavigationButtonStyle ?? ((text) => text);
 		this.scrollToEndIndicator = options.scrollToEndIndicator;
 		this.openUrl = options.openUrl;
+		this.jumpToBottomEnabled = options.jumpToBottom?.enabled ?? true;
+		this.jumpToBottomThreshold = Math.max(
+			1,
+			Math.floor(options.jumpToBottom?.threshold ?? (options.scrollToEndIndicator ? 1 : 3)),
+		);
+		this.jumpToBottomLabel = options.jumpToBottom?.label;
+		this.jumpToBottomStyle = options.jumpToBottom?.style ?? ((text) => `\x1b[7m${text}\x1b[27m`);
 		this.onRightClickPaste = options.onRightClickPaste;
 		this.copyOnSelect = options.copyOnSelect ?? true;
 		this.copySelection = options.copySelection;
@@ -328,11 +375,18 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 		if (this.layoutRoot === component) return;
 		this.layoutRoot = component;
 		this.currentLayout = undefined;
+		this.layoutRenderCache.clear();
 		this.requestRender();
 	}
 
 	override render(width: number): string[] {
 		return this.layoutRoot?.render(width) ?? super.render(width);
+	}
+
+	override invalidate(): void {
+		// TuiBase.invalidate() already invalidates the layout root via getMountedRoots().
+		super.invalidate();
+		this.layoutRenderCache.clear();
 	}
 
 	protected override getMountedRoots(): readonly Component[] {
@@ -496,22 +550,53 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 		this.previousScreen = [];
 		this.previousScreenWidth = 0;
 		this.previousScreenHeight = 0;
+		this.previousPrimaryScrollTop = undefined;
 		this.currentLayout = undefined;
+		this.layoutRenderCache.clear();
+		this.jumpToBottomRect = undefined;
+	}
+
+	/** Scroll-only invalidation keeps the immutable transcript lines cached. */
+	private requestScrollRender(): void {
+		super.requestRender();
+	}
+
+	/** Any ordinary render request may reflect content/state changes, so drop cached layout lines. */
+	override requestRender(force = false): void {
+		this.layoutRenderCache.clear();
+		super.requestRender(force);
+	}
+
+	/**
+	 * Keyboard input renders through this path, not requestRender(), to skip the frame
+	 * throttle. Input reaching the focused component can change what it draws (the editor
+	 * text above all), so it must drop cached layout lines too; otherwise typed text stays
+	 * invisible until some unrelated requestRender() clears the cache.
+	 */
+	protected override requestImmediateRender(): void {
+		this.layoutRenderCache.clear();
+		super.requestImmediateRender();
+	}
+
+	/** An explicit synchronous flush is a content render, never a scroll-only one. */
+	override renderNow(force = false): void {
+		this.layoutRenderCache.clear();
+		super.renderNow(force);
 	}
 
 	scrollBy(lines: number): void {
 		this.getPrimaryScrollView().scrollBy(lines);
-		this.requestRender();
+		this.requestScrollRender();
 	}
 
 	scrollToTop(): void {
 		this.getPrimaryScrollView().scrollToStart();
-		this.requestRender();
+		this.requestScrollRender();
 	}
 
 	scrollToBottom(): void {
 		this.getPrimaryScrollView().scrollToEnd();
-		this.requestRender();
+		this.requestScrollRender();
 	}
 
 	private scrollToPrompt(direction: -1 | 1): void {
@@ -523,7 +608,7 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 		for (let row = scrollView.scrollTop + direction; row >= 0 && row < lines.length; row += direction) {
 			if (!OSC133_PROMPT_START.test(lines[row] ?? "")) continue;
 			scrollView.scrollTo(row);
-			this.requestRender();
+			this.requestScrollRender();
 			return;
 		}
 	}
@@ -713,20 +798,31 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 		}
 		if (data === FOCUS_IN) return { consume: true };
 
-		const wheelEvent = this.parseWheelEvent(data);
-		if (wheelEvent) {
-			const lines = this.wheelScroll.next(wheelEvent.direction, performance.now());
-			// SGR mouse button codes use bit 3 (value 8) for the Alt modifier.
-			const wheelDelta =
-				wheelEvent.direction * ((wheelEvent.button & 8) !== 0 ? lines * ALT_WHEEL_SCROLL_MULTIPLIER : lines);
-			const event = this.createMouseEvent("wheel", wheelEvent.button, wheelEvent.x, wheelEvent.y, { wheelDelta });
-			const overlay = this.dispatchMouseToOverlay(event);
-			const result = overlay.result ?? (overlay.hit ? undefined : this.dispatchMouseToLayout(event));
-			if (result) {
-				if (this.applyMouseDispatchResult(event, result)) this.requestRender();
-				return { consume: true };
+		const wheelEvents = this.parseWheelEvents(data);
+		if (wheelEvents) {
+			// Components (overlays, mouse regions, lists) get each wheel tick first; whatever they
+			// leave unhandled scrolls the viewport as one batched, coalesced scroll render.
+			const unhandled: WheelDelta[] = [];
+			let render = false;
+			const now = performance.now();
+			for (const wheelEvent of wheelEvents) {
+				const lines = this.wheelScroll.next(wheelEvent.direction, now);
+				// SGR mouse button codes use bit 3 (value 8) for the Alt modifier.
+				const wheelDelta =
+					wheelEvent.direction * ((wheelEvent.button & 8) !== 0 ? lines * ALT_WHEEL_SCROLL_MULTIPLIER : lines);
+				const event = this.createMouseEvent("wheel", wheelEvent.button, wheelEvent.x, wheelEvent.y, { wheelDelta });
+				const overlay = this.dispatchMouseToOverlay(event);
+				const result = overlay.result ?? (overlay.hit ? undefined : this.dispatchMouseToLayout(event));
+				if (result) {
+					if (this.applyMouseDispatchResult(event, result)) render = true;
+					continue;
+				}
+				unhandled.push({ x: wheelEvent.x, y: wheelEvent.y, delta: wheelDelta });
 			}
-			this.routeWheel(wheelEvent, wheelDelta);
+			if (render) this.requestRender();
+			if (unhandled.length === 0) return { consume: true };
+			// Unhandled wheel ticks scroll the transcript even under a focused overlay (upstream #10769).
+			this.routeWheel(unhandled);
 			return { consume: true };
 		}
 		const mouseEvent = this.parseSgrMouseEvent(data);
@@ -947,7 +1043,7 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 
 		const overlay = this.dispatchMouseToOverlay(event);
 		if (!overlay.hit) {
-			if (this.handleScrollToEndIndicatorMouseEvent(raw)) return;
+			if (this.handleJumpToBottomMouseEvent(raw)) return;
 			const scrollbarHandled = this.handleScrollbarMouseEvent(raw);
 			if (!this.scrollbarDrag) this.updateScrollbarHover(raw.x, raw.y);
 			if (scrollbarHandled) return;
@@ -1001,18 +1097,56 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 		return undefined;
 	}
 
-	private routeWheel(event: WheelEvent, delta: number): void {
-		let remaining = delta;
-		const seen = new Set<ScrollView>();
-		for (const scrollView of this.currentLayout ? getScrollViewsAt(this.currentLayout, event.x, event.y) : []) {
-			seen.add(scrollView);
-			remaining = scrollView.scrollBy(remaining);
-			if (remaining === 0 || scrollView.overscroll === "contain") break;
+	private parseWheelEvents(data: string): WheelEvent[] | undefined {
+		const events: WheelEvent[] = [];
+		let offset = 0;
+		while (offset < data.length) {
+			const remaining = data.slice(offset);
+			const sgr = /^\x1b\[<\d+;\d+;\d+[Mm]/.exec(remaining);
+			if (sgr) {
+				const event = this.parseWheelEvent(sgr[0]);
+				if (!event) return undefined;
+				events.push(event);
+				offset += sgr[0].length;
+				continue;
+			}
+			if (remaining.startsWith("\x1b[M")) {
+				if (remaining.length < 6) return undefined;
+				const event = this.parseWheelEvent(remaining.slice(0, 6));
+				if (!event) return undefined;
+				events.push(event);
+				offset += 6;
+				continue;
+			}
+			return undefined;
 		}
-		const primary = this.getPrimaryScrollView();
-		if (remaining !== 0 && !seen.has(primary)) primary.scrollBy(remaining);
-		this.updateScrollbarHover(event.x, event.y);
-		this.requestRender();
+		return events.length > 0 ? events : undefined;
+	}
+
+	private routeWheel(events: readonly WheelDelta[]): void {
+		const grouped: WheelDelta[] = [];
+		for (const event of events) {
+			const previous = grouped[grouped.length - 1];
+			if (previous && previous.x === event.x && previous.y === event.y) {
+				previous.delta += event.delta;
+			} else {
+				grouped.push({ ...event });
+			}
+		}
+
+		for (const event of grouped) {
+			let remaining = event.delta;
+			const seen = new Set<ScrollView>();
+			for (const scrollView of this.currentLayout ? getScrollViewsAt(this.currentLayout, event.x, event.y) : []) {
+				seen.add(scrollView);
+				remaining = scrollView.scrollBy(remaining);
+				if (remaining === 0 || scrollView.overscroll === "contain") break;
+			}
+			const primary = this.getPrimaryScrollView();
+			if (remaining !== 0 && !seen.has(primary)) primary.scrollBy(remaining);
+			this.updateScrollbarHover(event.x, event.y);
+		}
+		this.requestScrollRender();
 	}
 
 	private parseSgrMouseEvent(data: string): SgrMouseEvent | undefined {
@@ -1044,14 +1178,6 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 		return true;
 	}
 
-	private handleScrollToEndIndicatorMouseEvent(event: SgrMouseEvent): boolean {
-		const rect = this.scrollToEndIndicatorRect;
-		if (!rect || event.release || (event.button & 32) !== 0 || (event.button & 3) !== 0) return false;
-		if (event.y !== rect.row || event.x < rect.column || event.x >= rect.column + rect.width) return false;
-		this.scrollToBottom();
-		return true;
-	}
-
 	private getScrollbarTargetAt(x: number, y: number, includeHiddenAuto = false): ScrollbarTarget | undefined {
 		if (this.hasOverlay() || !this.currentLayout) return undefined;
 		for (const scrollView of getScrollViewsAt(this.currentLayout, x, y)) {
@@ -1074,6 +1200,7 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 		this.scrollbarHover?.setScrollbarActive(false);
 		this.scrollbarHover = scrollView;
 		this.scrollbarHover?.setScrollbarActive(true);
+		this.requestScrollRender();
 	}
 
 	private updateScrollbarHover(x: number, y: number): void {
@@ -1317,7 +1444,7 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 		}
 		const point = this.getScrollSelectionPoint(scrollView, pointer.x, pointer.y);
 		if (point) this.updateSelectionFocus(point);
-		this.requestRender();
+		this.requestScrollRender();
 	}
 
 	private stopSelectionAutoScroll(): void {
@@ -1649,28 +1776,65 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 		return /^\x1b\[<\d+;\d+;\d+[Mm]$/.test(data) || (data.length === 6 && data.startsWith("\x1b[M"));
 	}
 
-	private compositeScrollToEndIndicator(screen: string[], layout: LayoutFrame, width: number): string[] {
-		this.scrollToEndIndicatorRect = undefined;
-		const scrollView = layout.primaryScrollView ?? this.implicitScrollView;
-		if (!this.scrollToEndIndicator || !scrollView.followEnd || scrollView.isFollowingEnd) return screen;
+	private getJumpToBottomLabel(): string {
+		if (this.jumpToBottomLabel !== undefined) return this.jumpToBottomLabel;
+		const keys = getKeybindings().getKeys("tui.altScreen.bottom");
+		return keys.length > 0 ? ` ↓ jump to bottom (${keys[0]}) ` : " ↓ jump to bottom ";
+	}
+
+	/**
+	 * Overlay a clickable "jump to bottom" pill on the last visible row of a follow-end primary
+	 * scroll view while it is scrolled up. `scrollToEndIndicator` (upstream's API) supplies the
+	 * already-styled text when set; otherwise the label is styled with `jumpToBottom.style`.
+	 * The pill stays clear of the scrollbar column so the scrollbar remains clickable.
+	 */
+	private compositeJumpToBottom(screen: string[], width: number, layout: LayoutFrame): string[] {
+		this.jumpToBottomRect = undefined;
+		if (!this.jumpToBottomEnabled || this.hasOverlay()) return screen;
+		const scrollView = layout.primaryScrollView;
+		if (!scrollView || !scrollView.followEnd || scrollView.isFollowingEnd) return screen;
+		if (scrollView.scrollDistanceFromEnd < this.jumpToBottomThreshold) return screen;
 		const box = getScrollViewBox(layout, scrollView);
-		const clip = box?.clip;
-		if (!clip || clip.width <= 0 || clip.height <= 0) return screen;
-		const row = clip.y + clip.height - 1;
-		if (row >= screen.length || isImageLine(screen[row] ?? "")) return screen;
-		const scrollbarColumn = box ? getScrollbarGeometry(box)?.column : undefined;
-		const label = truncateToWidth(this.scrollToEndIndicator(), clip.width, "");
-		const labelWidth = visibleWidth(label);
-		const column = clip.x + Math.floor((clip.width - labelWidth) / 2);
-		const rightEdge = scrollbarColumn ?? clip.x + clip.width;
-		const availableWidth = Math.max(0, rightEdge - column);
-		const text = truncateToWidth(label, availableWidth, "");
-		const textWidth = visibleWidth(text);
-		if (textWidth === 0) return screen;
+		if (!box) return screen;
+		const visibleTop = Math.max(0, box.rect.y, box.clip.y);
+		const visibleBottom = Math.min(
+			screen.length - 1,
+			box.rect.y + box.rect.height - 1,
+			box.clip.y + box.clip.height - 1,
+		);
+		if (visibleBottom < visibleTop) return screen;
+		// Center over the whole clip, scrollbar column included, so the pill does not shift when an
+		// auto scrollbar hides or reappears; only the text is cut short of the scrollbar (upstream #9842).
+		const clipLeft = Math.max(0, box.clip.x);
+		const clipRight = Math.min(width, box.clip.x + box.clip.width);
+		const clipWidth = clipRight - clipLeft;
+		if (clipWidth <= 0) return screen;
+		const scrollbarColumn = getScrollbarGeometry(box)?.column;
+		const rightEdge = Math.min(clipRight, scrollbarColumn ?? clipRight);
+		const label = truncateToWidth(
+			this.scrollToEndIndicator ? this.scrollToEndIndicator() : this.getJumpToBottomLabel(),
+			clipWidth,
+			"",
+		);
+		const x = clipLeft + Math.max(0, Math.floor((clipWidth - visibleWidth(label)) / 2));
+		const fitted = truncateToWidth(label, Math.max(0, rightEdge - x), "");
+		const pillWidth = visibleWidth(fitted);
+		if (pillWidth <= 0 || isImageLine(screen[visibleBottom] ?? "")) return screen;
+		const text = this.scrollToEndIndicator ? fitted : this.jumpToBottomStyle(fitted);
 		const result = [...screen];
-		result[row] = compositeTuiLine(result[row] ?? "", text, column, textWidth, width);
-		this.scrollToEndIndicatorRect = { row, column, width: textWidth };
+		result[visibleBottom] = compositeTuiLine(result[visibleBottom] ?? "", text, x, pillWidth, width);
+		this.jumpToBottomRect = { x, y: visibleBottom, width: pillWidth };
 		return result;
+	}
+
+	private handleJumpToBottomMouseEvent(event: SgrMouseEvent): boolean {
+		const rect = this.jumpToBottomRect;
+		if (!rect || event.release) return false;
+		if ((event.button & 32) !== 0 || (event.button & 3) !== 0) return false;
+		if (event.y !== rect.y || event.x < rect.x || event.x >= rect.x + rect.width) return false;
+		this.clearTextSelection();
+		this.scrollToBottom();
+		return true;
 	}
 
 	private compositeFlashes(screen: string[], width: number, height: number): string[] {
@@ -1687,19 +1851,129 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 		return result;
 	}
 
+	private sameJumpToBottomRect(a: JumpToBottomRect | undefined, b: JumpToBottomRect | undefined): boolean {
+		return a?.x === b?.x && a?.y === b?.y && a?.width === b?.width;
+	}
+
+	private withoutColumn(line: string, column: number | undefined, width: number): string {
+		if (column === undefined || column < 0 || column >= width) return line;
+		return `${sliceByColumn(line, 0, column, true)}${sliceByColumn(line, column + 1, width - column - 1, true)}`;
+	}
+
+	/** Strip fixed-position cells that are redrawn independently after a terminal scroll. */
+	private withoutSpans(
+		line: string,
+		scrollbarColumn: number | undefined,
+		pillSpan: JumpToBottomRect | undefined,
+		width: number,
+	): string {
+		const spans: Array<{ start: number; width: number }> = [];
+		if (scrollbarColumn !== undefined && scrollbarColumn >= 0 && scrollbarColumn < width) {
+			spans.push({ start: scrollbarColumn, width: 1 });
+		}
+		if (pillSpan) spans.push({ start: pillSpan.x, width: pillSpan.width });
+		// Strip higher-start spans first so lower column indices stay valid.
+		spans.sort((a, b) => b.start - a.start);
+		let result = line;
+		for (const span of spans) {
+			const end = Math.min(width, span.start + span.width);
+			if (span.start < 0 || span.start >= width || end <= span.start) continue;
+			result = `${sliceByColumn(result, 0, span.start, true)}${sliceByColumn(result, end, width - end, true)}`;
+		}
+		// compositeTuiLine adds boundary resets and overlay styling around the pill;
+		// those sequences are not part of the underlying row being compared.
+		return pillSpan ? stripTerminalSequences(result) : result;
+	}
+
+	private detectScrollShift(
+		screen: string[],
+		nextLayout: LayoutFrame,
+		width: number,
+		height: number,
+		delta: number,
+	): ScrollShift | undefined {
+		const scrollView = nextLayout.primaryScrollView;
+		const previousLayout = this.currentLayout;
+		if (!scrollView || !previousLayout || previousLayout.primaryScrollView !== scrollView) return undefined;
+		if (Math.abs(delta) < 1 || Math.abs(delta) >= height) return undefined;
+
+		const previousBox = getScrollViewBox(previousLayout, scrollView);
+		const nextBox = getScrollViewBox(nextLayout, scrollView);
+		if (!previousBox || !nextBox) return undefined;
+		const sameRect = (a: typeof previousBox.rect, b: typeof nextBox.rect): boolean =>
+			a.x === b.x && a.y === b.y && a.width === b.width && a.height === b.height;
+		const sameClip = (a: typeof previousBox.clip, b: typeof nextBox.clip): boolean =>
+			a.x === b.x && a.y === b.y && a.width === b.width && a.height === b.height;
+		if (!sameRect(previousBox.rect, nextBox.rect) || !sameClip(previousBox.clip, nextBox.clip)) return undefined;
+		// DECSTBM scrolls every column, so only use it when the viewport owns the full terminal width.
+		if (
+			previousBox.rect.x !== 0 ||
+			previousBox.rect.width !== width ||
+			previousBox.clip.x !== 0 ||
+			previousBox.clip.width !== width
+		) {
+			return undefined;
+		}
+
+		const top = Math.max(0, previousBox.rect.y, previousBox.clip.y);
+		const bottom = Math.min(
+			height - 1,
+			previousBox.rect.y + previousBox.rect.height - 1,
+			previousBox.clip.y + previousBox.clip.height - 1,
+		);
+		if (bottom < top || Math.abs(delta) >= bottom - top + 1) return undefined;
+
+		const previousScrollbar = getScrollbarGeometry(previousBox);
+		const nextScrollbar = getScrollbarGeometry(nextBox);
+		if (previousScrollbar && nextScrollbar && previousScrollbar.column !== nextScrollbar.column) return undefined;
+		const scrollbarColumn = nextScrollbar?.column ?? previousScrollbar?.column;
+
+		// The pill is composited at a fixed viewport row before this comparison, even
+		// though the content underneath it moved. A changed pill rect is already a
+		// conservative full-diff fallback in doRender; with a stable rect, exclude
+		// the pill on either side of the shifted row pair and repaint it below.
+		const pillRect = this.jumpToBottomRect;
+		const overlapStart = top + Math.max(0, -delta);
+		const overlapEnd = bottom - Math.max(0, delta);
+		for (let row = overlapStart; row <= overlapEnd; row++) {
+			const previousRow = row + delta;
+			const pillSpan = pillRect && (row === pillRect.y || previousRow === pillRect.y) ? pillRect : undefined;
+			if (
+				this.withoutSpans(screen[row] ?? "", scrollbarColumn, pillSpan, width) !==
+				this.withoutSpans(this.previousScreen[previousRow] ?? "", scrollbarColumn, pillSpan, width)
+			) {
+				return undefined;
+			}
+		}
+
+		const expectedScreen = Array.from({ length: height }, (_, row) => this.previousScreen[row] ?? "");
+		for (let row = top; row <= bottom; row++) {
+			const previousRow = row + delta;
+			expectedScreen[row] =
+				previousRow >= top && previousRow <= bottom ? (this.previousScreen[previousRow] ?? "") : "";
+		}
+		return { top, bottom, delta, scrollbarColumn, expectedScreen };
+	}
+
 	protected override doRender(): void {
 		if (this.stopped || !this.altScreenActive) return;
 		const width = Math.max(1, this.terminal.columns);
 		const height = Math.max(1, this.terminal.rows);
+		const previousJumpToBottomRect = this.jumpToBottomRect;
 		const root = this.layoutRoot ?? this.implicitScrollView;
-		let nextLayout = renderLayoutFrame(root, width, height, () => this.requestRender());
+		const layoutOptions = {
+			requestScrollRender: () => this.requestScrollRender(),
+			renderCache: this.layoutRenderCache,
+		};
+		let nextLayout = renderLayoutFrame(root, width, height, () => this.requestRender(), layoutOptions);
 		if (this.refreshSearch(nextLayout)) {
-			nextLayout = renderLayoutFrame(root, width, height, () => this.requestRender());
+			// The search only moved the viewport, so the cached layout lines stay valid.
+			nextLayout = renderLayoutFrame(root, width, height, () => this.requestRender(), layoutOptions);
 		}
 		// Resolve fake cursors before highlighting and compositing, which only track SGR codes
 		let screen = this.resolveFakeCursors(nextLayout.lines.map((line) => line.replace(OSC133_ZONE_PREFIX, "")));
 		screen = this.applySearchHighlights(screen, nextLayout);
-		screen = this.compositeScrollToEndIndicator(screen, nextLayout, width);
+		screen = this.compositeJumpToBottom(screen, width, nextLayout);
 		screen = this.compositeOverlays(screen, width, height);
 		if (screen.length > height) screen = screen.slice(screen.length - height);
 		screen = this.applySelection(screen, nextLayout);
@@ -1732,6 +2006,24 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 				return false;
 			});
 		const imagesNeedRedraw = imageAnchorsNeedRedraw || imageCellsNeedRedraw;
+		const jumpToBottomChanged = !this.sameJumpToBottomRect(previousJumpToBottomRect, this.jumpToBottomRect);
+		const selectionActive = this.getSelectionBounds() !== undefined;
+		const hasImageLines = screen.some(isImageLine) || this.previousScreen.some(isImageLine);
+		const primaryScrollTop = nextLayout.primaryScrollView?.scrollTop;
+		const primaryScrollDelta =
+			primaryScrollTop === undefined || this.previousPrimaryScrollTop === undefined
+				? 0
+				: primaryScrollTop - this.previousPrimaryScrollTop;
+		const scrollShift =
+			!fullRedraw &&
+			!imagesNeedRedraw &&
+			!this.hasOverlay() &&
+			!selectionActive &&
+			!jumpToBottomChanged &&
+			!hasImageLines &&
+			primaryScrollDelta !== 0
+				? this.detectScrollShift(screen, nextLayout, width, height, primaryScrollDelta)
+				: undefined;
 		const redrawImages = fullRedraw || imagesNeedRedraw;
 		const hadUploadedKittyImages = this.uploadedKittyImages.size > 0;
 		const preparedKittyScreen =
@@ -1753,30 +2045,52 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 		}
 		buffer += preparedKittyScreen.evictedImageDeletion;
 
-		// WezTerm erases intersecting Kitty image cells when a later row write touches a covered row.
-		// Draw image placements after every clear and text write so nothing later intersects them; preserve
-		// the existing interleaved output for text-only frames and every other terminal.
-		const drawKittyImagesLast =
-			redrawImages && this.imageProtocol === "kitty" && screen.some(isImageLine) && isWezTerm;
-		if (drawKittyImagesLast) {
+		if (scrollShift) {
+			// Reset SGR first: terminals fill rows exposed by SU/SD with the current background (BCE).
+			buffer += `\x1b[0m\x1b[${scrollShift.top + 1};${scrollShift.bottom + 1}r`;
+			buffer += scrollShift.delta > 0 ? `\x1b[${scrollShift.delta}S` : `\x1b[${-scrollShift.delta}T`;
+			buffer += "\x1b[r\x1b[1;1H";
 			for (let row = 0; row < height; row++) {
-				if (!fullRedraw && !imagesNeedRedraw && screen[row] === this.previousScreen[row]) continue;
-				buffer += `\x1b[${row + 1};1H\x1b[2K`;
-			}
-			for (let row = 0; row < height; row++) {
-				if (!fullRedraw && !imagesNeedRedraw && screen[row] === this.previousScreen[row]) continue;
-				if (isImageLine(preparedKittyScreen.lines[row] ?? "")) continue;
-				buffer += `\x1b[${row + 1};1H${preparedKittyScreen.lines[row] ?? ""}`;
-			}
-			for (let row = 0; row < height; row++) {
-				if (!fullRedraw && !imagesNeedRedraw && screen[row] === this.previousScreen[row]) continue;
-				if (!isImageLine(preparedKittyScreen.lines[row] ?? "")) continue;
-				buffer += `\x1b[${row + 1};1H${preparedKittyScreen.lines[row] ?? ""}`;
+				if (screen[row] === scrollShift.expectedScreen[row]) continue;
+				if (
+					scrollShift.scrollbarColumn !== undefined &&
+					row >= scrollShift.top &&
+					row <= scrollShift.bottom &&
+					this.withoutColumn(screen[row] ?? "", scrollShift.scrollbarColumn, width) ===
+						this.withoutColumn(scrollShift.expectedScreen[row] ?? "", scrollShift.scrollbarColumn, width)
+				) {
+					const scrollbarCell = sliceByColumn(screen[row] ?? "", scrollShift.scrollbarColumn, 1, true) || " ";
+					buffer += `\x1b[${row + 1};${scrollShift.scrollbarColumn + 1}H${scrollbarCell}\x1b[0m`;
+				} else {
+					buffer += `\x1b[${row + 1};1H\x1b[2K${screen[row] ?? ""}`;
+				}
 			}
 		} else {
-			for (let row = 0; row < height; row++) {
-				if (!fullRedraw && !imagesNeedRedraw && screen[row] === this.previousScreen[row]) continue;
-				buffer += `\x1b[${row + 1};1H\x1b[2K${preparedKittyScreen.lines[row] ?? ""}`;
+			// WezTerm erases intersecting Kitty image cells when a later row write touches a covered row.
+			// Draw image placements after every clear and text write so nothing later intersects them; preserve
+			// the existing interleaved output for text-only frames and every other terminal.
+			const drawKittyImagesLast =
+				redrawImages && this.imageProtocol === "kitty" && screen.some(isImageLine) && isWezTerm;
+			if (drawKittyImagesLast) {
+				for (let row = 0; row < height; row++) {
+					if (!fullRedraw && !imagesNeedRedraw && screen[row] === this.previousScreen[row]) continue;
+					buffer += `\x1b[${row + 1};1H\x1b[2K`;
+				}
+				for (let row = 0; row < height; row++) {
+					if (!fullRedraw && !imagesNeedRedraw && screen[row] === this.previousScreen[row]) continue;
+					if (isImageLine(preparedKittyScreen.lines[row] ?? "")) continue;
+					buffer += `\x1b[${row + 1};1H${preparedKittyScreen.lines[row] ?? ""}`;
+				}
+				for (let row = 0; row < height; row++) {
+					if (!fullRedraw && !imagesNeedRedraw && screen[row] === this.previousScreen[row]) continue;
+					if (!isImageLine(preparedKittyScreen.lines[row] ?? "")) continue;
+					buffer += `\x1b[${row + 1};1H${preparedKittyScreen.lines[row] ?? ""}`;
+				}
+			} else {
+				for (let row = 0; row < height; row++) {
+					if (!fullRedraw && !imagesNeedRedraw && screen[row] === this.previousScreen[row]) continue;
+					buffer += `\x1b[${row + 1};1H\x1b[2K${preparedKittyScreen.lines[row] ?? ""}`;
+				}
 			}
 		}
 
@@ -1792,6 +2106,7 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 		this.previousScreen = screen;
 		this.previousScreenWidth = width;
 		this.previousScreenHeight = height;
+		this.previousPrimaryScrollTop = primaryScrollTop;
 		this.currentLayout = nextLayout;
 	}
 }

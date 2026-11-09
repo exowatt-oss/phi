@@ -70,8 +70,21 @@ describe("getSupportedThinkingLevels", () => {
 		expect(getSupportedThinkingLevels(model!)).toContain("max");
 	});
 
-	it("includes xhigh and max but not off for Anthropic Claude Fable 5 on anthropic-messages API", () => {
+	it("offers only minimal and low for Anthropic Claude Fable 5 on anthropic-messages API", () => {
+		// Fable 5's adaptive effort vocabulary is exactly {"low"}. Verified 2026-09-12
+		// against api.anthropic.com, one 1-token prompt per level: "low" answers 200,
+		// and "medium"/"high"/"xhigh"/"max" all answer 400 "Invalid effort level". The
+		// catalog used to claim native xhigh/max here, so the picker offered levels the
+		// model rejects and a reroute onto it at medium failed the turn.
 		const model = getModel("anthropic", "claude-fable-5");
+		expect(model).toBeDefined();
+		expect(getSupportedThinkingLevels(model!)).toEqual(["minimal", "low"]);
+	});
+
+	it("keeps the full range for the Claude Fable 5.1 refresh", () => {
+		// 5.1 accepts all five efforts (same verification run), so the narrowing above
+		// must not catch it — the id match is what separates them.
+		const model = getModel("anthropic", "claude-fable-5-1");
 		expect(model).toBeDefined();
 		expect(getSupportedThinkingLevels(model!)).toContain("xhigh");
 		expect(getSupportedThinkingLevels(model!)).toContain("max");
@@ -175,6 +188,15 @@ describe("getSupportedThinkingLevels", () => {
 		expect(getSupportedThinkingLevels(model!)).toEqual(["off", "low", "high", "max"]);
 	});
 
+	it("includes low/high/max plus off for a custom DeepSeek Flash model on opencode-go", () => {
+		// Go may retire a catalog entry; custom models still need this effort mapping.
+		// The DeepSeek provider's flash entry (V4.1 Flash, formerly `deepseek-v4-flash`) stands in for one.
+		const base = getModel("deepseek", "deepseek-flash");
+		expect(base).toBeDefined();
+		const model = { ...base, provider: "opencode-go" };
+		expect(getSupportedThinkingLevels(model)).toEqual(["off", "low", "high", "max"]);
+	});
+
 	it("preserves low/high/max metadata for DeepSeek V4.1 Flash on OpenRouter", () => {
 		const model = getModel("openrouter", "deepseek/deepseek-v4.1-flash");
 		expect(model).toBeDefined();
@@ -246,11 +268,12 @@ describe("getSupportedThinkingLevels", () => {
 		expect(getSupportedThinkingLevels(model!)).toEqual(["low", "medium", "high", "xhigh"]);
 	});
 
-	it("includes xhigh and max but not off for Bedrock Claude Fable 5", () => {
+	it("offers only minimal and low for Bedrock Claude Fable 5", () => {
+		// Same model, same vocabulary. Only the first-party endpoint was measured, so
+		// this is an extrapolation — but it errs towards clamping down rather than
+		// sending an effort the model may reject.
 		const model = getModel("amazon-bedrock", "global.anthropic.claude-fable-5");
 		expect(model).toBeDefined();
-		expect(getSupportedThinkingLevels(model!)).toContain("xhigh");
-		expect(getSupportedThinkingLevels(model!)).toContain("max");
-		expect(getSupportedThinkingLevels(model!)).not.toContain("off");
+		expect(getSupportedThinkingLevels(model!)).toEqual(["minimal", "low"]);
 	});
 });

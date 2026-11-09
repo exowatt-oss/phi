@@ -2,6 +2,7 @@
  * xAI OAuth device-code flow.
  */
 
+import { OAuthTokenError } from "../errors.ts";
 import type { OAuthAuth, OAuthCredential, ProviderAuthInteraction } from "../types.ts";
 import { pollOAuthDeviceCodeFlow } from "./device-code.ts";
 
@@ -221,7 +222,8 @@ async function refreshXaiToken(refreshToken: string, signal: AbortSignal): Promi
 		signal,
 	);
 	if (!response.ok) {
-		throw requestFailure("token refresh", response);
+		const code = response.body.error === "invalid_grant" ? "invalid_grant" : "token_endpoint_error";
+		throw new OAuthTokenError(code, response.status, XAI_TOKEN_URL);
 	}
 	return credentialsFromTokenResponse(response.body, refreshToken);
 }

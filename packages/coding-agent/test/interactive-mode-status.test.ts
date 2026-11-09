@@ -261,6 +261,7 @@ describe("InteractiveMode.showExtensionCustom", () => {
 			editor,
 			editorContainer,
 			keybindings: {},
+			restoreEditorContainer: (InteractiveMode as any).prototype.restoreEditorContainer,
 			ui,
 			disposeActiveSelector: vi.fn(),
 			...extensionDialogState(),

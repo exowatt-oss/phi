@@ -1,4 +1,4 @@
-// Regression tests for Sol's phase 1a review (findings #1-#11) and the requested race tests.
+// Regression tests for the phase 1a review (findings #1-#11) and the requested race tests.
 import assert from "node:assert/strict";
 import { Type } from "typebox";
 import { Value } from "typebox/value";

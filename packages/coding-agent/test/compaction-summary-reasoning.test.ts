@@ -102,6 +102,28 @@ describe("generateSummary reasoning options", () => {
 		);
 	});
 
+	it("uses continuation-oriented boundaries for split-turn summaries", async () => {
+		const preparation: CompactionPreparation = {
+			firstKeptEntryId: "entry-keep",
+			messagesToSummarize: [],
+			turnPrefixMessages: messages,
+			isSplitTurn: true,
+			tokensBefore: 100,
+			fileOps: { read: new Set(), written: new Set(), edited: new Set() },
+			settings: { enabled: true, reserveTokens: 2000, keepRecentTokens: 20 },
+		};
+
+		const result = await compact(preparation, createModel(false), "test-key");
+
+		expect(completeSimpleMock).toHaveBeenCalledTimes(1);
+		expect(result.summary).toContain("Turn Context (split turn)");
+		const requestContext = completeSimpleMock.mock.calls[0][1] as TranscriptContext;
+		const prompt = JSON.stringify(requestContext.messages);
+		// Regression test for #9652: clear boundaries and continuation wording avoid the reasoning-extraction false positive.
+		expect(prompt).toContain("# Conversation\\n[User]: Summarize this.");
+		expect(prompt).toContain("# Instructions\\nThe messages above are earlier context from an ongoing conversation.");
+	});
+
 	it("uses fresh routing sessions without prompt caching", async () => {
 		await generateSummary(messages, createModel(false), undefined, "test-key");
 		await generateSummary(messages, createModel(false), undefined, "test-key");

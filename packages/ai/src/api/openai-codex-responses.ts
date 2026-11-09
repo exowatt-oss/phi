@@ -1,10 +1,5 @@
 import type * as NodeZlib from "node:zlib";
-import type {
-	Tool as OpenAITool,
-	ResponseCreateParamsStreaming,
-	ResponseInput,
-	ResponseStreamEvent,
-} from "openai/resources/responses/responses.js";
+import type { Tool as OpenAITool, ResponseInput, ResponseStreamEvent } from "openai/resources/responses/responses.js";
 import { clampThinkingLevel } from "../models.ts";
 import { registerSessionResourceCleanup } from "../session-resources.ts";
 import type {
@@ -45,6 +40,7 @@ import {
 	convertResponsesMessages,
 	convertResponsesTools,
 	getResponsesToolSupport,
+	type OpenAIResponsesServiceTier,
 	processResponsesStream,
 } from "./openai-responses-shared.ts";
 import { buildBaseOptions } from "./simple-options.ts";
@@ -83,7 +79,7 @@ const CODEX_RESPONSE_STATUSES = new Set<CodexResponseStatus>([
 export interface OpenAICodexResponsesOptions extends StreamOptions {
 	reasoningEffort?: "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 	reasoningSummary?: "auto" | "concise" | "detailed" | "off" | "on" | null;
-	serviceTier?: ResponseCreateParamsStreaming["service_tier"];
+	serviceTier?: OpenAIResponsesServiceTier;
 	textVerbosity?: "low" | "medium" | "high";
 	toolChoice?: "auto" | "none" | "required";
 }
@@ -102,7 +98,7 @@ interface RequestBody {
 	parallel_tool_calls?: boolean;
 	temperature?: number;
 	reasoning?: { effort?: string; summary?: string };
-	service_tier?: ResponseCreateParamsStreaming["service_tier"];
+	service_tier?: OpenAIResponsesServiceTier;
 	text?: { verbosity?: string };
 	include?: string[];
 	prompt_cache_key?: string;
@@ -532,6 +528,7 @@ export const streamSimple: StreamFunction<"openai-codex-responses", SimpleStream
 	return stream(model, context, {
 		...base,
 		reasoningEffort,
+		serviceTier: options?.serviceTier,
 	} satisfies OpenAICodexResponsesOptions);
 };
 
@@ -590,7 +587,10 @@ function buildRequestBody(
 	}
 
 	if (options?.serviceTier !== undefined) {
-		body.service_tier = options.serviceTier;
+		// The ChatGPT Codex endpoint uses the priority wire name for Fast mode.
+		// Keep the logical option unchanged so an explicit default response is
+		// still accounted for as a downgrade rather than a legacy priority echo.
+		body.service_tier = options.serviceTier === "fast" ? "priority" : options.serviceTier;
 	}
 
 	if (transcriptTools.requestTools.length > 0) {
@@ -623,13 +623,15 @@ function buildRequestBody(
 
 function getServiceTierCostMultiplier(
 	model: Pick<Model<"openai-codex-responses">, "id">,
-	serviceTier: ResponseCreateParamsStreaming["service_tier"] | undefined,
+	serviceTier: OpenAIResponsesServiceTier | undefined,
 ): number {
 	switch (serviceTier) {
 		case "flex":
 			return 0.5;
 		case "priority":
 			return model.id === "gpt-5.5" ? 2.5 : 2;
+		case "fast":
+			return 2;
 		default:
 			return 1;
 	}
@@ -637,7 +639,7 @@ function getServiceTierCostMultiplier(
 
 function applyServiceTierPricing(
 	usage: Usage,
-	serviceTier: ResponseCreateParamsStreaming["service_tier"] | undefined,
+	serviceTier: OpenAIResponsesServiceTier | undefined,
 	model: Pick<Model<"openai-codex-responses">, "id">,
 ) {
 	const multiplier = getServiceTierCostMultiplier(model, serviceTier);
@@ -651,9 +653,12 @@ function applyServiceTierPricing(
 }
 
 function resolveCodexServiceTier(
-	responseServiceTier: ResponseCreateParamsStreaming["service_tier"] | undefined,
-	requestServiceTier: ResponseCreateParamsStreaming["service_tier"] | undefined,
-): ResponseCreateParamsStreaming["service_tier"] | undefined {
+	responseServiceTier: OpenAIResponsesServiceTier | undefined,
+	requestServiceTier: OpenAIResponsesServiceTier | undefined,
+): OpenAIResponsesServiceTier | undefined {
+	if (requestServiceTier === "fast" && responseServiceTier === "priority") {
+		return "fast";
+	}
 	if (responseServiceTier === "default" && (requestServiceTier === "flex" || requestServiceTier === "priority")) {
 		return requestServiceTier;
 	}
@@ -1330,6 +1335,8 @@ async function* parseWebSocket(
 	socket: WebSocketLike,
 	signal?: AbortSignal,
 	idleTimeoutMs?: number,
+	onActivity?: () => void,
+	onActivityInstalled?: () => void,
 ): AsyncGenerator<Record<string, unknown>> {
 	const queue: Record<string, unknown>[] = [];
 	let pending: (() => void) | null = null;
@@ -1345,6 +1352,7 @@ async function* parseWebSocket(
 	};
 
 	const onMessage: WebSocketListener = (event) => {
+		onActivity?.();
 		void (async () => {
 			let text: string | null = null;
 			try {
@@ -1399,6 +1407,7 @@ async function* parseWebSocket(
 	socket.addEventListener("error", onError);
 	socket.addEventListener("close", onClose);
 	signal?.addEventListener("abort", onAbort);
+	onActivityInstalled?.();
 
 	try {
 		while (true) {
@@ -1565,7 +1574,13 @@ async function processWebSocketStream(
 		await processResponsesStream(
 			startWebSocketOutputOnFirstEvent(
 				mapCodexEvents(
-					parseWebSocket(socket, options?.signal, idleTimeoutMs),
+					parseWebSocket(
+						socket,
+						options?.signal,
+						idleTimeoutMs,
+						options?.onStreamActivity,
+						options?.onStreamActivityInstalled,
+					),
 					output,
 					model,
 					options?.onProviderStreamEvent,

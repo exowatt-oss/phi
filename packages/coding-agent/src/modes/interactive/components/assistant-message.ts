@@ -1,6 +1,7 @@
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { Container, Markdown, type MarkdownTheme, MouseRegion, Spacer, Text } from "@earendil-works/pi-tui";
 import type { MarkdownTransformer } from "../../../core/extensions/types.ts";
+import { formatRoutingTrailer, isAutoRouted } from "../../../core/routing.ts";
 import { getMarkdownTheme, theme } from "../theme/theme.ts";
 import { createMarkdownTransform } from "./markdown-transform.ts";
 
@@ -21,6 +22,8 @@ export class AssistantMessageComponent extends Container {
 	private lastMessage?: AssistantMessage;
 	private hasToolCalls = false;
 	private isStreaming = false;
+	private cachedRenderWidth?: number;
+	private cachedRenderLines?: string[];
 	private thinkingVisibilityOverrides = new Map<number, boolean>();
 
 	constructor(
@@ -78,17 +81,21 @@ export class AssistantMessageComponent extends Container {
 	}
 
 	override render(width: number): string[] {
-		const lines = super.render(width);
-		if (this.hasToolCalls || lines.length === 0) {
-			return lines;
-		}
+		if (this.cachedRenderLines && this.cachedRenderWidth === width) return this.cachedRenderLines;
 
-		lines[0] = OSC133_ZONE_START + lines[0];
-		lines[lines.length - 1] = OSC133_ZONE_END + OSC133_ZONE_FINAL + lines[lines.length - 1];
+		const lines = [...super.render(width)];
+		if (!this.hasToolCalls && lines.length > 0) {
+			lines[0] = OSC133_ZONE_START + lines[0];
+			lines[lines.length - 1] = OSC133_ZONE_END + OSC133_ZONE_FINAL + lines[lines.length - 1];
+		}
+		this.cachedRenderWidth = width;
+		this.cachedRenderLines = lines;
 		return lines;
 	}
 
 	updateContent(message: AssistantMessage, isStreaming = this.isStreaming): void {
+		this.cachedRenderWidth = undefined;
+		this.cachedRenderLines = undefined;
 		this.lastMessage = message;
 		this.isStreaming = isStreaming;
 
@@ -197,6 +204,19 @@ export class AssistantMessageComponent extends Container {
 				this.contentContainer.addChild(new Spacer(1));
 				this.contentContainer.addChild(new Text(theme.fg("error", `Error: ${errorMsg}`), this.outputPad, 0));
 			}
+		}
+
+		if (isAutoRouted(message) && message.stopReason !== "error" && message.stopReason !== "aborted") {
+			const routing = message.routing;
+			const trailer = formatRoutingTrailer(routing);
+			// Split the plain helper text around the served model so only that token is highlighted.
+			const head = `${routing.requestedModel} routed to `;
+			const rest = trailer.startsWith(head + routing.servedModel)
+				? trailer.slice(head.length + routing.servedModel.length)
+				: ` · ${trailer}`;
+			const themedTrailer =
+				theme.fg("dim", `⇢ ${head}`) + theme.bold(theme.fg("accent", routing.servedModel)) + theme.fg("dim", rest);
+			this.contentContainer.addChild(new Text(themedTrailer, this.outputPad, 0));
 		}
 	}
 }

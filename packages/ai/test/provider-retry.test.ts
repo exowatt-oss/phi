@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { retryProviderRequest } from "../src/utils/provider-retry.ts";
+import { retryProviderRequest, retryProviderRequestOnce } from "../src/utils/provider-retry.ts";
 
 function providerError(status: number | undefined, headers?: Record<string, string>): Error {
 	return Object.assign(new Error(`Provider error: ${status}`), {
@@ -34,6 +34,22 @@ describe("provider request retries", () => {
 		const request = vi.fn<() => Promise<string>>().mockRejectedValue(error);
 
 		await expect(retryProviderRequest(request, { maxRetries: 2 })).rejects.toBe(error);
+		expect(request).toHaveBeenCalledTimes(1);
+	});
+
+	it("waits once and makes exactly one request for a stream retry", async () => {
+		vi.useFakeTimers();
+		const initialError = providerError(503, { "retry-after-ms": "100" });
+		const finalError = providerError(503);
+		const request = vi.fn<() => Promise<string>>().mockRejectedValue(finalError);
+
+		const result = retryProviderRequestOnce(initialError, request);
+		const rejection = expect(result).rejects.toBe(finalError);
+		await vi.advanceTimersByTimeAsync(99);
+		expect(request).not.toHaveBeenCalled();
+		await vi.advanceTimersByTimeAsync(1);
+
+		await rejection;
 		expect(request).toHaveBeenCalledTimes(1);
 	});
 

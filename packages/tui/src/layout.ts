@@ -50,10 +50,22 @@ export interface ScrollbarGeometry {
 	maxScrollTop: number;
 }
 
+export type LayoutRenderCache = Map<Component, Map<number, string[]>>;
+
+export interface LayoutRenderOptions {
+	/** Callback for content/state changes that invalidate the render cache. */
+	requestRender?: () => void;
+	/** Callback for scroll-only changes that can reuse cached content lines. */
+	requestScrollRender?: () => void;
+	/** Cache shared by consecutive frames. Omit to use a one-frame cache. */
+	renderCache?: LayoutRenderCache;
+}
+
 interface LayoutContext {
 	viewport: { width: number; height: number };
-	renderCache: Map<Component, Map<number, string[]>>;
+	renderCache: LayoutRenderCache;
 	requestRender: () => void;
+	requestScrollRender: () => void;
 	primaryScrollView: ScrollView | undefined;
 }
 
@@ -147,7 +159,7 @@ function layoutComponent(
 		);
 		const contentHeight = childBox.rect.height;
 		const viewportHeight = height === undefined ? contentHeight : Math.max(0, Math.floor(height));
-		node.state.updateLayout(contentHeight, viewportHeight, context.requestRender);
+		node.state.updateLayout(contentHeight, viewportHeight, context.requestRender, context.requestScrollRender);
 		translateBox(childBox, previousScrollTop - node.state.scrollTop);
 		const scrollView = node.state as ScrollView;
 		if (node.state.primary || !context.primaryScrollView) context.primaryScrollView = scrollView;
@@ -328,6 +340,10 @@ function paintScrollbar(box: LayoutBox, screen: string[], totalWidth: number): v
 }
 
 function paintBox(box: LayoutBox, screen: string[], totalWidth: number): void {
+	// A long transcript's scroll child can be thousands of rows tall while its
+	// clip is only the viewport. Do not walk every off-screen row (or recurse
+	// into every off-screen message) on each scroll frame.
+	if (box.clip.width <= 0 || box.clip.height <= 0) return;
 	if (box.lines) {
 		const offset = box.lineOffset ?? 0;
 		const firstRow = Math.max(box.rect.y, box.clip.y, 0);
@@ -381,13 +397,15 @@ export function renderLayoutFrame(
 	width: number,
 	height: number,
 	requestRender: () => void,
+	options: LayoutRenderOptions = {},
 ): LayoutFrame {
 	const safeWidth = Math.max(1, Math.floor(width));
 	const safeHeight = Math.max(1, Math.floor(height));
 	const context: LayoutContext = {
 		viewport: { width: safeWidth, height: safeHeight },
-		renderCache: new Map(),
-		requestRender,
+		renderCache: options.renderCache ?? new Map(),
+		requestRender: options.requestRender ?? requestRender,
+		requestScrollRender: options.requestScrollRender ?? requestRender,
 		primaryScrollView: undefined,
 	};
 	const rootBox = layoutComponent(context, root, 0, 0, safeWidth, safeHeight, {

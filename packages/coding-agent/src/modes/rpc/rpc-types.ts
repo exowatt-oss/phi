@@ -7,11 +7,34 @@
 
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { ImageContent, Model } from "@earendil-works/pi-ai";
+import { getSupportedThinkingLevels, type ServiceTier } from "@earendil-works/pi-ai";
 import type { PromptDisposition, QueuedInputDisposition, SessionStats } from "../../core/agent-session.ts";
 import type { BashResult } from "../../core/bash-executor.ts";
 import type { CompactionResult } from "../../core/compaction/index.ts";
+import { getSupportedServiceTiers } from "../../core/service-tier.ts";
 import type { SessionEntry, SessionTreeNode } from "../../core/session-manager.ts";
 import type { SourceInfo } from "../../core/source-info.ts";
+
+/**
+ * A model as `get_available_models` reports it: the full {@link Model} plus the
+ * thinking levels it actually supports.
+ *
+ * The raw `Model` only carries `thinkingLevelMap`, whose semantics (an absent
+ * key means supported for `off`..`high` but unsupported for `xhigh`/`max`, an
+ * explicit `null` means unsupported) every host would otherwise have to
+ * reimplement. Hosts that did not reimplement them offered every level in their
+ * picker, including ones the provider rejects.
+ */
+export type RpcModelInfo = Model<any> & { thinkingLevels: ThinkingLevel[]; serviceTiers: readonly ServiceTier[] };
+
+/** Decorate a catalog model for the wire. See {@link RpcModelInfo}. */
+export function toRpcModelInfo(model: Model<any>): RpcModelInfo {
+	return {
+		...model,
+		thinkingLevels: getSupportedThinkingLevels(model) as ThinkingLevel[],
+		serviceTiers: getSupportedServiceTiers(model),
+	};
+}
 
 // ============================================================================
 // RPC Commands (stdin)
@@ -30,9 +53,10 @@ export type RpcCommand =
 	| { id?: string; type: "get_state" }
 
 	// Model
-	| { id?: string; type: "set_model"; provider: string; modelId: string }
+	| { id?: string; type: "set_model"; provider: string; modelId: string; persist?: boolean }
 	| { id?: string; type: "cycle_model" }
-	| { id?: string; type: "get_available_models" }
+	| { id?: string; type: "get_available_models"; scope?: "configured" | "all" }
+	| { id?: string; type: "set_service_tier"; tier: ServiceTier }
 
 	// Thinking
 	| { id?: string; type: "set_thinking_level"; level: ThinkingLevel }
@@ -96,6 +120,7 @@ export interface RpcSlashCommand {
 export interface RpcSessionState {
 	model?: Model<any>;
 	thinkingLevel: ThinkingLevel;
+	serviceTier?: ServiceTier;
 	isStreaming: boolean;
 	isCompacting: boolean;
 	steeringMode: "all" | "one-at-a-time";
@@ -157,8 +182,9 @@ export type RpcResponse =
 			type: "response";
 			command: "get_available_models";
 			success: true;
-			data: { models: Model<any>[] };
+			data: { models: RpcModelInfo[] };
 	  }
+	| { id?: string; type: "response"; command: "set_service_tier"; success: true; data: { serviceTier: ServiceTier } }
 
 	// Thinking
 	| { id?: string; type: "response"; command: "set_thinking_level"; success: true }

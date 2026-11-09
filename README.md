@@ -1,77 +1,53 @@
 <p align="center">
-  <a href="https://pi.dev">
-    <img alt="pi logo" src="https://pi.dev/logo-auto.svg" width="128">
+  <a href="https://github.com/exowatt-oss/phi">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="docs/assets/phi-logo.svg">
+      <img alt="phi logo" src="docs/assets/phi-logo-light.svg" width="128">
+    </picture>
   </a>
 </p>
-<p align="center">
-  <a href="https://discord.com/invite/3cU7Bz4UPx"><img alt="Discord" src="https://img.shields.io/badge/discord-community-5865F2?style=flat-square&logo=discord&logoColor=white" /></a>
-  <a href="https://www.npmjs.com/package/@earendil-works/pi-coding-agent"><img alt="npm" src="https://img.shields.io/npm/v/@earendil-works/pi-coding-agent?style=flat-square" /></a>
-</p>
 
-> New issues and PRs from new contributors are auto-closed by default. Maintainers review auto-closed issues daily. See [CONTRIBUTING.md](CONTRIBUTING.md).
+# phi
 
-# Pi
+![Status: maintained](https://img.shields.io/badge/status-maintained-brightgreen) ![License: MIT](https://img.shields.io/badge/license-MIT-blue)
 
-Pi is a minimal, extensible agent harness that you can make your own.
+Created at [Exowatt](https://exowatt.com). phi is a minimal, extensible agent harness that you can make your own.
 
-Adapt Pi to your workflows, not the other way around. Customize Pi with [extensions](packages/coding-agent/docs/extensions.md), [skills](packages/coding-agent/docs/skills.md), [prompt templates](packages/coding-agent/docs/prompt-templates.md), and [themes](packages/coding-agent/docs/themes.md). Bundle them as [Pi packages](packages/coding-agent/docs/packages.md) and share via npm or git.
+## About this fork
 
-Pi ships with powerful defaults but skips features like sub-agents and plan mode. Ask Pi to build what you want, or install a package that does it your way.
+phi is an MIT-licensed fork of [Pi by Mario Zechner](https://github.com/earendil-works/pi), maintained by Exowatt. It adds remote sessions, MCP, a configurable hub client, subagents, and workspace-state extensions. No Exowatt services or private hub bundles are required. Upstream retains its copyright; see [LICENSE](LICENSE) and [NOTICE](NOTICE). This repository is not endorsed by the upstream maintainers.
 
-Use Pi [interactively](packages/coding-agent/docs/usage.md), automate it in [print or JSON mode](packages/coding-agent/docs/cli.md), control it over [RPC](packages/coding-agent/docs/rpc.md), or build apps with the [Pi TypeScript SDK](packages/coding-agent/docs/sdk.md). See [OpenClaw](https://github.com/OpenClaw/OpenClaw) for a real-world integration.
+Adapt phi to your workflows, not the other way around. Customize phi with [extensions](packages/coding-agent/docs/extensions.md), [skills](packages/coding-agent/docs/skills.md), [prompt templates](packages/coding-agent/docs/prompt-templates.md), and [themes](packages/coding-agent/docs/themes.md). Bundle them as [packages](packages/coding-agent/docs/packages.md) and share via Git or a registry you control. This fork's workspace packages are private to prevent publication under the upstream npm scope.
+
+Ask phi to build what you want, or install an extension that does it your way.
+
+Use phi [interactively](packages/coding-agent/docs/usage.md), automate it in [print or JSON mode](packages/coding-agent/docs/cli.md), control it over [RPC](packages/coding-agent/docs/rpc.md), or build apps with the [TypeScript SDK](packages/coding-agent/docs/sdk.md). See [OpenClaw](https://github.com/OpenClaw/OpenClaw) for a real-world integration.
 
 ## Getting started
 
-Install the command-line interface:
+Node.js 22.19 or newer and npm are required. Clone this repository and build from source; do **not** use pi.dev's installers or the upstream npm package to install this fork.
 
 ```bash
-curl -fsSL https://pi.dev/install.sh | sh
+git clone https://github.com/exowatt-oss/phi.git
+cd phi
+npm ci --ignore-scripts
+npm run build:offline
+./pi-test.sh --no-env
 ```
 
-On Windows:
+`./pi-test.sh --no-env` launches phi without ambient API keys for a safe first run. For regular use with your configured keys, run `node packages/coding-agent/dist/bundle/cli.js`. Run `/login` to connect a built-in provider. phi starts with no Exowatt services configured.
 
-```shell
-powershell -c "irm https://pi.dev/install.ps1 | iex"
-```
+## Configuration
 
-The installer pins all dependencies and updates Pi with `pi update`. Alternatively, install directly with npm, which does not pin transitive dependencies:
-
-```bash
-npm install -g --ignore-scripts @earendil-works/pi-coding-agent
-```
-
-Pi requires Node.js 22.19 or newer. The macOS, Linux, and Windows installers can install it if needed. Pi does not require dependency lifecycle scripts for a normal npm installation.
-
-Start Pi in the directory where you want it to work:
-
-```bash
-cd /path/to/project
-pi
-```
-
-For a built-in AI provider, run `/login` inside Pi to connect a subscription or API key. Then give Pi a task.
-
-See the [documentation](https://pi.dev/docs/latest) for full setup and usage instructions, or [visit pi.dev](https://pi.dev) for demos.
+The optional hub uses `PHI_HUB_URL` (default `http://127.0.0.1:8787`); run your own server or configure a reachable hub before `/hub login`. The optional Feads integration uses `FEADS_URL` (default `http://127.0.0.1:8788`) and requires its own token; without credentials it sends no presence events. The optional binary updater is for self-hosted release feeds only: `PHI_UPDATE_BASE_URL` defaults to localhost, and `autoUpdate` is off by default. A feed must serve `versions.json`, the per-release binary archives and `phi-install.sh`; installed binaries need a local `phi-version.json` alongside them. This public source checkout does not ship an installer or a hosted feed. Source builds should update through Git instead. LLM providers use your own API keys or `models.json`; there is no preconfigured company gateway. A self-hosted provider named `gateway` can opt into LiteLLM `auto` response metadata. `phi auth token` reads only `PHI_AUTH_TOKEN_PROVIDER` (default `gateway`) and uses `PHI_AUTH_TOKEN_BASE_URL` (default `http://127.0.0.1:8790`); it does not fetch credentials. See [settings](packages/coding-agent/docs/settings.md) and [provider models](packages/coding-agent/docs/models.md).
 
 ## Run with Nix
 
-```bash
-nix run github:earendil-works/pi/stable
-```
-
-`stable` points at the latest release. Install it with `nix profile add github:earendil-works/pi/stable` and update with `nix profile upgrade pi`. Use a release tag such as `github:earendil-works/pi/v1.0.0` to pin a version, or `github:earendil-works/pi` for unreleased changes on `main`. Nix builds Pi from source.
-
-Supports ARM64 and x86-64 on Linux and macOS. Use `nix build .` or `nix run .` to build or run your checkout.
-
-Nix builds are offline, so the bundled model data comes from a pi.dev model catalog revision pinned in `nix/model-catalog.json`. At runtime, Pi still overlays newer catalog data from pi.dev as usual. The Nix workflow replaces the pin on `main` when it no longer matches the checkout, for example after a provider is added or gains a new model type. To refresh it by hand:
-
-```bash
-npm run update:model-catalog-pin
-```
+In a local checkout, `nix build .` and `nix run .` can build and run the fork. The pinned public model catalog is in `nix/model-catalog.json`. This is separate from upstream's `stable` release channel.
 
 ## Packages
 
-This monorepo contains the Pi CLI and its supporting libraries.
+This monorepo contains the phi CLI and its supporting libraries.
 
 | Package | Description |
 |---------|-------------|
@@ -83,29 +59,28 @@ This monorepo contains the Pi CLI and its supporting libraries.
 | **[@earendil-works/pi-coding-agent](packages/coding-agent)** | Interactive coding agent CLI |
 | **[@earendil-works/pi-tui](packages/tui)** | Terminal UI library with differential rendering |
 
-For Slack/chat automation and workflows see [earendil-works/pi-chat](https://github.com/earendil-works/pi-chat).
+For upstream Slack/chat automation and workflows see [earendil-works/pi-chat](https://github.com/earendil-works/pi-chat).
 
 ## Permissions & Containerization
 
-Pi does not include a built-in permission system for restricting filesystem, process, network, or credential access. By default, it runs with the permissions of the user and process that launched it.
+phi does not include a built-in permission system for restricting filesystem, process, network, or credential access. By default, it runs with the permissions of the user and process that launched it.
 
-If you need stronger boundaries, containerize or sandbox Pi. See [packages/coding-agent/docs/containerization.md](packages/coding-agent/docs/containerization.md) for three patterns:
+If you need stronger boundaries, containerize or sandbox phi. See [packages/coding-agent/docs/containerization.md](packages/coding-agent/docs/containerization.md) for three patterns:
 
-- **Gondolin extension**: keep `pi` and provider auth on the host while routing built-in tools and `!` commands into a local Linux micro-VM.
-- **Plain Docker**: run the whole `pi` process in a local container for simple isolation.
-- **OpenShell**: run the whole `pi` process in a policy-controlled sandbox.
+- **Gondolin extension**: keep `phi` and provider auth on the host while routing built-in tools and `!` commands into a local Linux micro-VM.
+- **Plain Docker**: run the whole `phi` process in a local container for simple isolation.
+- **OpenShell**: run the whole `phi` process in a policy-controlled sandbox.
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidelines and [AGENTS.md](AGENTS.md) for project-specific rules (for both humans and agents).  Longer term plans for Pi can also be found in [RFCs](https://rfc.earendil.com/keyword/pi/).
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the DCO contribution workflow and [AGENTS.md](AGENTS.md) for development commands. Upstream Pi plans are in its [RFCs](https://rfc.earendil.com/keyword/pi/).
 
 ## Development
 
 ```bash
 npm install --ignore-scripts  # Install all dependencies without running lifecycle scripts
-npm run build         # Refresh model data, then build all packages
-npm run build:offline # Rebuild using existing model data without network access
-npm run check         # Lint, format, and type check
+npm run build:offline # Build all packages with committed model data
+npm run check         # Lint, format, and type check (see AGENTS.md)
 ./test.sh            # Run tests (skips LLM-dependent tests without API keys)
 ./pi-test.sh         # Run pi from sources (can be run from any directory)
 ```
@@ -154,16 +129,13 @@ the consumer. Re-run both commands after changing Pi source.
 
 ## Building standalone binaries from release source
 
-GitHub releases include a versioned source archive covered by the release's `SHA256SUMS` file. Extract it and run the same build script used for the official standalone binaries:
+From a tagged checkout with the committed model data, build a standalone binary locally:
 
 ```bash
-VERSION="<release-version>"
-tar -xzf "pi-${VERSION}-source.tar.gz"
-cd "pi-${VERSION}"
 ./scripts/build-binaries.sh --offline-model-data --platform linux-x64 --out "$PWD/out"
 ```
 
-The archive includes release model data and native prebuilds. `--offline-model-data` uses that model data without refreshing provider catalogs. The script installs dependencies and builds the executable with its runtime assets; pass `--skip-install` if dependencies are already provided.
+`--offline-model-data` uses the committed model data without refreshing provider catalogs. The script installs dependencies and builds with runtime assets; pass `--skip-install` if dependencies are already provided.
 
 ## Supply-chain hardening
 
@@ -173,34 +145,16 @@ We treat npm dependency changes as reviewed code changes.
 - `.npmrc` sets `save-exact=true` and `min-release-age=2` to avoid same-day dependency releases during npm resolution.
 - `package-lock.json` is the dependency ground truth. Pre-commit blocks accidental lockfile commits unless `PI_ALLOW_LOCKFILE_CHANGE=1` is set.
 - `npm run check` verifies pinned direct deps, native TypeScript import compatibility, and the generated coding-agent install lock.
-- The pi.dev installer installs from `packages/coding-agent/install-lock/`, generated from the root lockfile, to pin transitive deps. The npm package does not pin transitive deps.
-- Local release smoke tests and npm publication use the same tarball packer; npm publishes the validated tarballs rather than repacking workspace directories.
-- Local release installs, documented npm installs, and `pi update --self` use `--ignore-scripts` where supported.
-- CI installs with `npm ci --ignore-scripts`, and a scheduled GitHub workflow runs `npm audit --omit=dev` plus `npm audit signatures --omit=dev`.
+- `packages/coding-agent/install-lock/` records the dependency closure; this fork is built from source.
+- Local release smoke tests use the same tarball packer. No npm publication is configured for this fork.
+- Local release installs use `--ignore-scripts` where supported.
+- CI installs with `npm ci --ignore-scripts`.
 - Install lock generation has an explicit allowlist for dependency lifecycle scripts; new lifecycle-script deps fail checks until reviewed.
-
-## Share your OSS coding agent sessions
-
-If you use Pi or other coding agents for open source work, please share your sessions.
-
-Public OSS session data helps improve coding agents with real-world tasks, tool use, failures, and fixes instead of toy benchmarks.
-
-For the full explanation, see [this post on X](https://x.com/badlogicgames/status/2037811643774652911).
-
-To publish sessions, use [`badlogic/pi-share-hf`](https://github.com/badlogic/pi-share-hf). Read its README.md for setup instructions. All you need is a Hugging Face account, the Hugging Face CLI, and `pi-share-hf`.
-
-You can also watch [this video](https://x.com/badlogicgames/status/2041151967695634619), where I show how I publish my `pi-mono` sessions.
-
-I regularly publish my own `pi-mono` work sessions here:
-
-- [badlogicgames/pi-mono on Hugging Face](https://huggingface.co/datasets/badlogicgames/pi-mono)
 
 ## License
 
-MIT
+MIT. Upstream Pi by Mario Zechner and Exowatt's modifications retain the MIT terms in [LICENSE](LICENSE); attribution and dependency notes are in [NOTICE](NOTICE).
 
-<p align="center">
-  <a href="https://pi.dev">pi.dev</a> domain graciously donated by
-  <br /><br />
-  <a href="https://exe.dev"><img src="packages/coding-agent/docs/images/exy.png" alt="Exy mascot" width="48" /><br />exe.dev</a>
-</p>
+## Security
+
+Report vulnerabilities through [GitHub private vulnerability reporting](https://github.com/exowatt-oss/phi/security/advisories/new). See [SECURITY.md](SECURITY.md); do not open a public issue.

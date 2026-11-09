@@ -1,3 +1,4 @@
+import { DEFAULT_STREAM_IDLE_TIMEOUT_MS, MAX_STREAM_IDLE_TIMEOUT_MS } from "@earendil-works/pi-ai";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
@@ -410,6 +411,34 @@ describe("SettingsManager", () => {
 		});
 	});
 
+	describe("streamIdleTimeoutMs", () => {
+		it("defaults to 420 seconds", () => {
+			const manager = SettingsManager.create(projectDir, agentDir);
+			expect(manager.getStreamIdleTimeoutMs()).toBe(DEFAULT_STREAM_IDLE_TIMEOUT_MS);
+		});
+
+		it("supports project overrides and zero to disable", () => {
+			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ streamIdleTimeoutMs: 240000 }));
+			writeFileSync(join(projectDir, ".pi", "settings.json"), JSON.stringify({ streamIdleTimeoutMs: 0 }));
+
+			const manager = SettingsManager.create(projectDir, agentDir);
+			expect(manager.getStreamIdleTimeoutMs()).toBe(0);
+		});
+
+		it("rejects invalid values and timer-overflow values", () => {
+			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ streamIdleTimeoutMs: -1 }));
+			let manager = SettingsManager.create(projectDir, agentDir);
+			expect(() => manager.getStreamIdleTimeoutMs()).toThrow("Invalid streamIdleTimeoutMs setting");
+
+			writeFileSync(
+				join(agentDir, "settings.json"),
+				JSON.stringify({ streamIdleTimeoutMs: MAX_STREAM_IDLE_TIMEOUT_MS + 1 }),
+			);
+			manager = SettingsManager.create(projectDir, agentDir);
+			expect(() => manager.getStreamIdleTimeoutMs()).toThrow(`exceeds maximum ${MAX_STREAM_IDLE_TIMEOUT_MS}`);
+		});
+	});
+
 	describe("cacheWarming", () => {
 		it("defaults to streaming and ignores project settings", () => {
 			expect(SettingsManager.create(projectDir, agentDir).getCacheWarmingMode()).toBe("streaming");
@@ -477,6 +506,83 @@ describe("SettingsManager", () => {
 		});
 	});
 
+	describe("serviceTier", () => {
+		it("defaults to standard processing and persists valid tiers", async () => {
+			const manager = SettingsManager.create(projectDir, agentDir);
+			expect(manager.getServiceTier()).toBe("default");
+
+			manager.setServiceTier("fast");
+			await manager.flush();
+
+			expect(manager.getServiceTier()).toBe("fast");
+			expect(JSON.parse(readFileSync(join(agentDir, "settings.json"), "utf-8")).serviceTier).toBe("fast");
+		});
+
+		it("persists an explicit ultrafast tier", async () => {
+			const manager = SettingsManager.create(projectDir, agentDir);
+			manager.setServiceTier("ultrafast");
+			await manager.flush();
+
+			expect(SettingsManager.create(projectDir, agentDir).getServiceTier()).toBe("ultrafast");
+		});
+
+		it("falls back to default for unsupported values", () => {
+			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ serviceTier: "priority" }));
+			expect(SettingsManager.create(projectDir, agentDir).getServiceTier()).toBe("default");
+		});
+
+		it("keeps explicit fast aliases fast when the default tier is standard", () => {
+			const manager = SettingsManager.create(projectDir, agentDir);
+			expect(manager.getServiceTierForModel("example-medium-fast")).toBe("fast");
+			expect(manager.getServiceTierForModel("example-medium")).toBe("default");
+		});
+	});
+
+	describe("compaction model", () => {
+		let previousTuiMode: string | undefined;
+		let previousContextBudget: string | undefined;
+
+		beforeEach(() => {
+			previousTuiMode = process.env.PI_TUI_MODE;
+			previousContextBudget = process.env.PI_CONTEXT_BUDGET;
+			process.env.PI_TUI_MODE = "1";
+			delete process.env.PI_CONTEXT_BUDGET;
+		});
+
+		afterEach(() => {
+			if (previousTuiMode === undefined) delete process.env.PI_TUI_MODE;
+			else process.env.PI_TUI_MODE = previousTuiMode;
+			if (previousContextBudget === undefined) delete process.env.PI_CONTEXT_BUDGET;
+			else process.env.PI_CONTEXT_BUDGET = previousContextBudget;
+		});
+
+		it("prefers an explicit model", () => {
+			const manager = SettingsManager.inMemory({ compaction: { model: "openai/gpt-5:low" } });
+
+			expect(manager.getCompactionModel("anthropic")).toBe("openai/gpt-5:low");
+		});
+
+		it("defaults to Anthropic Sonnet 5 at low thinking in TUI mode", () => {
+			const manager = SettingsManager.inMemory();
+
+			expect(manager.getCompactionModel("anthropic")).toBe("anthropic/claude-sonnet-5:low");
+		});
+
+		it("defaults to gateway Sonnet at low thinking for other providers in TUI mode", () => {
+			const manager = SettingsManager.inMemory();
+
+			expect(manager.getCompactionModel("openai")).toBeUndefined();
+		});
+
+		it("keeps the unset model undefined when context-aware compaction is off", () => {
+			delete process.env.PI_TUI_MODE;
+			delete process.env.PI_CONTEXT_BUDGET;
+			const manager = SettingsManager.inMemory();
+
+			expect(manager.getCompactionModel("anthropic")).toBeUndefined();
+		});
+	});
+
 	describe("TUI mode", () => {
 		it("defaults to fullscreen and persists regular mode", async () => {
 			const manager = SettingsManager.create(projectDir, agentDir);
@@ -499,12 +605,15 @@ describe("SettingsManager", () => {
 			expect(manager.getTuiMode()).toBe("fullscreen");
 		});
 
-		it("does not recognize the old uiMode setting", () => {
+		it("reads the legacy uiMode setting as a fallback (phi)", () => {
 			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ uiMode: "regular" }));
+			expect(SettingsManager.create(projectDir, agentDir).getTuiMode()).toBe("regular");
 
-			const manager = SettingsManager.create(projectDir, agentDir);
+			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ uiMode: "fullscreen" }));
+			expect(SettingsManager.create(projectDir, agentDir).getTuiMode()).toBe("fullscreen");
 
-			expect(manager.getTuiMode()).toBe("fullscreen");
+			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ uiMode: "regular", tuiMode: "fullscreen" }));
+			expect(SettingsManager.create(projectDir, agentDir).getTuiMode()).toBe("fullscreen");
 		});
 	});
 
@@ -541,6 +650,17 @@ describe("SettingsManager", () => {
 		manager.setFullscreenWheelScrollLines(3);
 		await manager.flush();
 		expect(JSON.parse(readFileSync(join(agentDir, "settings.json"), "utf-8")).fullscreenWheelScrollLines).toBe(3);
+
+		// The setter clamps before persisting (phi: the /settings row writes through it).
+		manager.setFullscreenWheelScrollLines(0);
+		await manager.flush();
+		expect(manager.getFullscreenWheelScrollLines()).toBe(1);
+		expect(JSON.parse(readFileSync(join(agentDir, "settings.json"), "utf-8")).fullscreenWheelScrollLines).toBe(1);
+
+		manager.setFullscreenWheelScrollLines(250.9);
+		await manager.flush();
+		expect(manager.getFullscreenWheelScrollLines()).toBe(100);
+		expect(JSON.parse(readFileSync(join(agentDir, "settings.json"), "utf-8")).fullscreenWheelScrollLines).toBe(100);
 
 		for (const [value, expected] of [
 			[7.9, 7],
@@ -743,6 +863,283 @@ describe("SettingsManager", () => {
 			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ shellPath: "~" }));
 			const manager = SettingsManager.create(projectDir, agentDir);
 			expect(manager.getShellPath()).toBe(homedir());
+		});
+	});
+
+	describe("btw settings", () => {
+		it("getBtwModel returns undefined when not set", () => {
+			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ theme: "dark" }));
+			const manager = SettingsManager.create(projectDir, agentDir);
+			expect(manager.getBtwModel()).toBeUndefined();
+		});
+
+		it("getBtwModel returns the configured model ref", () => {
+			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ btw: { model: "gateway/example-medium" } }));
+			const manager = SettingsManager.create(projectDir, agentDir);
+			expect(manager.getBtwModel()).toBe("gateway/example-medium");
+		});
+
+		it("getBtwPersist defaults to true", () => {
+			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({}));
+			const manager = SettingsManager.create(projectDir, agentDir);
+			expect(manager.getBtwPersist()).toBe(true);
+		});
+
+		it("getBtwPersist returns false when explicitly disabled", () => {
+			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ btw: { persist: false } }));
+			const manager = SettingsManager.create(projectDir, agentDir);
+			expect(manager.getBtwPersist()).toBe(false);
+		});
+
+		it("getBtwMaxHistory defaults to 20", () => {
+			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({}));
+			const manager = SettingsManager.create(projectDir, agentDir);
+			expect(manager.getBtwMaxHistory()).toBe(20);
+		});
+
+		it("getBtwMaxHistory returns configured value", () => {
+			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ btw: { maxHistory: 5 } }));
+			const manager = SettingsManager.create(projectDir, agentDir);
+			expect(manager.getBtwMaxHistory()).toBe(5);
+		});
+
+		it("getBtwMaxHistory clamps to 1 at minimum", () => {
+			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ btw: { maxHistory: 0 } }));
+			const manager = SettingsManager.create(projectDir, agentDir);
+			expect(manager.getBtwMaxHistory()).toBe(1);
+		});
+
+		it("getBtwMaxHistory clamps to 100 at maximum", () => {
+			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ btw: { maxHistory: 999 } }));
+			const manager = SettingsManager.create(projectDir, agentDir);
+			expect(manager.getBtwMaxHistory()).toBe(100);
+		});
+
+		it("setBtwModel persists to settings file", async () => {
+			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ theme: "dark" }));
+			const manager = SettingsManager.create(projectDir, agentDir);
+			manager.setBtwModel("gateway/example-medium:medium");
+			await manager.flush();
+			const saved = JSON.parse(readFileSync(join(agentDir, "settings.json"), "utf-8"));
+			expect(saved.btw.model).toBe("gateway/example-medium:medium");
+			expect(saved.theme).toBe("dark"); // preserved
+		});
+
+		it("setBtwPersist persists to settings file", async () => {
+			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({}));
+			const manager = SettingsManager.create(projectDir, agentDir);
+			manager.setBtwPersist(false);
+			await manager.flush();
+			const saved = JSON.parse(readFileSync(join(agentDir, "settings.json"), "utf-8"));
+			expect(saved.btw.persist).toBe(false);
+		});
+
+		it("setBtwMaxHistory clamps and persists", async () => {
+			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({}));
+			const manager = SettingsManager.create(projectDir, agentDir);
+			manager.setBtwMaxHistory(50);
+			await manager.flush();
+			const saved = JSON.parse(readFileSync(join(agentDir, "settings.json"), "utf-8"));
+			expect(saved.btw.maxHistory).toBe(50);
+		});
+
+		it("btw settings merge with project overrides", () => {
+			writeFileSync(
+				join(agentDir, "settings.json"),
+				JSON.stringify({ btw: { model: "anthropic/claude-opus", persist: true } }),
+			);
+			writeFileSync(join(projectDir, ".pi", "settings.json"), JSON.stringify({ btw: { persist: false } }));
+			const manager = SettingsManager.create(projectDir, agentDir);
+			// Project overrides persist, global model is preserved
+			expect(manager.getBtwPersist()).toBe(false);
+			expect(manager.getBtwModel()).toBe("anthropic/claude-opus");
+		});
+	});
+
+	describe("loop settings", () => {
+		it("returns defaults when unset", () => {
+			const manager = SettingsManager.create(projectDir, agentDir);
+			expect(manager.getLoopMaxIterations()).toBe(12);
+			expect(manager.getLoopMaxWallTimeMs()).toBe(7_200_000);
+			expect(manager.getLoopMaxCostUsd()).toBeUndefined();
+			expect(manager.getLoopCheckTimeoutMs()).toBe(600_000);
+			expect(manager.getLoopEvaluatorModel()).toBeUndefined();
+			expect(manager.getLoopEvaluatorConfidence()).toBe(0.85);
+			expect(manager.getLoopMaxCheckOutputBytes()).toBe(65_536);
+		});
+
+		it("respects explicit values", () => {
+			writeFileSync(
+				join(agentDir, "settings.json"),
+				JSON.stringify({
+					loop: {
+						maxIterations: 8,
+						maxWallTimeMs: 30_000,
+						maxCostUsd: 2.5,
+						checkTimeoutMs: 15_000,
+						evaluatorModel: "openai/gpt-5",
+						evaluatorConfidence: 0.9,
+						maxCheckOutputBytes: 32_768,
+					},
+				}),
+			);
+			const manager = SettingsManager.create(projectDir, agentDir);
+			expect(manager.getLoopMaxIterations()).toBe(8);
+			expect(manager.getLoopMaxWallTimeMs()).toBe(30_000);
+			expect(manager.getLoopMaxCostUsd()).toBe(2.5);
+			expect(manager.getLoopCheckTimeoutMs()).toBe(15_000);
+			expect(manager.getLoopEvaluatorModel()).toBe("openai/gpt-5");
+			expect(manager.getLoopEvaluatorConfidence()).toBe(0.9);
+			expect(manager.getLoopMaxCheckOutputBytes()).toBe(32_768);
+		});
+
+		it("clamps iteration and wall-time values while leaving cost uncapped", () => {
+			writeFileSync(
+				join(agentDir, "settings.json"),
+				JSON.stringify({
+					loop: {
+						maxIterations: 500,
+						maxWallTimeMs: 100_000_000,
+						maxCostUsd: 1000,
+						checkTimeoutMs: 100_000_000,
+						evaluatorConfidence: 2,
+						maxCheckOutputBytes: 2_000_000,
+					},
+				}),
+			);
+			const manager = SettingsManager.create(projectDir, agentDir);
+			expect(manager.getLoopMaxIterations()).toBe(100);
+			expect(manager.getLoopMaxWallTimeMs()).toBe(86_400_000);
+			expect(manager.getLoopMaxCostUsd()).toBe(1000);
+			expect(manager.getLoopCheckTimeoutMs()).toBe(86_400_000);
+			expect(manager.getLoopEvaluatorConfidence()).toBe(1);
+			expect(manager.getLoopMaxCheckOutputBytes()).toBe(1_048_576);
+		});
+
+		it("falls back to defaults for invalid types", () => {
+			writeFileSync(
+				join(agentDir, "settings.json"),
+				JSON.stringify({
+					loop: {
+						maxIterations: "many",
+						maxWallTimeMs: null,
+						maxCostUsd: "ten",
+						checkTimeoutMs: {},
+						evaluatorModel: 42,
+						evaluatorConfidence: false,
+						maxCheckOutputBytes: [],
+					},
+				}),
+			);
+			const manager = SettingsManager.create(projectDir, agentDir);
+			expect(manager.getLoopMaxIterations()).toBe(12);
+			expect(manager.getLoopMaxWallTimeMs()).toBe(7_200_000);
+			expect(manager.getLoopMaxCostUsd()).toBeUndefined();
+			expect(manager.getLoopCheckTimeoutMs()).toBe(600_000);
+			expect(manager.getLoopEvaluatorModel()).toBeUndefined();
+			expect(manager.getLoopEvaluatorConfidence()).toBe(0.85);
+			expect(manager.getLoopMaxCheckOutputBytes()).toBe(65_536);
+		});
+
+		it("merges project values over global values", () => {
+			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ loop: { maxIterations: 20, maxCostUsd: 5 } }));
+			writeFileSync(join(projectDir, ".pi", "settings.json"), JSON.stringify({ loop: { maxIterations: 4 } }));
+			const manager = SettingsManager.create(projectDir, agentDir);
+			expect(manager.getLoopMaxIterations()).toBe(4);
+			expect(manager.getLoopMaxCostUsd()).toBe(5);
+		});
+
+		it("persists setter values", async () => {
+			const manager = SettingsManager.create(projectDir, agentDir);
+			manager.setLoopMaxIterations(7);
+			manager.setLoopEvaluatorModel("openai/gpt-5");
+			await manager.flush();
+			const saved = JSON.parse(readFileSync(join(agentDir, "settings.json"), "utf-8"));
+			expect(saved.loop.maxIterations).toBe(7);
+			expect(saved.loop.evaluatorModel).toBe("openai/gpt-5");
+		});
+	});
+
+	describe("errorFallback", () => {
+		it("defaults to enabled and non-sticky", () => {
+			const manager = SettingsManager.create(projectDir, agentDir);
+			const settings = manager.getErrorFallbackSettings();
+			expect(settings.enabled).toBe(false);
+			expect(settings.sticky).toBe(false);
+			expect(settings.chain).toEqual([]);
+		});
+
+		it("honours an explicit sticky", () => {
+			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ errorFallback: { sticky: true } }));
+			const manager = SettingsManager.create(projectDir, agentDir);
+			expect(manager.getErrorFallbackSettings().sticky).toBe(true);
+		});
+
+		it("is off by default when a host UI owns model selection", () => {
+			const manager = SettingsManager.create(projectDir, agentDir);
+			manager.setHostManagedModelSelection(true);
+			expect(manager.getErrorFallbackSettings().enabled).toBe(false);
+		});
+
+		it("stays on for a host UI when settings enable it explicitly", () => {
+			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ errorFallback: { enabled: true } }));
+			const manager = SettingsManager.create(projectDir, agentDir);
+			manager.setHostManagedModelSelection(true);
+			expect(manager.getErrorFallbackSettings().enabled).toBe(true);
+		});
+
+		it("stays off for a host UI when settings disable it explicitly", () => {
+			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ errorFallback: { enabled: false } }));
+			const manager = SettingsManager.create(projectDir, agentDir);
+			manager.setHostManagedModelSelection(true);
+			expect(manager.getErrorFallbackSettings().enabled).toBe(false);
+		});
+
+		describe("PI_ERROR_FALLBACK_CHAIN", () => {
+			afterEach(() => {
+				delete process.env.PI_ERROR_FALLBACK_CHAIN;
+			});
+
+			it("turns rerouting on for a host UI when the env names rungs", () => {
+				// The same variable spells "off", so naming rungs is an explicit request.
+				// It used to be parsed and then ignored in RPC mode, where the default is off.
+				process.env.PI_ERROR_FALLBACK_CHAIN = "anthropic/claude-opus-5, anthropic/claude-sonnet-4-5";
+				const manager = SettingsManager.create(projectDir, agentDir);
+				manager.setHostManagedModelSelection(true);
+				const settings = manager.getErrorFallbackSettings();
+				expect(settings.enabled).toBe(true);
+				expect(settings.chain).toEqual(["anthropic/claude-opus-5", "anthropic/claude-sonnet-4-5"]);
+			});
+
+			it("does not override an explicit settings disable", () => {
+				writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ errorFallback: { enabled: false } }));
+				process.env.PI_ERROR_FALLBACK_CHAIN = "anthropic/claude-opus-5";
+				const manager = SettingsManager.create(projectDir, agentDir);
+				expect(manager.getErrorFallbackSettings().enabled).toBe(false);
+			});
+
+			it("leaves the host-managed default alone when the env is empty", () => {
+				process.env.PI_ERROR_FALLBACK_CHAIN = "  ,  ";
+				const manager = SettingsManager.create(projectDir, agentDir);
+				manager.setHostManagedModelSelection(true);
+				expect(manager.getErrorFallbackSettings().enabled).toBe(false);
+			});
+		});
+
+		it("lets a project settings.json enable rerouting for a host UI", () => {
+			// Project settings out-rank the agent-level file, and "explicit" has to mean
+			// explicit at whichever layer won — otherwise a repo that opts in gets the
+			// host-managed default (off) because the agent-level file said nothing.
+			writeFileSync(join(projectDir, ".pi", "settings.json"), JSON.stringify({ errorFallback: { enabled: true } }));
+			const manager = SettingsManager.create(projectDir, agentDir);
+			manager.setHostManagedModelSelection(true);
+			expect(manager.getErrorFallbackSettings().enabled).toBe(true);
+		});
+
+		it("lets a project settings.json disable rerouting outside a host UI", () => {
+			writeFileSync(join(projectDir, ".pi", "settings.json"), JSON.stringify({ errorFallback: { enabled: false } }));
+			const manager = SettingsManager.create(projectDir, agentDir);
+			expect(manager.getErrorFallbackSettings().enabled).toBe(false);
 		});
 	});
 });

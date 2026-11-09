@@ -41,12 +41,33 @@ function formatGrepResult(
 	options: ToolRenderResultOptions,
 	theme: Theme,
 	showImages: boolean,
+	isError: boolean,
 ): string {
 	const output = getTextOutput(result, showImages).trim();
+	const matchLimit = result.details?.matchLimitReached;
+	const truncation = result.details?.truncation;
+	const linesTruncated = result.details?.linesTruncated;
+
+	// Minimal display: one muted summary line, no payload. Errors and expanded views keep content.
+	if (options.display === "minimal" && !options.expanded && !isError) {
+		if (!output) return "";
+		const lines = output.split("\n");
+		// Formatted match lines look like `path:12: text`; context lines use `path-12- text`.
+		const matchCount = lines.filter((line) => /^.+:\d+: /.test(line)).length;
+		// A single line with no matches is a status message such as "No matches found": show it as is.
+		if (matchCount === 0 && lines.length === 1) return `\n${theme.fg("muted", `⎿ ${lines[0]}`)}`;
+		const summary =
+			matchCount > 0
+				? `${matchCount} match${matchCount === 1 ? "" : "es"}`
+				: `${lines.length} line${lines.length === 1 ? "" : "s"}`;
+		const truncated = matchLimit || truncation?.truncated || linesTruncated;
+		return `\n${theme.fg("muted", `⎿ ${summary}${truncated ? " · truncated" : ""} (`)}${keyHint("app.tools.expand", "to expand")}${theme.fg("muted", ")")}`;
+	}
+
 	let text = "";
 	if (output) {
 		const lines = output.split("\n");
-		const maxLines = options.expanded ? lines.length : 15;
+		const maxLines = options.expanded ? lines.length : (options.collapsedLines ?? 15);
 		const displayLines = lines.slice(0, maxLines);
 		const remaining = lines.length - maxLines;
 		text += `\n${displayLines.map((line) => theme.fg("toolOutput", line)).join("\n")}`;
@@ -55,9 +76,6 @@ function formatGrepResult(
 		}
 	}
 
-	const matchLimit = result.details?.matchLimitReached;
-	const truncation = result.details?.truncation;
-	const linesTruncated = result.details?.linesTruncated;
 	if (matchLimit || truncation?.truncated || linesTruncated) {
 		const warnings: string[] = [];
 		if (matchLimit) warnings.push(`${matchLimit} matches limit`);
@@ -76,7 +94,7 @@ export const grepRenderers: Pick<ToolDefinition<any, any>, "renderCall" | "rende
 	},
 	renderResult(result, options, theme, context) {
 		const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
-		text.setText(formatGrepResult(result as any, options, theme, context.showImages));
+		text.setText(formatGrepResult(result as any, options, theme, context.showImages, context.isError));
 		return text;
 	},
 };

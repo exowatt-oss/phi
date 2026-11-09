@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { complete, registerApiProvider, resetApiProviders } from "../src/compat.ts";
 import type { AssistantMessage, Context, Model } from "../src/types.ts";
 import { AssistantMessageEventStream } from "../src/utils/event-stream.ts";
@@ -41,6 +41,7 @@ function message(): AssistantMessage {
 describe("compat legacy API fallback", () => {
 	afterEach(() => {
 		resetApiProviders();
+		vi.useRealTimers();
 	});
 
 	it("dispatches unknown providers through the legacy API registry", async () => {
@@ -70,5 +71,25 @@ describe("compat legacy API fallback", () => {
 		await complete(model, context, { apiKey: "request-key" });
 
 		expect(capturedApiKey).toBe("request-key");
+	});
+
+	it("does not arm the idle timer for a custom built-in API implementation without raw instrumentation", async () => {
+		vi.useFakeTimers();
+		let customStream: AssistantMessageEventStream | undefined;
+		registerApiProvider({
+			api: "openai-responses",
+			stream: () => {
+				customStream = new AssistantMessageEventStream();
+				return customStream;
+			},
+			streamSimple: () => new AssistantMessageEventStream(),
+		});
+
+		const resultPromise = complete(model, context, { apiKey: "request-key", idleTimeoutMs: 10 });
+		await vi.advanceTimersByTimeAsync(100);
+		expect(vi.getTimerCount()).toBe(0);
+
+		customStream?.end(message());
+		expect((await resultPromise).stopReason).toBe("stop");
 	});
 });

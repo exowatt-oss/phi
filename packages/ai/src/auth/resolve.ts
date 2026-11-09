@@ -1,6 +1,7 @@
 import type { ProviderEnv } from "../types.ts";
 import { operationSignal, raceWithAbortSignal } from "../utils/abort.ts";
 import { ModelsError } from "../utils/models-error.ts";
+import { isInvalidGrantError } from "./errors.ts";
 
 export { ModelsError, type ModelsErrorCode } from "../utils/models-error.ts";
 
@@ -100,6 +101,25 @@ function overlayEnvAuthContext(base: AuthContext, env: ProviderEnv): AuthContext
 }
 
 const DEFAULT_OAUTH_MINIMUM_VALIDITY_MS = 5 * 60 * 1000;
+const oauthRefreshFlights = new WeakMap<CredentialStore, Map<string, Promise<Credential | undefined>>>();
+
+function authRequiredError(providerId: string, credentialInvalidated: boolean): ModelsError {
+	const interactiveCommand = `/login ${providerId}`;
+	return new ModelsError(
+		"auth_required",
+		`Authentication required for ${providerId}: the stored OAuth refresh token is no longer valid. Run \`phi\`, enter \`${interactiveCommand}\`, then retry this turn.`,
+		{
+			includeCauseInMessage: false,
+			authRequired: {
+				provider: providerId,
+				reason: "invalid_grant",
+				loginCommand: "phi",
+				interactiveCommand,
+				credentialInvalidated,
+			},
+		},
+	);
+}
 const DEFAULT_OAUTH_REFRESH_TIMEOUT_MS = 15_000;
 
 /**
@@ -107,11 +127,16 @@ const DEFAULT_OAUTH_REFRESH_TIMEOUT_MS = 15_000;
  * the result before the lock is released. `needsRefresh` is re-checked under
  * the lock, so concurrent callers and processes refresh only once.
  *
- * `signal` cancels only the wait for the lock. Once a refresh starts, the
- * provider may already have rotated the refresh token, so the refresh and its
- * persistence ignore `signal` and are bounded only by a timeout. Otherwise a
- * cancelled caller could discard the only valid refresh token. Callers that
- * must return promptly on cancellation race this promise with their signal.
+ * Inside a process, concurrent callers for the same store and provider share
+ * one refresh (singleflight). `signal` only stops this caller's wait: it is
+ * never forwarded to the shared refresh, so one cancelled waiter cannot cancel
+ * the rotation for unrelated waiters, and a refresh that has started always
+ * persists the rotated token (the provider may already have rotated the refresh
+ * token). The refresh is bounded only by a timeout.
+ *
+ * A structural `invalid_grant` answer removes the credential under the lock and
+ * rejects with an `auth_required` ModelsError. Other refresh failures keep only
+ * the typed failure category, never the untrusted provider error.
  *
  * Resolves with the stored OAuth credential after the operation, or undefined
  * when the provider no longer has an OAuth credential.
@@ -123,40 +148,69 @@ export async function refreshStoredOAuthCredential(
 	needsRefresh: (credential: OAuthCredential) => boolean,
 	signal: AbortSignal,
 ): Promise<OAuthCredential | undefined> {
-	let post: Credential | undefined;
-	const lockWait = new AbortController();
-	const cancelLockWait = () => lockWait.abort(signal.reason);
-	signal.addEventListener("abort", cancelLockWait, { once: true });
-	if (signal.aborted) cancelLockWait();
-	try {
-		post = await credentials.modify(
-			providerId,
-			async (current) => {
-				signal.removeEventListener("abort", cancelLockWait);
-				signal.throwIfAborted();
-				if (current?.type !== "oauth") return undefined; // logged out meanwhile
-				if (!needsRefresh(current)) return undefined; // another process/request refreshed
-				try {
-					return await oauth.refresh(current, AbortSignal.timeout(DEFAULT_OAUTH_REFRESH_TIMEOUT_MS));
-				} catch (error) {
-					throw new ModelsError("oauth", `OAuth refresh failed for ${providerId}`, { cause: error });
-				}
-			},
-			{ signal: lockWait.signal },
-		);
-	} catch (error) {
-		if (error instanceof ModelsError) throw error;
-		signal.throwIfAborted();
-		throw new ModelsError("auth", `Credential store modify failed for ${providerId}`, { cause: error });
-	} finally {
-		signal.removeEventListener("abort", cancelLockWait);
-	}
+	signal.throwIfAborted();
+	const post = await raceWithAbortSignal(sharedOAuthRefresh(credentials, providerId, oauth, needsRefresh), signal);
 	return post?.type === "oauth" ? post : undefined;
 }
 
+/** One refresh result per store/provider inside a process; never sees a caller's signal. */
+function sharedOAuthRefresh(
+	credentials: CredentialStore,
+	providerId: string,
+	oauth: OAuthAuth,
+	needsRefresh: (credential: OAuthCredential) => boolean,
+): Promise<Credential | undefined> {
+	let flights = oauthRefreshFlights.get(credentials);
+	if (!flights) {
+		flights = new Map();
+		oauthRefreshFlights.set(credentials, flights);
+	}
+	const existing = flights.get(providerId);
+	if (existing) return existing;
+
+	const flight = (async () => {
+		let invalidGrant: unknown;
+		let post: Credential | undefined;
+		try {
+			post = await credentials.modify(providerId, async (current) => {
+				if (current?.type !== "oauth") return undefined; // logged out meanwhile
+				if (!needsRefresh(current)) return undefined; // another process/request refreshed
+				try {
+					// Per-flight timeout only: a caller's own abort must not cancel the shared rotation.
+					return await oauth.refresh(current, AbortSignal.timeout(DEFAULT_OAUTH_REFRESH_TIMEOUT_MS));
+				} catch (error) {
+					if (isInvalidGrantError(error)) {
+						invalidGrant = error;
+						return null; // atomically remove the credential under the refresh lock
+					}
+					// Provider and extension refresh errors may contain token responses,
+					// parser details, or other credential material. Preserve only the
+					// typed failure category; never retain the untrusted error graph.
+					throw new ModelsError("oauth", `OAuth refresh failed for ${providerId}`, {
+						includeCauseInMessage: false,
+					});
+				}
+			});
+		} catch (error) {
+			if (error instanceof ModelsError) throw error;
+			throw new ModelsError("auth", `Credential store modify failed for ${providerId}`, { cause: error });
+		}
+		if (invalidGrant) throw authRequiredError(providerId, true);
+		return post;
+	})();
+	flights.set(providerId, flight);
+	const clearFlight = () => {
+		if (flights?.get(providerId) === flight) flights.delete(providerId);
+	};
+	void flight.then(clearFlight, clearFlight);
+	return flight;
+}
+
 /**
- * OAuth resolution with double-checked locking: tokens with less than five
- * minutes remaining are refreshed through `refreshStoredOAuthCredential`.
+ * OAuth resolution with process-local singleflight plus store locking: tokens
+ * with less than five minutes remaining are refreshed through
+ * `refreshStoredOAuthCredential`, which re-checks expiry under the store lock,
+ * refreshes once globally, and persists the rotated credential before release.
  */
 async function resolveStoredOAuth(
 	credentials: CredentialStore,
@@ -173,7 +227,11 @@ async function resolveStoredOAuth(
 	if (expiresSoon(credential)) {
 		// Optimistic check said expired; the authoritative check runs under the lock.
 		const post = await refreshStoredOAuthCredential(credentials, providerId, oauth, expiresSoon, signal);
-		if (!post) return undefined; // logged out meanwhile
+		if (!post) {
+			const current = await readCredential(credentials, providerId, signal);
+			if (!current) throw authRequiredError(providerId, false);
+			return undefined; // credential type changed meanwhile; let the caller retry
+		}
 		credential = post;
 		// The normal five-minute window triggers a refresh but does not impose a
 		// provider contract. Explicit callers (such as bearer-token export) do

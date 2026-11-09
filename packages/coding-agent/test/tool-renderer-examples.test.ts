@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { getModel } from "@earendil-works/pi-ai/compat";
 import type { TUI } from "@earendil-works/pi-tui";
-import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ToolDefinition } from "../src/core/extensions/types.ts";
 import { DefaultResourceLoader } from "../src/core/resource-loader.ts";
 import { createAgentSession } from "../src/core/sdk.ts";
@@ -29,6 +29,7 @@ describe("tool renderer examples", () => {
 	});
 
 	afterEach(() => {
+		vi.useRealTimers();
 		if (tempDir && existsSync(tempDir)) {
 			rmSync(tempDir, { recursive: true, force: true });
 		}
@@ -81,6 +82,9 @@ describe("tool renderer examples", () => {
 		},
 	])("keeps the system prompt unchanged for the $name example", async ({ extensionPath, tools }) => {
 		// Regression test for https://github.com/earendil-works/pi/issues/10072
+		// The system prompt carries "Current date and time" (to the minute): freeze the clock so the
+		// two prompts cannot straddle a minute boundary. Only Date is faked; timers stay real.
+		vi.useFakeTimers({ toFake: ["Date"], now: new Date("2026-03-04T10:20:30.000Z") });
 		const baseline = await getSessionState(undefined, tools);
 		const withRenderer = await getSessionState(extensionPath, tools);
 

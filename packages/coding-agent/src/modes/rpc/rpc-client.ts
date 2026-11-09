@@ -6,7 +6,7 @@
 
 import { type ChildProcess, spawn } from "node:child_process";
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
-import type { ImageContent } from "@earendil-works/pi-ai";
+import type { ImageContent, ServiceTier } from "@earendil-works/pi-ai";
 import type { PromptDisposition, QueuedInputDisposition, SessionStats } from "../../core/agent-session.ts";
 import type { BashResult } from "../../core/bash-executor.ts";
 import type { CompactionResult } from "../../core/compaction/index.ts";
@@ -45,6 +45,10 @@ export interface ModelInfo {
 	id: string;
 	contextWindow: number;
 	reasoning: boolean;
+	/** Thinking levels this model actually supports, best offered as-is in a host's picker. */
+	thinkingLevels: ThinkingLevel[];
+	/** Service tiers supported by this model; account eligibility is provider-controlled. */
+	serviceTiers: readonly ServiceTier[];
 }
 
 export type RpcEventListener = (event: JsonAgentSessionEvent) => void;
@@ -255,9 +259,15 @@ export class RpcClient {
 
 	/**
 	 * Set model by provider and ID.
+	 * @param persist - Persist the selection as the default for new sessions. Defaults to true.
 	 */
-	async setModel(provider: string, modelId: string): Promise<{ provider: string; id: string }> {
-		const response = await this.send({ type: "set_model", provider, modelId });
+	async setModel(provider: string, modelId: string, persist?: boolean): Promise<{ provider: string; id: string }> {
+		const response = await this.send({
+			type: "set_model",
+			provider,
+			modelId,
+			...(persist === undefined ? {} : { persist }),
+		});
 		return this.getData(response);
 	}
 
@@ -274,11 +284,19 @@ export class RpcClient {
 	}
 
 	/**
-	 * Get list of available models.
+	 * Get available models in the configured picker scope, or the full catalog.
 	 */
-	async getAvailableModels(): Promise<ModelInfo[]> {
-		const response = await this.send({ type: "get_available_models" });
+	async getAvailableModels(scope?: "configured" | "all"): Promise<ModelInfo[]> {
+		const response = await this.send({ type: "get_available_models", ...(scope === undefined ? {} : { scope }) });
 		return this.getData<{ models: ModelInfo[] }>(response).models;
+	}
+
+	/**
+	 * Set the service tier for this session without changing global settings.
+	 */
+	async setServiceTier(tier: ServiceTier): Promise<ServiceTier> {
+		const response = await this.send({ type: "set_service_tier", tier });
+		return this.getData<{ serviceTier: ServiceTier }>(response).serviceTier;
 	}
 
 	/**

@@ -8,6 +8,7 @@
 
 import { getProviderEnvValue } from "../../utils/provider-env.ts";
 import { sleep } from "../../utils/sleep.ts";
+import { OAuthTokenError } from "../errors.ts";
 import type { OAuthAuth, OAuthCredential, ProviderAuthInteraction } from "../types.ts";
 import { pollOAuthDeviceCodeFlow } from "./device-code.ts";
 
@@ -246,10 +247,11 @@ async function refreshToken(oauthHost: string, refreshTokenValue: string, signal
 			return parseTokenResponse(json, "refresh");
 		}
 
-		// Unauthorized: the stored credential is dead; Models clears it and prompts re-login.
-		if (response.status === 401 || response.status === 403 || json?.error === "invalid_grant") {
-			const description = typeof json?.error_description === "string" ? `: ${json.error_description}` : "";
-			throw new Error(`Kimi Code token refresh unauthorized (status ${response.status})${description}`);
+		if (json?.error === "invalid_grant") {
+			throw new OAuthTokenError("invalid_grant", response.status, `${oauthHost}/api/oauth/token`);
+		}
+		if (response.status === 401 || response.status === 403) {
+			throw new OAuthTokenError("token_endpoint_error", response.status, `${oauthHost}/api/oauth/token`);
 		}
 
 		if (isRetryableRefreshFailure(response) && attempt < REFRESH_MAX_RETRIES) {
@@ -257,8 +259,7 @@ async function refreshToken(oauthHost: string, refreshTokenValue: string, signal
 			continue;
 		}
 
-		const text = JSON.stringify(json);
-		throw new Error(`Kimi Code token refresh failed with status ${response.status}${text ? `: ${text}` : ""}`);
+		throw new Error(`Kimi Code token refresh failed with status ${response.status}`);
 	}
 
 	throw lastError ?? new Error("Kimi Code token refresh failed");

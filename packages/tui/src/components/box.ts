@@ -2,7 +2,8 @@ import { type Component, dispatchMouseEvent, type TuiMouseDispatchResult, type T
 import { flattenLines, visibleWidth } from "../utils.ts";
 
 type RenderCache = {
-	childLines: string[];
+	children: Component[];
+	childLines: string[][];
 	width: number;
 	bgSample: string | undefined;
 	lines: string[];
@@ -45,6 +46,17 @@ export class Box implements Component {
 		this.invalidateCache();
 	}
 
+	/**
+	 * Change the padding after construction. Takes effect on the next render:
+	 * the cached line array was produced with the old padding, so it is dropped.
+	 */
+	setPadding(paddingX: number, paddingY: number): void {
+		if (paddingX === this.paddingX && paddingY === this.paddingY) return;
+		this.paddingX = Math.max(0, paddingX);
+		this.paddingY = Math.max(0, paddingY);
+		this.invalidateCache();
+	}
+
 	setBgFn(bgFn?: (text: string) => string): void {
 		this.bgFn = bgFn;
 		// Don't invalidate here - we'll detect bgFn changes by sampling output
@@ -59,13 +71,19 @@ export class Box implements Component {
 		this.cache = undefined;
 	}
 
-	private matchCache(width: number, childLines: string[], bgSample: string | undefined): boolean {
+	private matchCache(
+		width: number,
+		children: Component[],
+		childLines: string[][],
+		bgSample: string | undefined,
+	): boolean {
 		const cache = this.cache;
 		return (
 			!!cache &&
 			cache.width === width &&
 			cache.bgSample === bgSample &&
-			cache.childLines.length === childLines.length &&
+			cache.children.length === children.length &&
+			cache.children.every((child, i) => child === children[i]) &&
 			cache.childLines.every((line, i) => line === childLines[i])
 		);
 	}
@@ -111,29 +129,27 @@ export class Box implements Component {
 		const contentWidth = Math.max(1, width - this.paddingX * 2);
 		const leftPad = " ".repeat(this.paddingX);
 
-		// Render all children. Keep the child lines unpadded: children usually return the same string
-		// objects every frame, so the cache check below is a cheap identity comparison per line.
-		// Padding here would create new strings that must be compared character by character.
-		const childLines: string[] = [];
+		// Render children and retain their line-array identities. Most transcript
+		// children cache by width, so scrolling can reuse the already-flattened box
+		// without rebuilding every line on every frame.
+		const childLines: string[][] = [];
 		const mouseChildren: Array<{ component: Component; height: number }> = [];
 		for (const child of this.children) {
 			const lines = child.render(contentWidth);
+			childLines.push(lines);
 			mouseChildren.push({ component: child, height: lines.length });
-			for (const line of lines) {
-				childLines.push(line);
-			}
 		}
 		this.mouseLayout = { width: contentWidth, children: mouseChildren };
 
-		if (childLines.length === 0) {
+		if (childLines.every((lines) => lines.length === 0)) {
 			return [];
 		}
 
 		// Check if bgFn output changed by sampling
 		const bgSample = this.bgFn ? this.bgFn("test") : undefined;
 
-		// Check cache validity
-		if (this.matchCache(width, childLines, bgSample)) {
+		// Check cache validity before adding padding/background to every line.
+		if (this.matchCache(width, this.children, childLines, bgSample)) {
 			return this.cache!.lines;
 		}
 
@@ -146,8 +162,10 @@ export class Box implements Component {
 		}
 
 		// Content
-		for (const line of childLines) {
-			result.push(this.applyBg(leftPad + line, width));
+		for (const child of childLines) {
+			for (const line of child) {
+				result.push(this.applyBg(leftPad + line, width));
+			}
 		}
 
 		// Bottom padding
@@ -157,7 +175,7 @@ export class Box implements Component {
 
 		// Update cache
 		flattenLines(result);
-		this.cache = { childLines, width, bgSample, lines: result };
+		this.cache = { children: [...this.children], childLines, width, bgSample, lines: result };
 
 		return result;
 	}

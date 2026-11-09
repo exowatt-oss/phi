@@ -131,6 +131,71 @@ process.wait()
 
 For maintained TypeScript clients, use the checked [RPC client example](../examples/rpc-client.ts). It requires a built Pi CLI because the repository example points to `dist/cli.js`.
 
+## phi command additions
+
+phi extends these [RPC Commands](rpc-commands.md). Everything else on that page applies unchanged.
+
+### get_state: serviceTier
+
+The `get_state` response data also carries the session's current `serviceTier` (for example `"default"` or `"fast"`).
+
+### set_model: persist
+
+The optional `persist` field controls whether the selection becomes the default model for new sessions. It defaults to `true` when omitted, preserving the existing behavior. Set it to `false` for a session-scoped switch that still updates the live session, session history, and events without changing `defaultProvider` or `defaultModel` in `settings.json`:
+
+```json
+{"type": "set_model", "provider": "anthropic", "modelId": "claude-sonnet-4-20250514", "persist": false}
+```
+
+The TypeScript `RpcClient.setModel(provider, modelId, persist?)` method exposes the same option and omits `persist` from the serialized command when the argument is not provided.
+
+### get_available_models: scope, thinkingLevels, serviceTiers
+
+`get_available_models` lists models in the configured picker scope, in configured order. An explicit session scope (`--models`) takes precedence over `enabledModels` in settings. With neither configured, discovery returns all available models. An unmatched configured scope returns an empty list.
+
+Hosts that need the complete catalog can explicitly request it with `{"type": "get_available_models", "scope": "all"}`. The default scope is `"configured"`.
+
+Each returned [Model](rpc-commands.md#model-object) object carries extra `thinkingLevels` and `serviceTiers` arrays:
+
+```json
+{
+  "type": "response",
+  "command": "get_available_models",
+  "success": true,
+  "data": {
+    "models": [
+      {
+        "provider": "anthropic",
+        "id": "claude-fable-5",
+        "reasoning": true,
+        "thinkingLevels": ["minimal", "low", "medium", "high", "xhigh", "max"],
+        "serviceTiers": ["default"]
+      }
+    ]
+  }
+}
+```
+
+`thinkingLevels` is the resolved list of levels the model actually supports — use it directly for a model picker. Deriving it from the raw `thinkingLevelMap` requires reimplementing its asymmetric semantics (an absent key means *supported* for `off`…`high` but *unsupported* for `xhigh`/`max`, an explicit `null` means unsupported), and a host that does not reimplement it offers levels the provider rejects. A non-reasoning model reports `["off"]`.
+
+`serviceTiers` lists documented model support. Eligible first-party Anthropic Opus and Codex models advertise `["default", "fast"]`; GPT-6 Astra on Amazon Bedrock's OpenAI endpoint advertises `["default", "fast", "ultrafast"]`; other models advertise `["default"]`. The provider still controls account and workspace access to Fast mode.
+
+<a id="set_service_tier"></a>
+
+### set_service_tier
+
+Set the selected model's service tier for the current session. This records the override in session history without changing global settings. Unsupported tiers return an error.
+
+```json
+{"type": "set_service_tier", "tier": "fast"}
+```
+
+```json
+{"type": "response", "command": "set_service_tier", "success": true, "data": {"serviceTier": "fast"}}
+```
+
+Send `"tier": "default"` to turn Fast mode off. `get_state` reports the current `serviceTier`, and `RpcClient.setServiceTier(tier)` returns the applied tier.
+
 ## Reference
 
 - [RPC Commands](rpc-commands.md): every stdin command and response

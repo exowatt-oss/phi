@@ -1,8 +1,9 @@
 import { ModelThinkingLevelSchema } from "@earendil-works/pi-ai/providers/model-schema";
+import { MAX_STREAM_IDLE_TIMEOUT_MS } from "@earendil-works/pi-ai/utils/stream-idle-guard";
 import { type Static, type TSchemaOptions, Type } from "typebox";
-import { SETTINGS_DEFAULTS } from "./settings-defaults.ts";
+import { PHI_SETTINGS_DEFAULTS, SETTINGS_DEFAULTS } from "./settings-defaults.ts";
 
-function nonNegativeSafeInteger(options: { default?: number } = {}) {
+function nonNegativeSafeInteger(options: { default?: number; description?: string } = {}) {
 	return Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER, ...options });
 }
 
@@ -18,7 +19,25 @@ const CompactionModelOverrideSchema = Type.Object({
 const CompactionSettingsSchema = Type.Object({
 	enabled: Type.Optional(Type.Boolean({ default: SETTINGS_DEFAULTS.compaction.enabled })),
 	reserveTokens: Type.Optional(nonNegativeSafeInteger({ default: SETTINGS_DEFAULTS.compaction.reserveTokens })),
-	keepRecentTokens: Type.Optional(nonNegativeSafeInteger({ default: SETTINGS_DEFAULTS.compaction.keepRecentTokens })),
+	keepRecentTokens: Type.Optional(
+		nonNegativeSafeInteger({
+			description:
+				"Recent tokens retained without summarization. Unset means adaptive: max(20000, 10% of the effective context window).",
+		}),
+	),
+	softCeilingTokens: Type.Optional(
+		nonNegativeSafeInteger({
+			description:
+				"Caps the context window compaction thresholds use; 0 uses the raw model window. Unset falls back to PI_COMPACTION_SOFT_CEILING_TOKENS. A model's compaction.softCeilingTokens in models.json wins.",
+			default: PHI_SETTINGS_DEFAULTS.compaction.softCeilingTokens,
+		}),
+	),
+	model: Type.Optional(
+		Type.String({
+			description:
+				'Summarization model as "provider/modelId[:thinkingLevel]". Default: the session model, or a Sonnet summarizer when the context-aware compaction ladder is on.',
+		}),
+	),
 	modelOverrides: Type.Optional(
 		Type.Record(Type.String(), CompactionModelOverrideSchema, {
 			description: 'Per-model overrides keyed by exact "provider/modelId" strings.',
@@ -71,6 +90,266 @@ const RetrySettingsSchema = Type.Object({
 	),
 });
 
+const AgentMailSettingsSchema = Type.Object({
+	enabled: Type.Optional(
+		Type.Boolean({
+			description: "Join other local UI sessions and offer the agent_list and agent_message tools.",
+			default: PHI_SETTINGS_DEFAULTS.agentMail.enabled,
+		}),
+	),
+});
+
+/**
+ * Liveness watchdog + budgets for subagent child processes (the `subagent`
+ * tool). All thresholds are minutes; see `extensions/subagents/watchdog.ts`
+ * for the resolved defaults and semantics.
+ */
+const SubagentsSettingsSchema = Type.Object(
+	{
+		watchdogEnabled: Type.Optional(
+			Type.Boolean({
+				description: "Enable semantic liveness supervision. false disables all watchdog and default-budget kills.",
+				default: true,
+			}),
+		),
+		stallSoftMinutes: Type.Optional(
+			Type.Number({
+				description:
+					"Minutes of parsed-event silence while awaiting model output before a run is flagged. Default: 5.",
+			}),
+		),
+		stallHardMinutes: Type.Optional(
+			Type.Number({
+				description:
+					"Stream hard fuse in minutes; floored by max(15, 3x streamIdleTimeoutMs), or soft-only when that guard is off. Default: 21.",
+			}),
+		),
+		toolStallSoftMinutes: Type.Optional(
+			Type.Number({
+				description:
+					"Parsed-event silence threshold in minutes while a tool execution is outstanding (quiet builds are legitimate). Default: 20.",
+			}),
+		),
+		toolStallHardMinutes: Type.Optional(
+			Type.Number({
+				description: "Hard kill threshold in minutes while a tool execution is outstanding. Default: 60.",
+			}),
+		),
+		maxRunMinutes: Type.Optional(
+			Type.Number({
+				description:
+					"Default wall-clock budget per subagent run, in minutes. Soft: only idle children are killed; 0 disables. Default: 120.",
+			}),
+		),
+		toolMaxMinutes: Type.Optional(
+			Type.Number({
+				description:
+					"Wall-clock ceiling for a single tool call inside a subagent, in minutes, even while it streams output. Floored at toolStallHardMinutes; 0 disables. Default: 90.",
+			}),
+		),
+		maxHardRunMinutes: Type.Optional(
+			Type.Number({
+				description:
+					"Absolute wall-clock ceiling for a subagent run without an explicit timeoutSeconds, in minutes. Kills even a producing child; floored at maxRunMinutes; 0 disables. Default: 360.",
+			}),
+		),
+		childIsolation: Type.Optional(
+			Type.Union([Type.Literal("auto"), Type.Literal("off")], {
+				description:
+					'Run each child in its own systemd-run --user --scope cgroup (Linux only) so a runaway fan-out cannot OOM the parent. "auto" uses it whenever the host can; "off" spawns children directly.',
+				default: "auto",
+			}),
+		),
+		childMemoryMax: Type.Optional(
+			Type.Union([Type.String(), Type.Number()], {
+				description:
+					'MemoryMax for each child cgroup: bytes, "8G", "512M", or a share of host RAM like "25%". 0 or "off" removes the ceiling. Default: 30% of RAM, clamped to 2-16 GiB.',
+			}),
+		),
+		childCpuCores: Type.Optional(
+			Type.Union([Type.Number(), Type.Literal("off")], {
+				description:
+					'Whole CPUs each child cgroup may use (CPUQuota); also exported to the child as VITEST_MAX_THREADS and PYTEST_XDIST_AUTO_NUM_WORKERS. 0 or "off" removes it. Default: max(4, CPUs / 6).',
+			}),
+		),
+		models: Type.Optional(
+			Type.Object(
+				{
+					default: Type.Optional(
+						Type.String({
+							description:
+								'Model for subagent tasks that name none (and whose agent definition names none), e.g. "example/model:high". PHI_SUBAGENT_MODEL_DEFAULT overrides it.',
+						}),
+					),
+					allow: Type.Optional(
+						Type.Array(Type.String(), {
+							description:
+								'Model patterns subagents may use: "provider/id", "provider/id:level", "provider/id:l1|l2", with * globs ("example/model:high"). A call with any task outside the list is refused. PHI_SUBAGENT_MODEL_ALLOW (comma-separated) overrides it.',
+						}),
+					),
+				},
+				{ description: "Pin the models the subagent tool may launch and the default for tasks that name none." },
+			),
+		),
+	},
+	{ description: "Liveness watchdog, budgets and isolation for subagent child processes." },
+);
+
+const FallbackChainSchema = Type.Array(Type.String(), {
+	description:
+		'Ordered "provider/modelId" refs, best model first. Rungs naming an unknown model or a provider without auth are skipped.',
+});
+
+/**
+ * Model escalation for safety-classifier refusals. Client-side, so it crosses providers and works on
+ * OAuth (subscription) auth, unlike Anthropic's server-side fallbacks beta.
+ */
+const RefusalFallbackSettingsSchema = Type.Object(
+	{
+		enabled: Type.Optional(
+			Type.Boolean({
+				description: "Escalate to the next model in chain when a safety classifier declines a turn.",
+				default: PHI_SETTINGS_DEFAULTS.refusalFallback.enabled,
+			}),
+		),
+		chain: Type.Optional(FallbackChainSchema),
+		// Sticky by default: the declined content is still in the context, so returning to the head of the
+		// chain on the next turn spends a guaranteed refusal per turn.
+		sticky: Type.Optional(
+			Type.Boolean({
+				description:
+					"Stay on the model that answered for the rest of the session; false restores the head of the chain after each escalated turn.",
+				default: PHI_SETTINGS_DEFAULTS.refusalFallback.sticky,
+			}),
+		),
+	},
+	{ description: "Client-side model escalation for safety-classifier refusals." },
+);
+
+/** Model rerouting for provider outages, the availability sibling of the refusal fallback. */
+const ErrorFallbackSettingsSchema = Type.Object(
+	{
+		enabled: Type.Optional(
+			Type.Boolean({
+				description:
+					"Reroute to the next model in chain when the provider is down, unreachable, or out of quota. Defaults to false when a host UI owns model selection (RPC mode).",
+				default: PHI_SETTINGS_DEFAULTS.errorFallback.enabled,
+			}),
+		),
+		chain: Type.Optional(
+			Type.Array(Type.String(), {
+				description:
+					'Ordered "provider/modelId" refs, best model first. Rungs naming an unknown model or a provider without auth are skipped.',
+				default: [...PHI_SETTINGS_DEFAULTS.errorFallback.chain],
+			}),
+		),
+		// Not sticky by default: sticky rerouting moved whole sessions onto another provider's billing and
+		// capabilities, under the original model's label, long after the outage had passed.
+		sticky: Type.Optional(
+			Type.Boolean({
+				description:
+					"Stay on the fallback model for the rest of the session; false restores the selected model after each rerouted turn.",
+				default: PHI_SETTINGS_DEFAULTS.errorFallback.sticky,
+			}),
+		),
+	},
+	{ description: "Client-side model rerouting for provider outages." },
+);
+
+const BtwSettingsSchema = Type.Object(
+	{
+		model: Type.Optional(
+			Type.String({
+				description:
+					'Model for side queries, as "provider/modelId" or "provider/modelId:thinking". Default: the current session model.',
+			}),
+		),
+		persist: Type.Optional(
+			Type.Boolean({
+				description: "Append completed answers to the TUI transcript as non-context entries.",
+				default: PHI_SETTINGS_DEFAULTS.btw.persist,
+			}),
+		),
+		maxHistory: Type.Optional(
+			Type.Number({
+				description:
+					"Maximum Q&A pairs kept in the in-memory side thread; oldest pairs drop first. Clamped from 1 to 100.",
+				default: PHI_SETTINGS_DEFAULTS.btw.maxHistory,
+			}),
+		),
+	},
+	{ description: "Settings for the /btw side-question command." },
+);
+
+const LoopSettingsSchema = Type.Object(
+	{
+		maxIterations: Type.Optional(
+			Type.Number({
+				description: "Iteration cap, clamped from 1 to 100.",
+				default: PHI_SETTINGS_DEFAULTS.loop.maxIterations,
+			}),
+		),
+		maxWallTimeMs: Type.Optional(
+			Type.Number({
+				description: "Wall-time cap in milliseconds, up to 24 hours.",
+				default: PHI_SETTINGS_DEFAULTS.loop.maxWallTimeMs,
+			}),
+		),
+		maxCostUsd: Type.Optional(Type.Number({ description: "Spend cap in USD; unset means unlimited." })),
+		checkTimeoutMs: Type.Optional(
+			Type.Number({
+				description: "Timeout for each --check command in milliseconds.",
+				default: PHI_SETTINGS_DEFAULTS.loop.checkTimeoutMs,
+			}),
+		),
+		evaluatorModel: Type.Optional(
+			Type.String({ description: "Model that judges --until conditions. Default: the session model." }),
+		),
+		evaluatorConfidence: Type.Optional(
+			Type.Number({
+				description: "Confidence the evaluator needs to stop the loop, clamped from 0.5 to 1.",
+				default: PHI_SETTINGS_DEFAULTS.loop.evaluatorConfidence,
+			}),
+		),
+		maxCheckOutputBytes: Type.Optional(
+			Type.Number({
+				description: "Check output kept per iteration, clamped from 1 KiB to 1 MiB.",
+				default: PHI_SETTINGS_DEFAULTS.loop.maxCheckOutputBytes,
+			}),
+		),
+	},
+	{ description: "Settings for the /loop command." },
+);
+
+/**
+ * Settings for the workspace-state emitter (contract v1).
+ * See the workspace-state contract
+ */
+const SessionStateSettingsSchema = Type.Object(
+	{
+		classifier: Type.Optional(
+			Type.Union([Type.Literal("heuristic"), Type.Literal("llm")], {
+				description:
+					'How the end state is classified. "llm" spends an isolated side-question call; "heuristic" inspects the final message locally and handles side-call failures.',
+				default: PHI_SETTINGS_DEFAULTS.sessionState.classifier,
+			}),
+		),
+		model: Type.Optional(
+			Type.String({
+				description: 'Model for the "llm" classifier, as "provider/modelId".',
+				default: PHI_SETTINGS_DEFAULTS.sessionState.model,
+			}),
+		),
+	},
+	{ description: "Settings for the workspace-state emitter." },
+);
+
+const ToolDisplaySchema = Type.Union([Type.Literal("minimal"), Type.Literal("compact"), Type.Literal("full")], {
+	description:
+		'How much of a tool call and result is shown while collapsed. "minimal": intent line plus a one-line summary. "compact": short previews. "full": like compact, but sessions start expanded. ctrl+o always expands.',
+	default: PHI_SETTINGS_DEFAULTS.toolDisplay,
+});
+
 const TerminalSettingsSchema = Type.Object({
 	showImages: Type.Optional(
 		Type.Boolean({
@@ -106,7 +385,8 @@ const TerminalSettingsSchema = Type.Object({
 const ImageSettingsSchema = Type.Object({
 	autoResize: Type.Optional(
 		Type.Boolean({
-			description: "Resize images to 2000x2000 maximum for better model compatibility.",
+			description:
+				"Fit images to Claude's native resolution (2576px long edge) before sending; smaller images pass through untouched.",
 			default: SETTINGS_DEFAULTS.images.autoResize,
 		}),
 	),
@@ -210,6 +490,13 @@ export const SettingsSchema = Type.Object(
 		defaultProvider: Type.Optional(Type.String()),
 		defaultModel: Type.Optional(Type.String()),
 		defaultThinkingLevel: Type.Optional(ModelThinkingLevelSchema),
+		serviceTier: Type.Optional(
+			Type.Union([Type.Literal("default"), Type.Literal("flex"), Type.Literal("fast"), Type.Literal("ultrafast")], {
+				description:
+					'Processing tier: "fast", "default", OpenAI-only "flex", or "ultrafast" (sent verbatim). "fast" also enables Anthropic fast mode on supported first-party models.',
+				default: PHI_SETTINGS_DEFAULTS.serviceTier,
+			}),
+		),
 		modelThinkingLevels: Type.Optional(
 			Type.Record(Type.String(), ModelThinkingLevelSchema, {
 				description: 'Per-model default thinking level overrides keyed by "provider/modelId".',
@@ -242,6 +529,10 @@ export const SettingsSchema = Type.Object(
 		compaction: Type.Optional(CompactionSettingsSchema),
 		branchSummary: Type.Optional(BranchSummarySettingsSchema),
 		retry: Type.Optional(RetrySettingsSchema),
+		subagents: Type.Optional(SubagentsSettingsSchema),
+		agentMail: Type.Optional(AgentMailSettingsSchema),
+		refusalFallback: Type.Optional(RefusalFallbackSettingsSchema),
+		errorFallback: Type.Optional(ErrorFallbackSettingsSchema),
 		hideThinkingBlock: Type.Optional(Type.Boolean({ default: SETTINGS_DEFAULTS.hideThinkingBlock })),
 		showCacheMissNotices: Type.Optional(
 			Type.Boolean({
@@ -284,9 +575,17 @@ export const SettingsSchema = Type.Object(
 				default: SETTINGS_DEFAULTS.collapseChangelog,
 			}),
 		),
+		autoUpdate: Type.Optional(
+			Type.Boolean({
+				description:
+					"Install newer phi releases from a configured self-hosted update feed automatically, without running /upgrade. The new release takes effect when phi restarts.",
+				default: SETTINGS_DEFAULTS.autoUpdate,
+			}),
+		),
 		enableInstallTelemetry: Type.Optional(
 			Type.Boolean({
-				description: "Send an anonymous version and update ping after changelog-detected updates.",
+				description:
+					"Send an anonymous version and update ping to pi.dev after changelog-detected updates. Off in phi; PI_TELEMETRY=1 also opts in.",
 				default: SETTINGS_DEFAULTS.enableInstallTelemetry,
 			}),
 		),
@@ -374,6 +673,14 @@ export const SettingsSchema = Type.Object(
 				default: SETTINGS_DEFAULTS.outputPad,
 			}),
 		),
+		toolOutputLines: Type.Optional(
+			Type.Number({
+				description:
+					"Output lines shown per tool result while collapsed, clamped from 0 to 200; 0 shows only the expand hint. ctrl+o always expands.",
+				default: PHI_SETTINGS_DEFAULTS.toolOutputLines,
+			}),
+		),
+		toolDisplay: Type.Optional(ToolDisplaySchema),
 		autocompleteMaxVisible: Type.Optional(
 			Type.Number({
 				description: "Maximum visible items in the autocomplete dropdown.",
@@ -399,6 +706,13 @@ export const SettingsSchema = Type.Object(
 				description: 'HTTP header or body idle timeout in milliseconds; 0 or "disabled" disables it.',
 			}),
 		),
+		streamIdleTimeoutMs: Type.Optional(
+			Type.Union([Type.Number({ minimum: 0, maximum: MAX_STREAM_IDLE_TIMEOUT_MS }), Type.Literal("disabled")], {
+				description:
+					'Raw model-stream inactivity timeout in milliseconds before the request is aborted and retried; 0 or "disabled" disables it.',
+				default: PHI_SETTINGS_DEFAULTS.streamIdleTimeoutMs,
+			}),
+		),
 		cacheWarming: Type.Optional(
 			Type.Union([Type.Literal("off"), Type.Literal("streaming"), Type.Literal("idle")], {
 				description:
@@ -414,6 +728,12 @@ export const SettingsSchema = Type.Object(
 		tuiMode: Type.Optional(
 			Type.Union([Type.Literal("regular"), Type.Literal("fullscreen")], {
 				default: SETTINGS_DEFAULTS.tuiMode,
+			}),
+		),
+		uiMode: Type.Optional(
+			Type.Union([Type.Literal("regular"), Type.Literal("fullscreen")], {
+				description: "Legacy spelling of tuiMode written by phi 0.83 and earlier; read as a fallback.",
+				deprecated: true,
 			}),
 		),
 		fullscreenExitOutput: Type.Optional(
@@ -440,6 +760,9 @@ export const SettingsSchema = Type.Object(
 				default: SETTINGS_DEFAULTS.fullscreenWheelScrollLines,
 			}),
 		),
+		btw: Type.Optional(BtwSettingsSchema),
+		loop: Type.Optional(LoopSettingsSchema),
+		sessionState: Type.Optional(SessionStateSettingsSchema),
 		queueMode: Type.Optional(
 			Type.Union([Type.Literal("all"), Type.Literal("one-at-a-time")], {
 				description: "Legacy setting migrated to steeringMode.",
@@ -459,6 +782,14 @@ export interface CompactionModelOverride extends Static<typeof CompactionModelOv
 export interface CompactionSettings extends Static<typeof CompactionSettingsSchema> {}
 export interface BranchSummarySettings extends Static<typeof BranchSummarySettingsSchema> {}
 export interface ProviderRetrySettings extends Static<typeof ProviderRetrySettingsSchema> {}
+export interface AgentMailSettings extends Static<typeof AgentMailSettingsSchema> {}
+export interface SubagentsSettings extends Static<typeof SubagentsSettingsSchema> {}
+export interface RefusalFallbackSettings extends Static<typeof RefusalFallbackSettingsSchema> {}
+export interface ErrorFallbackSettings extends Static<typeof ErrorFallbackSettingsSchema> {}
+export interface BtwSettings extends Static<typeof BtwSettingsSchema> {}
+export interface LoopSettings extends Static<typeof LoopSettingsSchema> {}
+export interface SessionStateSettings extends Static<typeof SessionStateSettingsSchema> {}
+export type ToolDisplayMode = Static<typeof ToolDisplaySchema>;
 export interface RetrySettings extends Omit<Static<typeof RetrySettingsSchema>, "maxDelayMs"> {}
 export interface TerminalSettings extends Static<typeof TerminalSettingsSchema> {}
 export interface ImageSettings extends Static<typeof ImageSettingsSchema> {}

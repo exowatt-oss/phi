@@ -2,10 +2,17 @@ import { applyExifOrientation } from "./exif-orientation.ts";
 import { loadPhoton } from "./photon.ts";
 
 export interface ImageResizeOptions {
-	maxWidth?: number; // Default: 2000
-	maxHeight?: number; // Default: 2000
-	maxBytes?: number; // Default: 4.5MB of base64 payload (below Anthropic's 5MB limit)
-	jpegQuality?: number; // Default: 80
+	maxWidth?: number; // Default: 2576 (Claude's high-resolution long-edge limit)
+	maxHeight?: number; // Default: 2576
+	/** Visual-token budget, one token per 28x28 pixel patch. Default: 4784 (Claude's high-resolution tier) */
+	maxVisualTokens?: number;
+	maxBytes?: number; // Default: 4.5MB of base64 payload (below the 5MB per-image limit on Bedrock and Vertex)
+	/**
+	 * Lossless PNG is used when it encodes below this size; heavier images, typically photographic ones,
+	 * use high-quality JPEG instead. Default: 2MB of base64
+	 */
+	preferLosslessBelowBytes?: number;
+	jpegQuality?: number; // Default: 92
 }
 
 export interface ResizedImage {
@@ -18,6 +25,23 @@ export interface ResizedImage {
 	wasResized: boolean;
 }
 
+export interface ImageDimensionLimits {
+	maxWidth: number;
+	maxHeight: number;
+	maxVisualTokens: number;
+}
+
+/**
+ * The most an image is worth sending to Claude: the high-resolution tier (Claude 4.7 and later) downscales
+ * anything larger to fit both limits before looking at it. 2576 is a multiple of the 28px patch, so the
+ * plain pixel check below equals Claude's padded-edge check.
+ */
+export const CLAUDE_NATIVE_IMAGE_LIMITS: ImageDimensionLimits = {
+	maxWidth: 2576,
+	maxHeight: 2576,
+	maxVisualTokens: 4784,
+};
+
 /**
  * Tag on image resize worker replies. Node can post its own messages on the worker channel
  * (for example `{ "watch:require": [...] }` under `node --watch`), so replies must be identifiable.
@@ -28,14 +52,16 @@ export type ResizeImageWorkerResponse =
 	| { type: typeof IMAGE_RESIZE_WORKER_RESPONSE_TYPE; result: ResizedImage | null }
 	| { type: typeof IMAGE_RESIZE_WORKER_RESPONSE_TYPE; error: string };
 
-// 4.5MB of base64 payload. Provides headroom below Anthropic's 5MB limit.
-const DEFAULT_MAX_BYTES = 4.5 * 1024 * 1024;
+// 4.5MB of base64 payload. Headroom below the 5MB per-image limit (3.75MB decoded on Bedrock Converse).
+export const DEFAULT_MAX_IMAGE_BYTES = 4.5 * 1024 * 1024;
+
+const VISUAL_PATCH_PX = 28;
 
 const DEFAULT_OPTIONS: Required<ImageResizeOptions> = {
-	maxWidth: 2000,
-	maxHeight: 2000,
-	maxBytes: DEFAULT_MAX_BYTES,
-	jpegQuality: 80,
+	...CLAUDE_NATIVE_IMAGE_LIMITS,
+	maxBytes: DEFAULT_MAX_IMAGE_BYTES,
+	preferLosslessBelowBytes: 2 * 1024 * 1024,
+	jpegQuality: 92,
 };
 
 interface EncodedCandidate {
@@ -53,18 +79,71 @@ function encodeCandidate(buffer: Uint8Array, mimeType: string): EncodedCandidate
 	};
 }
 
+/** Visual tokens an image costs Claude: one per 28x28 pixel patch. */
+export function countVisualTokens(width: number, height: number): number {
+	return Math.ceil(width / VISUAL_PATCH_PX) * Math.ceil(height / VISUAL_PATCH_PX);
+}
+
+/** Round half to even, as Claude's server-side resize does at exact .5 ties. */
+function roundHalfToEven(value: number): number {
+	const floor = Math.floor(value);
+	if (value - floor !== 0.5) return Math.round(value);
+	return floor % 2 === 0 ? floor : floor + 1;
+}
+
 /**
- * Resize an image to fit within the specified max dimensions and encoded file size.
+ * The largest aspect-preserving size within the limits, or the original size when it already fits.
+ * With CLAUDE_NATIVE_IMAGE_LIMITS this is Anthropic's reference resize rule (binary search along the long
+ * edge), so an image resized here is exactly what Claude sees: no second resize server-side, and
+ * coordinates the model returns map 1:1 onto it.
+ */
+export function fitImageDimensions(
+	width: number,
+	height: number,
+	limits: ImageDimensionLimits,
+): { width: number; height: number } {
+	const fits = (w: number, h: number) =>
+		w <= limits.maxWidth && h <= limits.maxHeight && countVisualTokens(w, h) <= limits.maxVisualTokens;
+	if (fits(width, height)) return { width, height };
+
+	const landscape = width >= height;
+	const longEdge = landscape ? width : height;
+	const aspectRatio = landscape ? width / height : height / width;
+	const sizeForLongEdge = (edge: number) => {
+		const shortEdge = Math.max(roundHalfToEven(edge / aspectRatio), 1);
+		return landscape ? { width: edge, height: shortEdge } : { width: shortEdge, height: edge };
+	};
+
+	let lo = 1; // always fits
+	let hi = longEdge; // never fits
+	while (lo + 1 < hi) {
+		const mid = Math.floor((lo + hi) / 2);
+		const size = sizeForLongEdge(mid);
+		if (fits(size.width, size.height)) {
+			lo = mid;
+		} else {
+			hi = mid;
+		}
+	}
+	return sizeForLongEdge(lo);
+}
+
+/**
+ * Resize an image to fit within the specified dimensions, visual-token budget, and encoded file size.
  * Returns null if the image cannot be resized below maxBytes.
  *
  * Uses Photon (Rust/WASM) for image processing. If Photon is not available,
  * returns null.
  *
- * Strategy for staying under maxBytes:
- * 1. First resize to maxWidth/maxHeight
- * 2. Try both PNG and JPEG formats, pick the smaller one
- * 3. If still too large, try JPEG with decreasing quality
+ * Images already within every limit are returned untouched. Otherwise, to keep as much of the image as
+ * the model can see:
+ * 1. Downscale only to the dimension and visual-token limits (Claude's native view by default)
+ * 2. Encode as PNG when that stays below preferLosslessBelowBytes
+ * 3. Otherwise use high-quality JPEG (stepping down from jpegQuality to 75), or PNG if it fits and is smaller
  * 4. If still too large, progressively reduce dimensions until 1x1
+ *
+ * Output is PNG or JPEG only: some providers (xAI, llama.cpp) cannot decode WebP, and a stored image
+ * a provider rejects would fail every later request in the session.
  */
 export async function resizeImageInProcess(
 	inputBytes: Uint8Array,
@@ -88,9 +167,10 @@ export async function resizeImageInProcess(
 		const originalWidth = image.get_width();
 		const originalHeight = image.get_height();
 		const format = mimeType.split("/")[1] ?? "png";
+		const target = fitImageDimensions(originalWidth, originalHeight, opts);
 
-		// Check if already within all limits (dimensions AND encoded size)
-		if (originalWidth <= opts.maxWidth && originalHeight <= opts.maxHeight && inputBase64Size < opts.maxBytes) {
+		// Check if already within all limits (dimensions, visual tokens AND encoded size)
+		if (target.width === originalWidth && target.height === originalHeight && inputBase64Size < opts.maxBytes) {
 			return {
 				data: Buffer.from(inputBytes).toString("base64"),
 				mimeType: mimeType || `image/${format}`,
@@ -102,59 +182,60 @@ export async function resizeImageInProcess(
 			};
 		}
 
-		// Calculate initial dimensions respecting max limits
-		let targetWidth = originalWidth;
-		let targetHeight = originalHeight;
+		const jpegQualities = Array.from(new Set([opts.jpegQuality, 85, 75]))
+			.filter((quality) => quality <= opts.jpegQuality)
+			.sort((a, b) => b - a);
 
-		if (targetWidth > opts.maxWidth) {
-			targetHeight = Math.round((targetHeight * opts.maxWidth) / targetWidth);
-			targetWidth = opts.maxWidth;
-		}
-		if (targetHeight > opts.maxHeight) {
-			targetWidth = Math.round((targetWidth * opts.maxHeight) / targetHeight);
-			targetHeight = opts.maxHeight;
-		}
-
-		function tryEncodings(width: number, height: number, jpegQualities: number[]): EncodedCandidate[] {
-			const resized = photon!.resize(image!, width, height, photon!.SamplingFilter.Lanczos3);
+		function encodeWithinLimits(width: number, height: number): EncodedCandidate | undefined {
+			const resized =
+				width === originalWidth && height === originalHeight
+					? undefined
+					: photon!.resize(image!, width, height, photon!.SamplingFilter.Lanczos3);
+			const source = resized ?? image!;
 
 			try {
-				const candidates: EncodedCandidate[] = [encodeCandidate(resized.get_bytes(), "image/png")];
-				for (const quality of jpegQualities) {
-					candidates.push(encodeCandidate(resized.get_bytes_jpeg(quality), "image/jpeg"));
+				const lossless = encodeCandidate(source.get_bytes(), "image/png");
+				if (lossless.encodedSize < Math.min(opts.maxBytes, opts.preferLosslessBelowBytes)) {
+					return lossless;
 				}
-				return candidates;
+
+				for (const quality of jpegQualities) {
+					const jpeg = encodeCandidate(source.get_bytes_jpeg(quality), "image/jpeg");
+					const best =
+						lossless.encodedSize < opts.maxBytes && lossless.encodedSize <= jpeg.encodedSize ? lossless : jpeg;
+					if (best.encodedSize < opts.maxBytes) {
+						return best;
+					}
+				}
+				return undefined;
 			} finally {
-				resized.free();
+				resized?.free();
 			}
 		}
 
-		const qualitySteps = Array.from(new Set([opts.jpegQuality, 85, 70, 55, 40]));
-		let currentWidth = targetWidth;
-		let currentHeight = targetHeight;
+		let currentWidth = target.width;
+		let currentHeight = target.height;
 
 		while (true) {
-			const candidates = tryEncodings(currentWidth, currentHeight, qualitySteps);
-			for (const candidate of candidates) {
-				if (candidate.encodedSize < opts.maxBytes) {
-					return {
-						data: candidate.data,
-						mimeType: candidate.mimeType,
-						originalWidth,
-						originalHeight,
-						width: currentWidth,
-						height: currentHeight,
-						wasResized: true,
-					};
-				}
+			const encoded = encodeWithinLimits(currentWidth, currentHeight);
+			if (encoded) {
+				return {
+					data: encoded.data,
+					mimeType: encoded.mimeType,
+					originalWidth,
+					originalHeight,
+					width: currentWidth,
+					height: currentHeight,
+					wasResized: currentWidth !== originalWidth || currentHeight !== originalHeight,
+				};
 			}
 
 			if (currentWidth === 1 && currentHeight === 1) {
 				break;
 			}
 
-			const nextWidth = currentWidth === 1 ? 1 : Math.max(1, Math.floor(currentWidth * 0.75));
-			const nextHeight = currentHeight === 1 ? 1 : Math.max(1, Math.floor(currentHeight * 0.75));
+			const nextWidth = currentWidth === 1 ? 1 : Math.max(1, Math.floor(currentWidth * 0.85));
+			const nextHeight = currentHeight === 1 ? 1 : Math.max(1, Math.floor(currentHeight * 0.85));
 			if (nextWidth === currentWidth && nextHeight === currentHeight) {
 				break;
 			}

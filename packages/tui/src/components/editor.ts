@@ -792,6 +792,7 @@ export class Editor implements Component, Focusable {
 				if (selected && this.autocompleteProvider) {
 					this.pushUndoSnapshot();
 					this.lastAction = null;
+					const submitSlashCompletion = this.isSlashCompletionAtMessageStart();
 					const result = this.autocompleteProvider.applyCompletion(
 						this.state.lines,
 						this.state.cursorLine,
@@ -803,14 +804,12 @@ export class Editor implements Component, Focusable {
 					this.state.cursorLine = result.cursorLine;
 					this.setCursorCol(result.cursorCol);
 
-					if (this.autocompletePrefix.startsWith("/")) {
-						this.cancelAutocomplete();
-						// Fall through to submit
-					} else {
-						this.cancelAutocomplete();
+					this.cancelAutocomplete();
+					if (!submitSlashCompletion) {
 						if (this.onChange) this.onChange(this.getText());
 						return;
 					}
+					// Start-of-message slash completions fall through to submit.
 				}
 			}
 		}
@@ -1227,8 +1226,8 @@ export class Editor implements Component, Focusable {
 
 		// Check if we should trigger or update autocomplete
 		if (!this.autocompleteState) {
-			// Auto-trigger for "/" at the start of a line (slash commands)
-			if (char === "/" && this.isAtStartOfMessage()) {
+			// Auto-trigger for "/" at a token boundary (slash commands)
+			if (char === "/" && this.isAtSlashCommandBoundary()) {
 				this.tryTriggerAutocomplete();
 			}
 			// Auto-trigger for symbol-based completion like @, #, or provider triggers at token boundaries
@@ -2191,16 +2190,38 @@ export class Editor implements Component, Focusable {
 		return this.state.cursorLine === 0;
 	}
 
-	// Helper method to check if cursor is at start of message (for slash command detection)
-	private isAtStartOfMessage(): boolean {
+	// Slash commands can start at the beginning of any token on the first line.
+	private isAtSlashCommandBoundary(): boolean {
 		if (!this.isSlashMenuAllowed()) return false;
 		const currentLine = this.state.lines[this.state.cursorLine] || "";
-		const beforeCursor = currentLine.slice(0, this.state.cursorCol);
-		return beforeCursor.trim() === "" || beforeCursor.trim() === "/";
+		const slashIndex = this.state.cursorCol - 1;
+		return (
+			slashIndex >= 0 &&
+			currentLine[slashIndex] === "/" &&
+			(slashIndex === 0 || isWhitespaceChar(currentLine[slashIndex - 1]!))
+		);
+	}
+
+	private isInActiveSlashCommandToken(textBeforeCursor: string): boolean {
+		if (!this.isSlashMenuAllowed()) return false;
+		const token = textBeforeCursor.match(/\S+$/)?.[0];
+		return token?.startsWith("/") ?? false;
+	}
+
+	private isSlashCompletionAtMessageStart(): boolean {
+		if (!this.autocompletePrefix.startsWith("/")) return false;
+
+		const currentLine = this.state.lines[this.state.cursorLine] || "";
+		const tokenStart = this.state.cursorCol - this.autocompletePrefix.length;
+		if (tokenStart < 0) return false;
+
+		// The prefix starts at the active slash token. Leading whitespace is
+		// still considered the start of the message, as it was previously.
+		return currentLine.slice(0, tokenStart).trim() === "";
 	}
 
 	private isInSlashCommandContext(textBeforeCursor: string): boolean {
-		return this.isSlashMenuAllowed() && textBeforeCursor.trimStart().startsWith("/");
+		return this.isSlashMenuAllowed() && /(?:^|\s)\/\S*/.test(textBeforeCursor);
 	}
 
 	// Autocomplete methods
@@ -2269,7 +2290,7 @@ export class Editor implements Component, Focusable {
 		const currentLine = this.state.lines[this.state.cursorLine] || "";
 		const beforeCursor = currentLine.slice(0, this.state.cursorCol);
 
-		if (this.isInSlashCommandContext(beforeCursor) && !beforeCursor.trimStart().includes(" ")) {
+		if (this.isInActiveSlashCommandToken(beforeCursor)) {
 			this.handleSlashCommandCompletion();
 		} else {
 			this.forceFileAutocomplete(true);

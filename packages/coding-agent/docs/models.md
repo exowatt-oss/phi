@@ -76,7 +76,14 @@ To route a built-in provider through a proxy, set only its `baseUrl`. Its models
 }
 ```
 
-[Models Configuration](models-configuration.md) lists every field.
+[Models Configuration](models-configuration.md) lists every upstream field. In phi, `modelOverrides` also accepts `api` and `compaction`, and a model entry or override can set its own compaction ceiling:
+
+| Field | Required | Default | Description |
+|-------|----------|---------|-------------|
+| `compaction` | No | omitted | Compaction policy overrides for this model |
+| `compaction.softCeilingTokens` | No | global setting (`300000`) | Soft context ceiling used for compaction thresholds; `0` uses the raw model context window |
+
+Compaction uses the smaller of `contextWindow` and the configured soft ceiling. A model-level `compaction.softCeilingTokens` takes precedence over the global `compaction.softCeilingTokens` setting; set it to `0` to disable the ceiling for that model. See [Compaction](compaction.md#the-context-management-ladder-phi).
 
 ### Describe model input and caching
 
@@ -99,7 +106,9 @@ Use `inputLimits.images.resize` to control how Pi encodes new image attachments,
 }
 ```
 
-`maxBytes` limits the base64-encoded payload. Omitted resize fields use conservative defaults of 2000 by 2000 pixels, 4.5 MiB encoded, and JPEG quality 80. Images are encoded once; changing models does not rewrite historical images. The catalog can also describe hard request limits with `inputLimits.maxRequestBytes`, `images.maxPerMessage`, and `images.maxPerRequest`, but Pi does not yet rewrite or reject history based on them.
+`maxBytes` limits the base64-encoded payload. Omitted resize fields use phi's defaults, which fit images to Claude's native resolution: 2576 pixels on the long edge and 4784 visual tokens, 4.5 MiB encoded, lossless PNG when it encodes below 2 MiB and JPEG quality 92 otherwise. Images are encoded once; changing models does not rewrite historical images. The catalog can also describe hard request limits with `inputLimits.maxRequestBytes`, `images.maxPerMessage`, and `images.maxPerRequest`, but Pi does not yet rewrite or reject history based on them.
+
+Independently of the catalog, phi checks the outgoing copy of every request against fixed hard image limits (the strictest common provider limits, such as Anthropic on Bedrock and Vertex), even when `images.autoResize` is off. The session keeps the original images.
 
 <a id="prompt-cache-lifetimes"></a>
 
@@ -138,6 +147,19 @@ OpenAI-compatible APIs support free-form `samplingParams` model defaults and `sa
 Pi first clamps unsupported thinking levels, then merges model `samplingParams`, the effective level's override, and request-level `samplingParams` in that order. Later values win per key. Missing levels inherit the model defaults. `modelOverrides` merges per-level entries per key with the base model. These fields apply only to `openai-completions`, `openai-responses`, and `azure-openai-responses`; other APIs ignore them.
 
 Compatibility settings should describe verified differences in the endpoint's request or response behavior. Do not enable them based only on an endpoint advertising OpenAI or Anthropic compatibility.
+
+### phi compatibility flags
+
+phi adds these `compat` fields on top of the upstream set listed under [Compatibility](models-configuration.md#compatibility):
+
+| Field | Description |
+|-------|-------------|
+| `sendReasoningEffortOff` | Send `reasoning_effort: <thinkingLevelMap.off>` when thinking is off, instead of omitting the field. Default: `false`. The off value is provider-specific vocabulary (`"none"`, in practice), so a gateway model group that re-maps onto an upstream with a different vocabulary rejects the request outright; omitting it just leaves the upstream at its own default effort. Set it only for a model that genuinely needs an explicit "do not think" value and whose endpoint reads it. |
+| `supportsExplicitPromptCacheMode` | For `openai-responses`, send GPT-5.6 explicit prompt-cache options. Cached requests use `mode: "explicit"` with a 30-minute TTL; `cacheRetention: "none"` sends explicit mode without a key or TTL to suppress writes. Default: `false`. |
+| `supportsExplicitPromptCacheBreakpoints` | For `openai-responses`, add an explicit cache breakpoint to the last cacheable block in the contiguous system/developer instruction prefix. Dynamic user and tool history is never marked. Default: follows `supportsExplicitPromptCacheMode`. |
+| `fastServiceTier` | For `openai-responses`, the wire `service_tier` sent when the session's tier is `fast` (`/fast`, `--service-tier fast`), read back as fast. Default: `"ultrafast"` for GPT-6 Astra on Amazon Bedrock `/openai/v1` endpoints, otherwise `fast` is sent as-is. |
+| `fastServiceTierCostMultiplier` | For `openai-responses`, multiplier on every cost rate when a response is served at the fast tier. Default: `6` for Bedrock GPT-6 Astra UltraFast, otherwise `2`. An explicit `ultrafast` tier is billed at this multiplier only when `fastServiceTier` resolves to `"ultrafast"`; otherwise at standard rates. |
+| `sortToolSchemaKeys` | For `openai-responses`, recursively sort tool JSON-schema keys so the cached prompt prefix is identical before and after the first tool call. Default: `true` for Amazon Bedrock `/openai/v1` endpoints, otherwise `false`. |
 
 ## Use classifier models
 

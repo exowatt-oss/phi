@@ -22,7 +22,7 @@ describe("resolveEscapeTimeoutMs", () => {
 	});
 
 	it("defaults to 100ms over SSH", () => {
-		assert.equal(resolveEscapeTimeoutMs({ SSH_CONNECTION: "10.0.0.1 22" }), 100);
+		assert.equal(resolveEscapeTimeoutMs({ SSH_CONNECTION: "192.0.2.1 22" }), 100);
 		assert.equal(resolveEscapeTimeoutMs({ SSH_TTY: "/dev/pts/1" }), 100);
 	});
 

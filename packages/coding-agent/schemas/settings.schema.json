@@ -20,6 +20,28 @@
     "defaultThinkingLevel": {
       "$ref": "#/$defs/ModelThinkingLevel"
     },
+    "serviceTier": {
+      "anyOf": [
+        {
+          "type": "string",
+          "const": "default"
+        },
+        {
+          "type": "string",
+          "const": "flex"
+        },
+        {
+          "type": "string",
+          "const": "fast"
+        },
+        {
+          "type": "string",
+          "const": "ultrafast"
+        }
+      ],
+      "description": "Processing tier: \"fast\", \"default\", OpenAI-only \"flex\", or \"ultrafast\" (sent verbatim). \"fast\" also enables Anthropic fast mode on supported first-party models.",
+      "default": "default"
+    },
     "modelThinkingLevels": {
       "type": "object",
       "patternProperties": {
@@ -114,7 +136,18 @@
           "type": "integer",
           "minimum": 0,
           "maximum": 9007199254740991,
-          "default": 20000
+          "description": "Recent tokens retained without summarization. Unset means adaptive: max(20000, 10% of the effective context window)."
+        },
+        "softCeilingTokens": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991,
+          "description": "Caps the context window compaction thresholds use; 0 uses the raw model window. Unset falls back to PI_COMPACTION_SOFT_CEILING_TOKENS. A model's compaction.softCeilingTokens in models.json wins.",
+          "default": 300000
+        },
+        "model": {
+          "type": "string",
+          "description": "Summarization model as \"provider/modelId[:thinkingLevel]\". Default: the session model, or a Sonnet summarizer when the context-aware compaction ladder is on."
         },
         "modelOverrides": {
           "type": "object",
@@ -199,6 +232,156 @@
         }
       }
     },
+    "subagents": {
+      "type": "object",
+      "properties": {
+        "watchdogEnabled": {
+          "type": "boolean",
+          "description": "Enable semantic liveness supervision. false disables all watchdog and default-budget kills.",
+          "default": true
+        },
+        "stallSoftMinutes": {
+          "type": "number",
+          "description": "Minutes of parsed-event silence while awaiting model output before a run is flagged. Default: 5."
+        },
+        "stallHardMinutes": {
+          "type": "number",
+          "description": "Stream hard fuse in minutes; floored by max(15, 3x streamIdleTimeoutMs), or soft-only when that guard is off. Default: 21."
+        },
+        "toolStallSoftMinutes": {
+          "type": "number",
+          "description": "Parsed-event silence threshold in minutes while a tool execution is outstanding (quiet builds are legitimate). Default: 20."
+        },
+        "toolStallHardMinutes": {
+          "type": "number",
+          "description": "Hard kill threshold in minutes while a tool execution is outstanding. Default: 60."
+        },
+        "maxRunMinutes": {
+          "type": "number",
+          "description": "Default wall-clock budget per subagent run, in minutes. Soft: only idle children are killed; 0 disables. Default: 120."
+        },
+        "toolMaxMinutes": {
+          "type": "number",
+          "description": "Wall-clock ceiling for a single tool call inside a subagent, in minutes, even while it streams output. Floored at toolStallHardMinutes; 0 disables. Default: 90."
+        },
+        "maxHardRunMinutes": {
+          "type": "number",
+          "description": "Absolute wall-clock ceiling for a subagent run without an explicit timeoutSeconds, in minutes. Kills even a producing child; floored at maxRunMinutes; 0 disables. Default: 360."
+        },
+        "childIsolation": {
+          "anyOf": [
+            {
+              "type": "string",
+              "const": "auto"
+            },
+            {
+              "type": "string",
+              "const": "off"
+            }
+          ],
+          "description": "Run each child in its own systemd-run --user --scope cgroup (Linux only) so a runaway fan-out cannot OOM the parent. \"auto\" uses it whenever the host can; \"off\" spawns children directly.",
+          "default": "auto"
+        },
+        "childMemoryMax": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "number"
+            }
+          ],
+          "description": "MemoryMax for each child cgroup: bytes, \"8G\", \"512M\", or a share of host RAM like \"25%\". 0 or \"off\" removes the ceiling. Default: 30% of RAM, clamped to 2-16 GiB."
+        },
+        "childCpuCores": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "string",
+              "const": "off"
+            }
+          ],
+          "description": "Whole CPUs each child cgroup may use (CPUQuota); also exported to the child as VITEST_MAX_THREADS and PYTEST_XDIST_AUTO_NUM_WORKERS. 0 or \"off\" removes it. Default: max(4, CPUs / 6)."
+        },
+        "models": {
+          "type": "object",
+          "properties": {
+            "default": {
+              "type": "string",
+              "description": "Model for subagent tasks that name none (and whose agent definition names none), e.g. \"example/model:high\". PHI_SUBAGENT_MODEL_DEFAULT overrides it."
+            },
+            "allow": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Model patterns subagents may use: \"provider/id\", \"provider/id:level\", \"provider/id:l1|l2\", with * globs (\"example/model:high\"). A call with any task outside the list is refused. PHI_SUBAGENT_MODEL_ALLOW (comma-separated) overrides it."
+            }
+          },
+          "description": "Pin the models the subagent tool may launch and the default for tasks that name none."
+        }
+      },
+      "description": "Liveness watchdog, budgets and isolation for subagent child processes."
+    },
+    "agentMail": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Join other local UI sessions and offer the agent_list and agent_message tools.",
+          "default": true
+        }
+      }
+    },
+    "refusalFallback": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Escalate to the next model in chain when a safety classifier declines a turn.",
+          "default": true
+        },
+        "chain": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Ordered \"provider/modelId\" refs, best model first. Rungs naming an unknown model or a provider without auth are skipped."
+        },
+        "sticky": {
+          "type": "boolean",
+          "description": "Stay on the model that answered for the rest of the session; false restores the head of the chain after each escalated turn.",
+          "default": true
+        }
+      },
+      "description": "Client-side model escalation for safety-classifier refusals."
+    },
+    "errorFallback": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Reroute to the next model in chain when the provider is down, unreachable, or out of quota. Defaults to false when a host UI owns model selection (RPC mode).",
+          "default": false
+        },
+        "chain": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Ordered \"provider/modelId\" refs, best model first. Rungs naming an unknown model or a provider without auth are skipped.",
+          "default": []
+        },
+        "sticky": {
+          "type": "boolean",
+          "description": "Stay on the fallback model for the rest of the session; false restores the selected model after each rerouted turn.",
+          "default": false
+        }
+      },
+      "description": "Client-side model rerouting for provider outages."
+    },
     "hideThinkingBlock": {
       "type": "boolean",
       "default": false
@@ -263,10 +446,15 @@
       "description": "Show the condensed changelog after update; use /changelog for the full changelog.",
       "default": false
     },
+    "autoUpdate": {
+      "type": "boolean",
+      "description": "Install newer phi releases from a configured self-hosted update feed automatically, without running /upgrade. The new release takes effect when phi restarts.",
+      "default": false
+    },
     "enableInstallTelemetry": {
       "type": "boolean",
-      "description": "Send an anonymous version and update ping after changelog-detected updates.",
-      "default": true
+      "description": "Send an anonymous version and update ping to pi.dev after changelog-detected updates. Off in phi; PI_TELEMETRY=1 also opts in.",
+      "default": false
     },
     "enableAnalytics": {
       "type": "boolean",
@@ -457,7 +645,7 @@
       "properties": {
         "autoResize": {
           "type": "boolean",
-          "description": "Resize images to 2000x2000 maximum for better model compatibility.",
+          "description": "Fit images to Claude's native resolution (2576px long edge) before sending; smaller images pass through untouched.",
           "default": true
         },
         "blockImages": {
@@ -562,6 +750,29 @@
       "description": "Horizontal padding for transcript content.",
       "default": 1
     },
+    "toolOutputLines": {
+      "type": "number",
+      "description": "Output lines shown per tool result while collapsed, clamped from 0 to 200; 0 shows only the expand hint. ctrl+o always expands.",
+      "default": 5
+    },
+    "toolDisplay": {
+      "anyOf": [
+        {
+          "type": "string",
+          "const": "minimal"
+        },
+        {
+          "type": "string",
+          "const": "compact"
+        },
+        {
+          "type": "string",
+          "const": "full"
+        }
+      ],
+      "description": "How much of a tool call and result is shown while collapsed. \"minimal\": intent line plus a one-line summary. \"compact\": short previews. \"full\": like compact, but sessions start expanded. ctrl+o always expands.",
+      "default": "minimal"
+    },
     "autocompleteMaxVisible": {
       "type": "number",
       "description": "Maximum visible items in the autocomplete dropdown.",
@@ -652,6 +863,21 @@
       ],
       "description": "HTTP header or body idle timeout in milliseconds; 0 or \"disabled\" disables it."
     },
+    "streamIdleTimeoutMs": {
+      "anyOf": [
+        {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 2147483647
+        },
+        {
+          "type": "string",
+          "const": "disabled"
+        }
+      ],
+      "description": "Raw model-stream inactivity timeout in milliseconds before the request is aborted and retried; 0 or \"disabled\" disables it.",
+      "default": 420000
+    },
     "cacheWarming": {
       "anyOf": [
         {
@@ -695,6 +921,20 @@
         }
       ],
       "default": "fullscreen"
+    },
+    "uiMode": {
+      "anyOf": [
+        {
+          "type": "string",
+          "const": "regular"
+        },
+        {
+          "type": "string",
+          "const": "fullscreen"
+        }
+      ],
+      "description": "Legacy spelling of tuiMode written by phi 0.83 and earlier; read as a fallback.",
+      "deprecated": true
     },
     "fullscreenExitOutput": {
       "anyOf": [
@@ -745,6 +985,90 @@
       ],
       "description": "Lines scrolled per wheel event in fullscreen mode; numeric values are clamped from 1 to 100.",
       "default": "auto"
+    },
+    "btw": {
+      "type": "object",
+      "properties": {
+        "model": {
+          "type": "string",
+          "description": "Model for side queries, as \"provider/modelId\" or \"provider/modelId:thinking\". Default: the current session model."
+        },
+        "persist": {
+          "type": "boolean",
+          "description": "Append completed answers to the TUI transcript as non-context entries.",
+          "default": true
+        },
+        "maxHistory": {
+          "type": "number",
+          "description": "Maximum Q&A pairs kept in the in-memory side thread; oldest pairs drop first. Clamped from 1 to 100.",
+          "default": 20
+        }
+      },
+      "description": "Settings for the /btw side-question command."
+    },
+    "loop": {
+      "type": "object",
+      "properties": {
+        "maxIterations": {
+          "type": "number",
+          "description": "Iteration cap, clamped from 1 to 100.",
+          "default": 12
+        },
+        "maxWallTimeMs": {
+          "type": "number",
+          "description": "Wall-time cap in milliseconds, up to 24 hours.",
+          "default": 7200000
+        },
+        "maxCostUsd": {
+          "type": "number",
+          "description": "Spend cap in USD; unset means unlimited."
+        },
+        "checkTimeoutMs": {
+          "type": "number",
+          "description": "Timeout for each --check command in milliseconds.",
+          "default": 600000
+        },
+        "evaluatorModel": {
+          "type": "string",
+          "description": "Model that judges --until conditions. Default: the session model."
+        },
+        "evaluatorConfidence": {
+          "type": "number",
+          "description": "Confidence the evaluator needs to stop the loop, clamped from 0.5 to 1.",
+          "default": 0.85
+        },
+        "maxCheckOutputBytes": {
+          "type": "number",
+          "description": "Check output kept per iteration, clamped from 1 KiB to 1 MiB.",
+          "default": 65536
+        }
+      },
+      "description": "Settings for the /loop command."
+    },
+    "sessionState": {
+      "type": "object",
+      "properties": {
+        "classifier": {
+          "anyOf": [
+            {
+              "type": "string",
+              "const": "heuristic"
+            },
+            {
+              "type": "string",
+              "const": "llm"
+            }
+          ],
+          "description": "How the end state is classified. \"llm\" spends an isolated side-question call; \"heuristic\" inspects the final message locally and handles side-call failures.",
+          "default": "heuristic"
+        },
+        "model": {
+          "type": "string",
+          "description": "Model for the \"llm\" classifier, as \"provider/modelId\".",
+          "default": ""
+        }
+      },
+      "description": "Settings for the workspace-state emitter."
     },
     "queueMode": {
       "anyOf": [

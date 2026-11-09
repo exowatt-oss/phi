@@ -1,5 +1,6 @@
 import { createServer, type Server } from "node:http";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { OAuthTokenError } from "../src/auth/errors.ts";
 import { anthropicOAuth } from "../src/auth/oauth/anthropic.ts";
 import type { AuthEvent, AuthPrompt } from "../src/auth/types.ts";
 
@@ -34,6 +35,39 @@ function getJsonBody(init?: RequestInit): Record<string, string> {
 	}
 	return JSON.parse(init.body) as Record<string, string>;
 }
+
+async function rejectedWithoutSecret(promise: Promise<unknown>, secret: string): Promise<Error> {
+	let thrown: unknown;
+	try {
+		await promise;
+	} catch (error) {
+		thrown = error;
+	}
+	expect(thrown).toBeInstanceOf(Error);
+	const text: string[] = [];
+	const seen = new Set<object>();
+	const visit = (value: unknown): void => {
+		if (typeof value === "string") {
+			text.push(value);
+			return;
+		}
+		if (typeof value !== "object" || value === null || seen.has(value)) return;
+		seen.add(value);
+		for (const key of Object.getOwnPropertyNames(value)) visit((value as Record<string, unknown>)[key]);
+	};
+	visit(thrown);
+	expect(text.join("\n")).not.toContain(secret);
+	return thrown as Error;
+}
+
+const fetchRejectionCases: Array<["refresh" | "login", () => unknown]> = [
+	["refresh", () => "sentinel-fetch-rejection"],
+	["refresh", () => new Error("sentinel-fetch-error", { cause: new Error("sentinel-fetch-cause") })],
+	["refresh", () => new OAuthTokenError("sentinel-fetch-secret", 418, "https://sentinel-fetch-secret")],
+	["login", () => "sentinel-fetch-rejection"],
+	["login", () => new Error("sentinel-fetch-error", { cause: new Error("sentinel-fetch-cause") })],
+	["login", () => new OAuthTokenError("sentinel-fetch-secret", 418, "https://sentinel-fetch-secret")],
+];
 
 describe.sequential("Anthropic OAuth", () => {
 	afterEach(() => {
@@ -76,6 +110,73 @@ describe.sequential("Anthropic OAuth", () => {
 		expect(credentials.access).toBe("access-token");
 		expect(credentials.refresh).toBe("refresh-token");
 		expect(fetchMock).toHaveBeenCalledOnce();
+	});
+
+	it("exchanges a pasted code#state with the manual redirect_uri, ignoring copy whitespace", async () => {
+		let copyUrl = "";
+		let autoUrl = "";
+		const fetchMock = vi.fn(async (_input: unknown, init?: RequestInit): Promise<Response> => {
+			const body = getJsonBody(init);
+			expect(body.code).toBe("pasted-code");
+			expect(body.redirect_uri).toBe("https://platform.claude.com/oauth/code/callback");
+			return jsonResponse({ access_token: "access-token", refresh_token: "refresh-token", expires_in: 3600 });
+		});
+		vi.stubGlobal("fetch", fetchMock);
+
+		await anthropicOAuth.login({
+			signal: neverAbortedSignal,
+			notify: (event) => {
+				if (event.type === "auth_url") {
+					autoUrl = event.url;
+					copyUrl = event.copyUrl ?? "";
+				}
+			},
+			prompt: async (prompt) => {
+				if (prompt.type === "select") return "browser";
+				if (prompt.type !== "manual_code") throw new Error(`Unexpected prompt: ${prompt.type}`);
+				const state = new URL(copyUrl).searchParams.get("state");
+				return `  pasted-\n  code#${state}  `;
+			},
+		});
+
+		expect(new URL(autoUrl).searchParams.get("redirect_uri")).toBe("http://localhost:53692/callback");
+		expect(new URL(copyUrl).searchParams.get("redirect_uri")).toBe("https://platform.claude.com/oauth/code/callback");
+		expect(fetchMock).toHaveBeenCalledOnce();
+	});
+
+	it("still accepts a pasted code when the preferred callback port is taken", async () => {
+		const blocker = createServer();
+		await listen(blocker, 53692);
+		try {
+			let autoUrl = "";
+			let copyUrl = "";
+			vi.stubGlobal(
+				"fetch",
+				vi.fn(async (_input: unknown, init?: RequestInit) => {
+					expect(getJsonBody(init).redirect_uri).toBe("https://platform.claude.com/oauth/code/callback");
+					return jsonResponse({ access_token: "a", refresh_token: "r", expires_in: 3600 });
+				}),
+			);
+			const credential = await anthropicOAuth.login({
+				signal: neverAbortedSignal,
+				notify: (event) => {
+					if (event.type !== "auth_url") return;
+					autoUrl = event.url;
+					copyUrl = event.copyUrl ?? "";
+				},
+				prompt: async (prompt) => (prompt.type === "select" ? "browser" : "the-code"),
+			});
+			expect(credential.access).toBe("a");
+			// The automatic link moves to a free loopback port; the copyable link keeps showing the code.
+			const autoRedirect = new URL(new URL(autoUrl).searchParams.get("redirect_uri") ?? "");
+			expect(autoRedirect.hostname).toBe("localhost");
+			expect(autoRedirect.port).not.toBe("53692");
+			expect(new URL(copyUrl).searchParams.get("redirect_uri")).toBe(
+				"https://platform.claude.com/oauth/code/callback",
+			);
+		} finally {
+			await new Promise<void>((resolve) => blocker.close(() => resolve()));
+		}
 	});
 
 	it("offers browser login first and uses the selected Anthropic copy code flow", async () => {
@@ -130,6 +231,31 @@ describe.sequential("Anthropic OAuth", () => {
 		]);
 	});
 
+	it("surfaces the copy code URL as copyUrl so the TUI copy shortcut copies it", async () => {
+		const authEvents: Extract<AuthEvent, { type: "auth_url" }>[] = [];
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async () => jsonResponse({ access_token: "a", refresh_token: "r", expires_in: 3600 })),
+		);
+
+		await anthropicOAuth.login({
+			signal: neverAbortedSignal,
+			notify: (event) => {
+				if (event.type === "auth_url") authEvents.push(event);
+			},
+			prompt: async (prompt) => {
+				if (prompt.type === "select") return "copy_code";
+				return `the-code#${new URL(authEvents[0]?.url ?? "").searchParams.get("state")}`;
+			},
+		});
+
+		expect(authEvents).toHaveLength(1);
+		expect(authEvents[0]?.copyUrl).toBe(authEvents[0]?.url);
+		expect(new URL(authEvents[0]?.copyUrl ?? "").searchParams.get("redirect_uri")).toBe(
+			"https://platform.claude.com/oauth/code/callback",
+		);
+	});
+
 	it("cancels when Anthropic login method selection is cancelled", async () => {
 		await expect(
 			anthropicOAuth.login({
@@ -172,6 +298,171 @@ describe.sequential("Anthropic OAuth", () => {
 		expect(credentials.access).toBe("new-access-token");
 		expect(credentials.refresh).toBe("new-refresh-token");
 		expect(fetchMock).toHaveBeenCalledOnce();
+	});
+
+	it("reports invalid_grant as a structured error without echoing the response body", async () => {
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async () => jsonResponse({ error: "invalid_grant", error_description: "refresh token rejected" }, 400)),
+		);
+
+		const refresh = anthropicOAuth.refresh(
+			{
+				type: "oauth",
+				access: "old-access-token",
+				refresh: "stale-refresh-token",
+				expires: 0,
+			},
+			neverAbortedSignal,
+		);
+		await expect(refresh).rejects.toMatchObject({
+			name: "OAuthTokenError",
+			oauthErrorCode: "invalid_grant",
+			status: 400,
+			endpoint: "https://platform.claude.com/v1/oauth/token",
+		});
+		await expect(refresh).rejects.not.toThrow("refresh token rejected");
+	});
+
+	it.each([
+		["non-JSON", new Response("sentinel-response-secret", { status: 400 })],
+		["non-string OAuth error", jsonResponse({ error: { detail: "sentinel-response-secret" } }, 400)],
+		["unknown token-shaped OAuth error", jsonResponse({ error: "sentinel-response-secret" }, 400)],
+	])("does not expose %s token endpoint error bodies", async (_name, response) => {
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async () => response),
+		);
+
+		const error = await rejectedWithoutSecret(
+			anthropicOAuth.refresh(
+				{
+					type: "oauth",
+					access: "old-access-token",
+					refresh: "stale-refresh-token",
+					expires: 0,
+				},
+				neverAbortedSignal,
+			),
+			"sentinel-response-secret",
+		);
+		expect(error).toMatchObject({ oauthErrorCode: "token_endpoint_error" });
+		expect(error.message).toContain("error=token_endpoint_error");
+	});
+
+	it.each(fetchRejectionCases)("does not expose arbitrary %s fetch rejections", async (operation, rejection) => {
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async () => Promise.reject(rejection())),
+		);
+		const request =
+			operation === "refresh"
+				? anthropicOAuth.refresh(
+						{
+							type: "oauth",
+							access: "old-access-token",
+							refresh: "stale-refresh-token",
+							expires: 0,
+						},
+						neverAbortedSignal,
+					)
+				: anthropicOAuth.login({
+						signal: neverAbortedSignal,
+						notify: () => {},
+						prompt: async (prompt) => {
+							if (prompt.type === "select") return "browser";
+							if (prompt.type !== "manual_code") throw new Error(`Unexpected prompt: ${prompt.type}`);
+							return "authorization-code";
+						},
+					});
+		const error = await rejectedWithoutSecret(request, "sentinel-fetch");
+		expect(error.message).toContain("OAuth token endpoint request failed");
+	});
+
+	it("does not expose non-JSON successful refresh responses or parser causes", async () => {
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async () => new Response("sentinel-nonjson-refresh", { status: 200 })),
+		);
+
+		const error = await rejectedWithoutSecret(
+			anthropicOAuth.refresh(
+				{
+					type: "oauth",
+					access: "old-access-token",
+					refresh: "stale-refresh-token",
+					expires: 0,
+				},
+				neverAbortedSignal,
+			),
+			"sentinel-nonjson-refresh",
+		);
+		expect(error.message).toContain("invalid JSON");
+		expect(error).not.toHaveProperty("cause");
+	});
+
+	it("does not expose malformed successful refresh responses", async () => {
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async () => jsonResponse({ access_token: "sentinel-access-secret" })),
+		);
+
+		const error = await rejectedWithoutSecret(
+			anthropicOAuth.refresh(
+				{
+					type: "oauth",
+					access: "old-access-token",
+					refresh: "stale-refresh-token",
+					expires: 0,
+				},
+				neverAbortedSignal,
+			),
+			"sentinel-access-secret",
+		);
+		expect(error.message).toContain("invalid token response");
+	});
+
+	it("does not expose non-JSON successful login responses or parser causes", async () => {
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async () => new Response("sentinel-nonjson-login", { status: 200 })),
+		);
+
+		const error = await rejectedWithoutSecret(
+			anthropicOAuth.login({
+				signal: neverAbortedSignal,
+				notify: () => {},
+				prompt: async (prompt) => {
+					if (prompt.type === "select") return "browser";
+					if (prompt.type !== "manual_code") throw new Error(`Unexpected prompt: ${prompt.type}`);
+					return "authorization-code";
+				},
+			}),
+			"sentinel-nonjson-login",
+		);
+		expect(error.message).toContain("invalid JSON");
+		expect(error).not.toHaveProperty("cause");
+	});
+
+	it("does not expose malformed successful login responses", async () => {
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async () => jsonResponse({ refresh_token: "sentinel-refresh-secret" })),
+		);
+
+		const error = await rejectedWithoutSecret(
+			anthropicOAuth.login({
+				signal: neverAbortedSignal,
+				notify: () => {},
+				prompt: async (prompt) => {
+					if (prompt.type === "select") return "browser";
+					if (prompt.type !== "manual_code") throw new Error(`Unexpected prompt: ${prompt.type}`);
+					return "authorization-code";
+				},
+			}),
+			"sentinel-refresh-secret",
+		);
+		expect(error.message).toContain("invalid token response");
 	});
 
 	it("anthropicOAuth.login resolves through the manual_code prompt and aborts it after settling", async () => {

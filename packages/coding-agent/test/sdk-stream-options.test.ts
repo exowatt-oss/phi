@@ -53,7 +53,11 @@ describe("createAgentSession stream options", () => {
 		};
 	}
 
-	function createDoneMessage(api: Api, promptTokens = 0): AssistantMessage {
+	function createDoneMessage(
+		api: Api,
+		promptTokens = 0,
+		stopReason: AssistantMessage["stopReason"] = "stop",
+	): AssistantMessage {
 		return {
 			role: "assistant",
 			content: [{ type: "text", text: "ok" }],
@@ -68,7 +72,7 @@ describe("createAgentSession stream options", () => {
 				totalTokens: promptTokens,
 				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 			},
-			stopReason: "stop",
+			stopReason,
 			timestamp: Date.now(),
 		};
 	}
@@ -83,6 +87,8 @@ describe("createAgentSession stream options", () => {
 		api: Api,
 		settings: Partial<Settings>,
 		requestOptions: SimpleStreamOptions = {},
+		_extensionSource?: string,
+		streamFactory?: (options: SimpleStreamOptions | undefined) => ReturnType<typeof createDoneStream>,
 		extensionFactory?: ExtensionFactory,
 		providerEvent?: unknown,
 	): Promise<SimpleStreamOptions | undefined> {
@@ -106,6 +112,7 @@ describe("createAgentSession stream options", () => {
 			headers: { "x-provider": "provider" },
 			streamSimple: (requestModel, _context, providerOptions) => {
 				capturedOptions = providerOptions;
+				if (streamFactory) return streamFactory(providerOptions);
 				if (providerEvent === undefined) return createDoneStream(api);
 
 				const stream = createAssistantMessageEventStream();
@@ -146,6 +153,53 @@ describe("createAgentSession stream options", () => {
 			modelRegistry.unregisterProvider(model.provider);
 		}
 	}
+
+	it("forwards streamIdleTimeoutMs to the model runtime", async () => {
+		const options = await captureStreamOptions("openai-completions", { streamIdleTimeoutMs: 1234 });
+
+		expect(options?.idleTimeoutMs).toBe(1234);
+	});
+
+	it("aborts inactive streams through the session runtime used by RPC mode", async () => {
+		let rawFetchInvoked = false;
+		const options = await captureStreamOptions(
+			"openai-completions",
+			{ streamIdleTimeoutMs: 10 },
+			{
+				fetch: async () => {
+					rawFetchInvoked = true;
+					return new Response(new ReadableStream());
+				},
+			},
+			undefined,
+			(providerOptions) => {
+				const stream = createAssistantMessageEventStream();
+				providerOptions?.signal?.addEventListener(
+					"abort",
+					() => stream.end(createDoneMessage("openai-completions", 0, "aborted")),
+					{ once: true },
+				);
+				void providerOptions?.fetch?.("https://capture.invalid/v1/stream", {
+					signal: providerOptions.signal,
+				});
+				return stream;
+			},
+		);
+
+		expect(rawFetchInvoked).toBe(true);
+		expect(options?.idleTimeoutMs).toBe(10);
+		expect(options?.signal?.aborted).toBe(true);
+	});
+
+	it("lets a request disable the stream idle timeout", async () => {
+		const options = await captureStreamOptions(
+			"openai-completions",
+			{ streamIdleTimeoutMs: 1234 },
+			{ idleTimeoutMs: 0 },
+		);
+
+		expect(options?.idleTimeoutMs).toBe(0);
+	});
 
 	async function createCacheWarmingSession(populate?: (manager: SessionManager, model: Model<Api>) => void) {
 		const model: Model<Api> = {
@@ -277,6 +331,8 @@ describe("createAgentSession stream options", () => {
 			"openai-completions",
 			{},
 			{},
+			undefined,
+			undefined,
 			(pi) => {
 				pi.on("provider_stream_event", (event) => {
 					extensionEvents.push(event);
@@ -302,6 +358,8 @@ describe("createAgentSession stream options", () => {
 			"openai-completions",
 			{},
 			{ headers: { "x-explicit": "explicit" } },
+			undefined,
+			undefined,
 			(pi) => {
 				pi.on("before_provider_headers", (event) => {
 					event.headers["x-hook"] = [

@@ -6,9 +6,16 @@
  * - `pi --mode json "prompt"` - JSON event stream
  */
 
+import { createInterface } from "node:readline";
 import type { AssistantMessage, ImageContent } from "@earendil-works/pi-ai";
 import type { AgentSessionRuntime } from "../core/agent-session-runtime.ts";
 import { flushRawStdout, waitForRawStdoutBackpressure, writeRawStdout } from "../core/output-guard.ts";
+import {
+	closeSubagentControlChannel,
+	isSubagentControlEnabled,
+	openSubagentControlChannel,
+	resolvePendingReply,
+} from "../core/subagent-control.ts";
 import { killTrackedDetachedChildren } from "../utils/shell.ts";
 import { toJsonEvent } from "./json-event.ts";
 
@@ -35,13 +42,21 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 	let exitCode = 0;
 	let session = runtimeHost.session;
 	let unsubscribe: (() => void) | undefined;
+	let lastAssistantMessage: AssistantMessage | undefined;
+	let contextWindowStarted = false;
 	let unsubscribeBackpressure: (() => void) | undefined;
 	let disposed = false;
+	const controlEnabled = mode === "json" && isSubagentControlEnabled();
+	let controlInput: ReturnType<typeof createInterface> | undefined;
 	const signalCleanupHandlers: Array<() => void> = [];
 
 	const disposeRuntime = async (): Promise<void> => {
 		if (disposed) return;
 		disposed = true;
+		if (controlEnabled) {
+			controlInput?.close();
+			closeSubagentControlChannel("parent closed the channel");
+		}
 		unsubscribe?.();
 		unsubscribeBackpressure?.();
 		await runtimeHost.dispose();
@@ -73,6 +88,8 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 
 	const rebindSession = async (): Promise<void> => {
 		session = runtimeHost.session;
+		lastAssistantMessage = undefined;
+		contextWindowStarted = false;
 		await session.bindExtensions({
 			mode: mode === "json" ? "json" : "print",
 			commandContextActions: {
@@ -106,8 +123,34 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 		unsubscribe?.();
 		unsubscribeBackpressure?.();
 		unsubscribe = session.subscribe((event) => {
+			if (event.type === "message_end") {
+				if (event.message.role === "assistant") {
+					lastAssistantMessage = event.message;
+					contextWindowStarted = false;
+				} else if (event.message.role === "custom" && event.message.customType === "context-window") {
+					contextWindowStarted = true;
+				}
+			}
 			if (mode === "json") {
 				writeRawStdout(`${JSON.stringify(toJsonEvent(event))}\n`);
+				return;
+			}
+			// Text mode: a model escalation changes who answered, which a scripted
+			// caller should be able to see. stderr, so stdout stays just the answer.
+			if (event.type === "refusal_fallback") {
+				console.error(
+					`Safety classifier declined${event.category ? ` (${event.category})` : ""} on ${event.from} — escalating to ${event.to}`,
+				);
+			} else if (event.type === "refusal_fallback_exhausted") {
+				console.error(
+					`Safety classifier declined on ${event.from}; fallback chain exhausted (${event.tried.join(", ")})`,
+				);
+			} else if (event.type === "error_fallback") {
+				console.error(`${event.from} unavailable — rerouting to ${event.to} (${event.reason})`);
+			} else if (event.type === "error_fallback_exhausted") {
+				console.error(
+					`${event.from} unavailable (${event.reason}); error-fallback chain exhausted (${event.tried.join(", ")})`,
+				);
 			}
 		});
 		unsubscribeBackpressure =
@@ -128,20 +171,135 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 
 		await rebindSession();
 
+		// Only JSON subagent children interpret stdin as commands. Attach before the
+		// initial prompt: a parent must be able to answer message_parent mid-tool.
+		let inputClosed: Promise<void> | undefined;
+		const runningPrompts = new Set<Promise<void>>();
+		if (controlEnabled) {
+			openSubagentControlChannel();
+			controlInput = createInterface({ input: process.stdin, crlfDelay: Infinity });
+			let onControlClose!: () => void;
+			inputClosed = new Promise<void>((resolve) => {
+				let closed = false;
+				onControlClose = () => {
+					if (closed) return;
+					closed = true;
+					closeSubagentControlChannel("parent closed the channel");
+					resolve();
+				};
+				controlInput?.once("close", onControlClose);
+			});
+			if (process.stdin.readableEnded) {
+				onControlClose();
+				controlInput.close();
+			}
+
+			controlInput.on("line", (line) => {
+				let command: unknown;
+				try {
+					command = JSON.parse(line);
+				} catch {
+					console.error("Invalid subagent control command (ignored)");
+					return;
+				}
+				if (!command || typeof command !== "object" || Array.isArray(command) || !("type" in command)) {
+					console.error("Invalid subagent control command (ignored)");
+					return;
+				}
+
+				const reportCommandError = (error: unknown): void => {
+					console.error(error instanceof Error ? error.message : String(error));
+					exitCode = 1;
+				};
+				const { type } = command;
+				if (type === "steer" || type === "follow_up") {
+					if (!("message" in command) || typeof command.message !== "string") {
+						console.error("Invalid subagent control command (ignored)");
+						return;
+					}
+					// An accepted prompt may still be in preflight before isStreaming flips.
+					// In that case queue against it rather than starting a competing run.
+					if (session.isStreaming || runningPrompts.size > 0) {
+						const pending = type === "steer" ? session.steer(command.message) : session.followUp(command.message);
+						void pending.catch(reportCommandError);
+					} else {
+						const turn = session.prompt(command.message);
+						runningPrompts.add(turn);
+						void turn.catch(reportCommandError).finally(() => runningPrompts.delete(turn));
+					}
+					return;
+				}
+				if (type === "reply") {
+					if (
+						!("toolCallId" in command) ||
+						typeof command.toolCallId !== "string" ||
+						!("text" in command) ||
+						typeof command.text !== "string"
+					) {
+						console.error("Invalid subagent control command (ignored)");
+						return;
+					}
+					if (!resolvePendingReply(command.toolCallId, command.text)) {
+						console.error(`Unknown subagent reply id: ${command.toolCallId}`);
+					}
+					return;
+				}
+				if (type === "abort") {
+					void session.abort().catch(reportCommandError);
+					return;
+				}
+				console.error("Invalid subagent control command (ignored)");
+			});
+		}
+
 		if (initialMessage) {
-			await session.prompt(initialMessage, { images: initialImages });
+			const turn = session.prompt(initialMessage, { images: initialImages });
+			if (controlEnabled) runningPrompts.add(turn);
+			try {
+				await turn;
+			} catch (error: unknown) {
+				if (!controlEnabled) throw error;
+				console.error(error instanceof Error ? error.message : String(error));
+				exitCode = 1;
+			} finally {
+				runningPrompts.delete(turn);
+			}
 		}
 
 		for (const message of messages) {
-			await session.prompt(message);
+			lastAssistantMessage = undefined;
+			contextWindowStarted = false;
+			const turn = session.prompt(message);
+			if (controlEnabled) runningPrompts.add(turn);
+			try {
+				await turn;
+			} catch (error: unknown) {
+				if (!controlEnabled) throw error;
+				console.error(error instanceof Error ? error.message : String(error));
+				exitCode = 1;
+			} finally {
+				runningPrompts.delete(turn);
+			}
+		}
+
+		if (inputClosed) {
+			await inputClosed;
+			// EOF does not abort a turn. Commands accepted just before close must
+			// finish too, including tool waits rejected by the close handler.
+			await Promise.all([...runningPrompts]);
+			await session.waitForIdle();
 		}
 
 		if (mode === "text") {
-			const state = session.state;
-			const lastMessage = state.messages[state.messages.length - 1];
+			const activeLastMessage = session.state.messages.at(-1);
+			const assistantMsg =
+				activeLastMessage?.role === "assistant"
+					? activeLastMessage
+					: contextWindowStarted
+						? lastAssistantMessage
+						: undefined;
 
-			if (lastMessage?.role === "assistant") {
-				const assistantMsg = lastMessage as AssistantMessage;
+			if (assistantMsg) {
 				if (assistantMsg.stopReason === "error" || assistantMsg.stopReason === "aborted") {
 					console.error(assistantMsg.errorMessage || `Request ${assistantMsg.stopReason}`);
 					exitCode = 1;
@@ -164,6 +322,7 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 		console.error(error instanceof Error ? error.message : String(error));
 		return 1;
 	} finally {
+		controlInput?.close();
 		for (const cleanup of signalCleanupHandlers) {
 			cleanup();
 		}

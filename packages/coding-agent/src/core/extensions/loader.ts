@@ -32,6 +32,7 @@ import type {
 	MessageRenderer,
 	ProviderConfig,
 	RegisteredCommand,
+	SubagentSpawnHook,
 	ToolDefinition,
 	ToolRendererResolver,
 } from "./types.ts";
@@ -170,6 +171,8 @@ export function createExtensionRuntime(): ExtensionRuntime {
 	};
 
 	const runtime: ExtensionRuntime = {
+		subagentSpawnHooks: [],
+		emitSubagentSpawn: async () => ({}),
 		sendMessage: notInitialized,
 		sendUserMessage: notInitialized,
 		appendEntry: notInitialized,
@@ -271,6 +274,14 @@ function createExtensionAPI(
 	};
 
 	const api = {
+		onSubagentSpawn(handler: SubagentSpawnHook): void {
+			runtime.assertActive();
+			runtime.subagentSpawnHooks.push(handler);
+		},
+		emitSubagentSpawn(event: import("./types.ts").SubagentSpawnEvent): Promise<Record<string, string>> {
+			runtime.assertActive();
+			return runtime.emitSubagentSpawn?.(event) ?? Promise.resolve({});
+		},
 		// Registration methods - write to extension
 		on(event: string, handler: HandlerFn): () => void {
 			assertActive();
@@ -300,6 +311,18 @@ function createExtensionAPI(
 				definition: tool,
 				sourceInfo: extension.sourceInfo,
 			});
+			runtime.refreshTools();
+		},
+
+		registerTools(tools: readonly ToolDefinition[]): void {
+			runtime.assertActive();
+			if (tools.length === 0) return;
+			for (const tool of tools) {
+				extension.tools.set(tool.name, {
+					definition: tool,
+					sourceInfo: extension.sourceInfo,
+				});
+			}
 			runtime.refreshTools();
 		},
 
@@ -590,6 +613,15 @@ async function loadExtensionModule(extensionPath: string, cacheToken?: Extension
 		extensionCache.set(extensionPath, factory);
 	}
 	return factory;
+}
+
+/**
+ * Import an extension module from disk the way path extensions are imported
+ * (jiti with the bundled virtual modules or aliases), without registering it.
+ * Built-in extensions use this to load file-based code shipped next to phi.
+ */
+export async function importExtensionFactory(extensionPath: string): Promise<ExtensionFactory | undefined> {
+	return loadExtensionModule(extensionPath);
 }
 
 /**

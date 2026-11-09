@@ -10,9 +10,14 @@ import {
 import { allowNetwork } from "./test-network-env.ts";
 
 const originalSkipVersionCheck = process.env.PI_SKIP_VERSION_CHECK;
+const originalEnableVersionCheck = process.env.PHI_ENABLE_VERSION_CHECK;
 
 beforeEach(() => {
 	allowNetwork();
+	// The Exowatt fork defaults the automatic check OFF (core/exowatt-hardening.ts).
+	// Tests that exercise the check itself opt in explicitly.
+	delete process.env.PI_SKIP_VERSION_CHECK;
+	process.env.PHI_ENABLE_VERSION_CHECK = "1";
 });
 
 afterEach(() => {
@@ -21,6 +26,11 @@ afterEach(() => {
 		delete process.env.PI_SKIP_VERSION_CHECK;
 	} else {
 		process.env.PI_SKIP_VERSION_CHECK = originalSkipVersionCheck;
+	}
+	if (originalEnableVersionCheck === undefined) {
+		delete process.env.PHI_ENABLE_VERSION_CHECK;
+	} else {
+		process.env.PHI_ENABLE_VERSION_CHECK = originalEnableVersionCheck;
 	}
 });
 
@@ -127,5 +137,17 @@ describe("version checks", () => {
 
 		await expect(getLatestPiVersion("1.2.3")).resolves.toBe("1.2.4");
 		expect(fetchMock).toHaveBeenCalledOnce();
+	});
+
+	it("does not call pi.dev by default on the Exowatt fork", async () => {
+		// The whole point of the hardening: a stock phi with no env set never
+		// reaches pi.dev on startup.
+		delete process.env.PHI_ENABLE_VERSION_CHECK;
+		delete process.env.PI_SKIP_VERSION_CHECK;
+		const fetchMock = vi.fn();
+		vi.stubGlobal("fetch", fetchMock);
+
+		await expect(checkForNewPiVersion("1.2.3")).resolves.toBeUndefined();
+		expect(fetchMock).not.toHaveBeenCalled();
 	});
 });

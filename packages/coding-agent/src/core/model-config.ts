@@ -16,6 +16,21 @@ import { stripJsonComments } from "../utils/json.ts";
 import { normalizePath } from "../utils/paths.ts";
 import { stripBom } from "../utils/text.ts";
 
+// Keep the value permissive at the file boundary so an invalid soft ceiling can
+// be dropped per-model without rejecting the rest of models.json. The composer
+// validates that the value is a non-negative safe integer before it reaches Model.
+const ModelCompactionSchema = Type.Object(
+	{
+		softCeilingTokens: Type.Optional(
+			Type.Unknown({
+				description:
+					"Caps the context window this model's compaction thresholds use, in tokens; overrides the compaction.softCeilingTokens setting. A non-negative integer; 0 uses the raw window. Invalid values are ignored.",
+			}),
+		),
+	},
+	{ description: "Per-model compaction settings." },
+);
+
 const SamplingParamsSchema = Type.Record(Type.String(), Type.Unknown());
 const SamplingParamsByThinkingLevelSchema = Type.Object(
 	{
@@ -55,6 +70,7 @@ const ModelDefinitionSchema = Type.Object({
 	input: Type.Optional(Type.Array(ModelInputModalitySchema, { default: ["text"] })),
 	inputLimits: Type.Optional(ModelInputLimitsSchema),
 	cost: Type.Optional(ModelCostSchema),
+	compaction: Type.Optional(ModelCompactionSchema),
 	promptCache: Type.Optional(ModelPromptCacheSchema),
 	contextWindow: Type.Optional(
 		Type.Number({ exclusiveMinimum: 0, default: 128000, description: ModelFieldDescriptions.contextWindow }),
@@ -70,6 +86,8 @@ const ModelDefinitionSchema = Type.Object({
 
 const ModelOverrideSchema = Type.Object({
 	name: Type.Optional(Type.String({ minLength: 1, description: ModelFieldDescriptions.name })),
+	/** phi: a model override may move a model to another API (e.g. a gateway alias onto openai-responses). */
+	api: Type.Optional(Type.String({ minLength: 1 })),
 	reasoning: Type.Optional(Type.Boolean({ description: ModelFieldDescriptions.reasoning })),
 	thinkingLevelMap: Type.Optional(ThinkingLevelMapSchema),
 	input: Type.Optional(Type.Array(ModelInputModalitySchema)),
@@ -79,6 +97,8 @@ const ModelOverrideSchema = Type.Object({
 	contextWindow: Type.Optional(
 		Type.Number({ exclusiveMinimum: 0, description: ModelFieldDescriptions.contextWindow }),
 	),
+	/** phi: per-model compaction ceiling. */
+	compaction: Type.Optional(ModelCompactionSchema),
 	maxTokens: Type.Optional(Type.Number({ exclusiveMinimum: 0, description: ModelFieldDescriptions.maxTokens })),
 	samplingParams: Type.Optional(SamplingParamsFieldSchema),
 	samplingParamsByThinkingLevel: Type.Optional(SamplingParamsByThinkingLevelSchema),
@@ -155,6 +175,46 @@ function deepFreeze<T>(value: T): T {
 	return Object.freeze(value);
 }
 
+/**
+ * Merge one provider config over another, with `over` taking precedence. Scalar
+ * fields from `over` replace `base`; `models` arrays concatenate with a later
+ * definition of the same `id` replacing the earlier one; `modelOverrides` merge
+ * by key. This is the per-provider half of the layered merge below.
+ */
+function mergeProviderConfig(base: ModelsJsonProvider, over: ModelsJsonProvider): ModelsJsonProvider {
+	const merged: ModelsJsonProvider = { ...base, ...over };
+
+	if (base.models || over.models) {
+		const byId = new Map<string, ModelsJsonModel>();
+		for (const model of [...(base.models ?? []), ...(over.models ?? [])]) byId.set(model.id, model);
+		merged.models = [...byId.values()];
+	}
+	if (base.modelOverrides || over.modelOverrides) {
+		merged.modelOverrides = { ...base.modelOverrides, ...over.modelOverrides };
+	}
+	if (base.headers || over.headers) {
+		merged.headers = { ...base.headers, ...over.headers };
+	}
+	return merged;
+}
+
+/**
+ * Merge a lower-precedence provider map with a higher-precedence one. A provider
+ * present in both is merged field-by-field with the higher layer winning; a
+ * provider present in only one is carried through unchanged.
+ */
+function mergeProviderMaps(
+	lower: ReadonlyMap<string, ModelsJsonProvider>,
+	higher: ReadonlyMap<string, ModelsJsonProvider>,
+): Map<string, ModelsJsonProvider> {
+	const merged = new Map<string, ModelsJsonProvider>(lower);
+	for (const [providerId, provider] of higher) {
+		const existing = merged.get(providerId);
+		merged.set(providerId, existing ? mergeProviderConfig(existing, provider) : provider);
+	}
+	return merged;
+}
+
 /** One immutable load of models.json. */
 export class ModelConfig {
 	private readonly providers: ReadonlyMap<string, ModelsJsonProvider>;
@@ -167,26 +227,56 @@ export class ModelConfig {
 
 	static async load(modelsJsonPath: string | undefined): Promise<ModelConfig> {
 		if (!modelsJsonPath) return new ModelConfig(new Map());
+		const { providers, error } = await ModelConfig.loadProviderMap(modelsJsonPath);
+		return new ModelConfig(providers, error);
+	}
+
+	/**
+	 * Load and merge several models.json sources into one config. Sources are
+	 * ordered lowest precedence first, highest last: a provider or field defined
+	 * in a later source wins over an earlier one. phi uses this to layer enabled
+	 * hub model bundles beneath the user's own `~/.pi/agent/models.json`, which is
+	 * therefore always the final — highest precedence — source. The merge is
+	 * deterministic in the order given, so multiple bundles compose predictably.
+	 */
+	static async loadLayered(modelsJsonPaths: readonly (string | undefined)[]): Promise<ModelConfig> {
+		const paths = modelsJsonPaths.filter((path): path is string => Boolean(path));
+		if (paths.length === 0) return new ModelConfig(new Map());
+		if (paths.length === 1) return ModelConfig.load(paths[0]);
+
+		let merged = new Map<string, ModelsJsonProvider>();
+		const errors: string[] = [];
+		for (const path of paths) {
+			const { providers, error } = await ModelConfig.loadProviderMap(path);
+			if (error) errors.push(error);
+			merged = mergeProviderMaps(merged, providers);
+		}
+		return new ModelConfig(merged, errors.length > 0 ? errors.join("\n\n") : undefined);
+	}
+
+	private static async loadProviderMap(
+		modelsJsonPath: string,
+	): Promise<{ providers: Map<string, ModelsJsonProvider>; error?: string }> {
 		const path = normalizePath(modelsJsonPath);
 		let content: string;
 		try {
 			content = await readFile(path, "utf-8");
 		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code === "ENOENT") return new ModelConfig(new Map());
-			return new ModelConfig(
-				new Map(),
-				`Failed to load models.json: ${error instanceof Error ? error.message : error}\n\nFile: ${path}`,
-			);
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return { providers: new Map() };
+			return {
+				providers: new Map(),
+				error: `Failed to load models.json: ${error instanceof Error ? error.message : error}\n\nFile: ${path}`,
+			};
 		}
 
 		let parsed: unknown;
 		try {
 			parsed = JSON.parse(stripJsonComments(stripBom(content)));
 		} catch (error) {
-			return new ModelConfig(
-				new Map(),
-				`Failed to parse models.json: ${error instanceof Error ? error.message : error}\n\nFile: ${path}`,
-			);
+			return {
+				providers: new Map(),
+				error: `Failed to parse models.json: ${error instanceof Error ? error.message : error}\n\nFile: ${path}`,
+			};
 		}
 
 		if (!validateModelsConfig.Check(parsed)) {
@@ -195,14 +285,14 @@ export class ModelConfig {
 					.Errors(parsed)
 					.map((error) => `  - ${formatValidationPath(error)}: ${error.message}`)
 					.join("\n") || "Unknown schema error";
-			return new ModelConfig(new Map(), `Invalid models.json schema:\n${errors}\n\nFile: ${path}`);
+			return { providers: new Map(), error: `Invalid models.json schema:\n${errors}\n\nFile: ${path}` };
 		}
 
 		const providers = new Map<string, ModelsJsonProvider>();
 		for (const [providerId, provider] of Object.entries(parsed.providers)) {
 			providers.set(providerId, deepFreeze(structuredClone(provider)));
 		}
-		return new ModelConfig(providers);
+		return { providers };
 	}
 
 	getProvider(providerId: string): ModelsJsonProvider | undefined {

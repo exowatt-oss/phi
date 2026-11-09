@@ -71,6 +71,9 @@ export interface ProviderChatModelConfig extends ProviderModelConfigBase {
 	maxTokens: number;
 	samplingParams?: Model<Api>["samplingParams"];
 	samplingParamsByThinkingLevel?: Model<Api>["samplingParamsByThinkingLevel"];
+	/** phi: request-time image limits and the per-model compaction ceiling. */
+	inputLimits?: Model<Api>["inputLimits"];
+	compaction?: Model<Api>["compaction"];
 	compat?: Model<Api>["compat"];
 }
 
@@ -116,6 +119,22 @@ export type AuthStatus = {
 };
 
 export const clearApiKeyCache = clearConfigValueCache;
+
+function normalizeCompaction(value: unknown): Model<Api>["compaction"] {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+	const softCeilingTokens = (value as { softCeilingTokens?: unknown }).softCeilingTokens;
+	return typeof softCeilingTokens === "number" && Number.isSafeInteger(softCeilingTokens) && softCeilingTokens >= 0
+		? { softCeilingTokens }
+		: undefined;
+}
+
+function mergeCompaction(
+	base: Model<Api>["compaction"],
+	override: ModelsJsonModelOverride["compaction"],
+): Model<Api>["compaction"] {
+	const normalized = normalizeCompaction(override);
+	return normalized ? { ...base, ...normalized } : base;
+}
 
 function getAllProviderModels(provider: Provider | undefined): readonly AnyModel[] {
 	return provider ? (provider.getAllModels?.() ?? provider.getModels()) : [];
@@ -177,8 +196,10 @@ function mergeSamplingParamsByThinkingLevel(
 }
 
 function applyModelOverride(model: Model<Api>, override: ModelsJsonModelOverride): Model<Api> {
+	const compaction = mergeCompaction(model.compaction, override.compaction);
 	return {
 		...model,
+		api: (override.api as Api | undefined) ?? model.api,
 		name: override.name ?? model.name,
 		reasoning: override.reasoning ?? model.reasoning,
 		thinkingLevelMap: override.thinkingLevelMap
@@ -197,6 +218,7 @@ function applyModelOverride(model: Model<Api>, override: ModelsJsonModelOverride
 			: model.cost,
 		promptCache: override.promptCache ? { ...model.promptCache, ...override.promptCache } : model.promptCache,
 		contextWindow: override.contextWindow ?? model.contextWindow,
+		...(compaction ? { compaction } : {}),
 		maxTokens: override.maxTokens ?? model.maxTokens,
 		samplingParams: override.samplingParams
 			? { ...model.samplingParams, ...override.samplingParams }
@@ -229,6 +251,7 @@ function modelFromJson(
 	if (definition.maxTokens !== undefined && definition.maxTokens <= 0) {
 		throw new Error(`Provider ${providerId}, model ${definition.id}: invalid maxTokens`);
 	}
+	const compaction = normalizeCompaction(definition.compaction);
 	return {
 		id: definition.id,
 		name: definition.name ?? definition.id,
@@ -242,6 +265,7 @@ function modelFromJson(
 		cost: definition.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		promptCache: definition.promptCache,
 		contextWindow: definition.contextWindow ?? 128000,
+		...(compaction ? { compaction } : {}),
 		maxTokens: definition.maxTokens ?? 16384,
 		samplingParams: definition.samplingParams,
 		samplingParamsByThinkingLevel: definition.samplingParamsByThinkingLevel,
@@ -296,7 +320,15 @@ function extensionModelFromDefinition(
 	if (definition.type === "classifier") {
 		return { ...definition, api: api as ClassifierApi, provider: providerId, baseUrl, headers: undefined };
 	}
-	return { ...definition, api: api as Api, provider: providerId, baseUrl, headers: undefined };
+	const compaction = normalizeCompaction(definition.compaction);
+	return {
+		...definition,
+		api: api as Api,
+		provider: providerId,
+		baseUrl,
+		...(compaction ? { compaction } : {}),
+		headers: undefined,
+	};
 }
 
 function applyModelsJson(

@@ -79,6 +79,8 @@ export type {
 	CacheWarmingDecisionEventResult,
 	CompactionEntryDraft,
 	CompactOptions,
+	ContextBreakdown,
+	ContextBreakdownCategory,
 	ContextEditEntryDraft,
 	ContextEvent,
 	ContextEventResult,
@@ -132,6 +134,7 @@ export type {
 	MessageUpdateEvent,
 	ModelSelectEvent,
 	ModelSelectSource,
+	NewContextRequest,
 	NormalizedBuildSystemPromptOptions,
 	PowerShellToolCallEvent,
 	ProjectTrustContext,
@@ -148,6 +151,7 @@ export type {
 	ResolvedCommand,
 	ResourcesDiscoverEvent,
 	ResourcesDiscoverResult,
+	SessionBeforeAutoCompactEvent,
 	SessionBeforeCompactEvent,
 	SessionBeforeCompactResult,
 	SessionBeforeForkEvent,
@@ -283,6 +287,7 @@ export {
 	type CompactionEntry,
 	type ContextEditableContent,
 	type ContextEditEntry,
+	type ContextWindowEntry,
 	CURRENT_SESSION_VERSION,
 	type CustomEntry,
 	type CustomMessageEntry,
@@ -409,8 +414,26 @@ export {
 // Built-in extensions. The CLI loads them; SDK sessions add them to their extension factories.
 export { type CodemodeExtensionOptions, createCodemodeExtension } from "./extensions/codemode/index.ts";
 export type { CodemodeStoreEntryData, CodemodeToolDetails } from "./extensions/codemode/tool.ts";
-export type { LoadedMcpConfig, McpExposure, McpServerConfig, McpServerEntry } from "./extensions/mcp/config.ts";
-export { createMcpExtension, type McpExtensionOptions, type McpTransportFactory } from "./extensions/mcp/index.ts";
+export type { McpOAuthBridgeTimeoutOverrides, McpOAuthRequestIdFactory } from "./extensions/mcp/oauth/command-host.ts";
+export {
+	createCommandMcpOAuthHost,
+	createMcpOAuthHostIntegration,
+	MCP_OAUTH_BRIDGE_COMMAND_ENV,
+	MCP_OAUTH_BRIDGE_ERROR_CODES,
+	MCP_OAUTH_BRIDGE_TIMEOUT_MS,
+} from "./extensions/mcp/oauth/command-host.ts";
+export type { McpOAuthHostCode, McpOAuthHostIntegration } from "./extensions/mcp/oauth/host.ts";
+export {
+	MCP_OAUTH_BRIDGE_SCHEMA,
+	MCP_OAUTH_CALLBACK_PATH,
+	MCP_OAUTH_MAX_LEASE_TTL_MS,
+	MCP_OAUTH_MAX_REQUEST_BYTES,
+	MCP_OAUTH_MAX_REQUEST_ID_LENGTH,
+	MCP_OAUTH_MAX_RESPONSE_BYTES,
+	MCP_OAUTH_MAX_URL_LENGTH,
+	McpOAuthHostError,
+	validateLoopbackRedirectUri,
+} from "./extensions/mcp/oauth/host.ts";
 export { createToolSearchExtension } from "./extensions/tool-search/index.ts";
 // Main entry point
 export { type MainOptions, main } from "./main.ts";
@@ -427,6 +450,7 @@ export {
 	type RpcEventListener,
 	type RpcExtensionUIRequest,
 	type RpcExtensionUIResponse,
+	type RpcModelInfo,
 	type RpcResponse,
 	type RpcSessionState,
 	runPrintMode,

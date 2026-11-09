@@ -535,7 +535,9 @@ describe("AgentSession actionable boundaries", () => {
 		await harness.session.prompt("small prompt");
 
 		expect(harness.eventsOfType("compaction_start")).toEqual([]);
-		expect(harness.session.getContextUsage()?.tokens).toBeLessThan(2_000);
+		// phi's calibrated overhead estimate (prose at 3.5 chars/token, tool JSON at 2.3) puts the
+		// default prompt and tools near 2.3k tokens; the point is that the reported usage is not reused.
+		expect(harness.session.getContextUsage()?.tokens).toBeLessThan(3_000);
 	});
 
 	it("does not trigger successful-response overflow from usage captured before a boundary edit", async () => {
@@ -572,7 +574,9 @@ describe("AgentSession actionable boundaries", () => {
 		await harness.session.prompt("large input that is later omitted");
 
 		expect(harness.eventsOfType("compaction_start")).toEqual([]);
-		expect(harness.session.getContextUsage()?.tokens).toBeLessThan(2_000);
+		// phi's calibrated overhead estimate (prose at 3.5 chars/token, tool JSON at 2.3) puts the
+		// default prompt and tools near 2.3k tokens; the point is that the reported usage is not reused.
+		expect(harness.session.getContextUsage()?.tokens).toBeLessThan(3_000);
 	});
 
 	it("does not trigger threshold compaction from post-edit usage captured before a later compaction", async () => {
@@ -773,7 +777,8 @@ describe("durable length recovery", () => {
 
 		expect(executed).toBe(false);
 		expect(harness.faux.state.callCount).toBe(2);
-		expect(requests[0]).toContain("may be truncated");
+		// phi words the failed call differently (packages/agent agent-loop.ts); both texts share this phrase.
+		expect(requests[0]).toContain("hit the output token limit");
 		expect(harness.sessionManager.getEntries().some((entry) => entry.type === "context_edit")).toBe(false);
 	});
 

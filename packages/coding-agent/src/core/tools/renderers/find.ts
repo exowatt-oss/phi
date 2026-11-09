@@ -38,12 +38,28 @@ function formatFindResult(
 	options: ToolRenderResultOptions,
 	theme: Theme,
 	showImages: boolean,
+	isError: boolean,
 ): string {
 	const output = getTextOutput(result, showImages).trim();
+	const resultLimit = result.details?.resultLimitReached;
+	const truncation = result.details?.truncation;
+
+	// Minimal display: one muted summary line, no payload. Errors and expanded views keep content.
+	if (options.display === "minimal" && !options.expanded && !isError) {
+		if (!output) return "";
+		const lines = output.split("\n");
+		// A single line is a status message such as "No files found matching pattern": show it as is.
+		if (lines.length === 1) return `\n${theme.fg("muted", `⎿ ${lines[0]}`)}`;
+		// Path rows only: execute() appends blank lines plus a bracketed notice when limits were hit.
+		const fileCount = lines.filter((line) => line.trim() !== "" && !line.startsWith("[")).length;
+		const truncated = resultLimit || truncation?.truncated;
+		return `\n${theme.fg("muted", `⎿ ${fileCount} file${fileCount === 1 ? "" : "s"}${truncated ? " · truncated" : ""} (`)}${keyHint("app.tools.expand", "to expand")}${theme.fg("muted", ")")}`;
+	}
+
 	let text = "";
 	if (output) {
 		const lines = output.split("\n");
-		const maxLines = options.expanded ? lines.length : 20;
+		const maxLines = options.expanded ? lines.length : (options.collapsedLines ?? 20);
 		const displayLines = lines.slice(0, maxLines);
 		const remaining = lines.length - maxLines;
 		text += `\n${displayLines.map((line) => theme.fg("toolOutput", line)).join("\n")}`;
@@ -52,8 +68,6 @@ function formatFindResult(
 		}
 	}
 
-	const resultLimit = result.details?.resultLimitReached;
-	const truncation = result.details?.truncation;
 	if (resultLimit || truncation?.truncated) {
 		const warnings: string[] = [];
 		if (resultLimit) warnings.push(`${resultLimit} results limit`);
@@ -71,7 +85,7 @@ export const findRenderers: Pick<ToolDefinition<any, any>, "renderCall" | "rende
 	},
 	renderResult(result, options, theme, context) {
 		const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
-		text.setText(formatFindResult(result as any, options, theme, context.showImages));
+		text.setText(formatFindResult(result as any, options, theme, context.showImages, context.isError));
 		return text;
 	},
 };

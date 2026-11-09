@@ -46,6 +46,7 @@ import type {
 	ModelThinkingLevel,
 	ModelType,
 	ModelTypeMap,
+	OpenAIResponsesCompat,
 	ProviderClassifier,
 	ProviderHeaders,
 	ProviderImages,
@@ -67,6 +68,7 @@ import {
 	imageErrorResult,
 	isModelType,
 } from "./utils/model-operations.ts";
+import { withStreamIdleGuard } from "./utils/stream-idle-guard.ts";
 import { normalizeContext } from "./utils/transcript.ts";
 
 export { ModelsError, type ModelsErrorCode } from "./auth/resolve.ts";
@@ -307,9 +309,11 @@ export interface Models {
 	 * Resolve provider-scoped auth by provider id, or provider auth plus static
 	 * model headers when passed a model. Includes a source label for status UI.
 	 * Resolves `undefined` when the provider is unknown or unconfigured.
-	 * Rejects with `ModelsError`: code "oauth" when a token refresh fails (the
-	 * stored credential is preserved for retry; re-login fixes it), code "auth"
-	 * when api-key resolution or the credential store fails. Request paths
+	 * Rejects with `ModelsError`: code "oauth" for a non-terminal token refresh
+	 * failure (the stored credential is preserved for retry), code "auth_required"
+	 * for terminal `invalid_grant` (the rejected credential is atomically removed
+	 * when the store supports it, and interactive re-login is required), or code
+	 * "auth" when api-key resolution or the credential store fails. Request paths
 	 * surface rejections as stream errors.
 	 */
 	getAuth(providerId: string, overrides?: AuthResolutionOverrides): Promise<AuthResult | undefined>;
@@ -636,6 +640,7 @@ class ModelsImpl implements MutableModels {
 			if (signal.aborted) return undefined;
 			// A refresh that has started survives cancellation or a superseding model refresh, so a
 			// rotated refresh token is always persisted. A newer refresh then sees the fresh credential.
+			// Concurrent catalog refreshes share one rotation of the stored token (process-local singleflight).
 			return refreshStoredOAuthCredential(
 				this.credentials,
 				provider.id,
@@ -904,17 +909,24 @@ class ModelsImpl implements MutableModels {
 		options?: ModelsApiStreamOptions<TApi>,
 	): AssistantMessageEventStream {
 		const transcript = normalizeContext(context);
-		return lazyStream(
-			model,
-			async () => {
-				const provider = this.requireChatProvider(model);
-				const { requestModel, requestOptions } = await this.applyAuth(
-					model,
-					options as ModelsApiStreamOptions<Api> | undefined,
-				);
-				return provider.stream(requestModel, transcript, requestOptions as ApiStreamOptions<TApi>);
-			},
-			observeModelRequest(model, options, false),
+		return withStreamIdleGuard(model, options, (guardedOptions) =>
+			lazyStream(
+				model,
+				async () => {
+					const provider = this.requireChatProvider(model);
+					const { requestModel, requestOptions } = await this.applyAuth(
+						model,
+						guardedOptions as ModelsApiStreamOptions<Api> | undefined,
+					);
+					return provider.stream(
+						requestModel as Model<TApi>,
+						transcript,
+						requestOptions as ApiStreamOptions<TApi>,
+					);
+				},
+				observeModelRequest(model, guardedOptions, false),
+				options?.signal,
+			),
 		);
 	}
 
@@ -928,14 +940,17 @@ class ModelsImpl implements MutableModels {
 
 	streamSimple(model: Model<Api>, context: Context, options?: ModelsSimpleStreamOptions): AssistantMessageEventStream {
 		const transcript = normalizeContext(context);
-		return lazyStream(
-			model,
-			async () => {
-				const provider = this.requireChatProvider(model);
-				const { requestModel, requestOptions } = await this.applyAuth(model, options);
-				return provider.streamSimple(requestModel, transcript, requestOptions as SimpleStreamOptions);
-			},
-			observeModelRequest(model, options, false),
+		return withStreamIdleGuard(model, options, (guardedOptions) =>
+			lazyStream(
+				model,
+				async () => {
+					const provider = this.requireChatProvider(model);
+					const { requestModel, requestOptions } = await this.applyAuth(model, guardedOptions);
+					return provider.streamSimple(requestModel, transcript, requestOptions as SimpleStreamOptions);
+				},
+				observeModelRequest(model, guardedOptions, false),
+				options?.signal,
+			),
 		);
 	}
 
@@ -963,6 +978,7 @@ class ModelsImpl implements MutableModels {
 				return provider.fetchDeferred(requestModel, handle, requestOptions as DeferredFetchOptions);
 			},
 			observeModelRequest(model, options, true),
+			options?.signal,
 		);
 	}
 
@@ -1256,6 +1272,71 @@ export function calculateCost(model: AnyModel, usage: Usage): Usage["cost"] {
 }
 
 const EXTENDED_THINKING_LEVELS: ModelThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+/**
+ * Whether Anthropic fast mode (`speed: "fast"`) is worth sending to this model.
+ * Explicit `compat.supportsFastMode` wins; otherwise only first-party Claude
+ * Opus 5.5, Opus 5, and Opus 4.8 on the Anthropic Messages API (with or without
+ * a date suffix) qualify, which is the set the Claude API serves in fast mode.
+ * Opus 4.7 rejects the parameter and Opus 4.6 silently ignores it, so neither
+ * is included; Bedrock, Vertex, and other hosts do not offer fast mode at all.
+ */
+export function supportsFastMode<TApi extends Api>(model: Model<TApi>): boolean {
+	if (model.api !== "anthropic-messages") return false;
+	const compat = model.compat as { supportsFastMode?: boolean } | undefined;
+	if (compat?.supportsFastMode !== undefined) return compat.supportsFastMode;
+	if (model.provider !== "anthropic") return false;
+	return /^claude-opus-(?:5-5|5|4-8)(?:-\d{8})?$/.test(model.id);
+}
+
+const BEDROCK_OPENAI_BASE_URL =
+	/^https:\/\/bedrock-(?:mantle|runtime)\.[a-z0-9-]+\.(?:api\.aws|amazonaws\.com)(?:\/|$)/i;
+const BEDROCK_ULTRAFAST_MODEL = /(?:^|\.)gpt-6(?:-astra|\.1-sol)(?:$|[-:])/;
+
+/** Whether a model is served by Amazon Bedrock's OpenAI-compatible endpoint (Mantle or bedrock-runtime `/openai/v1`). */
+export function isBedrockOpenAIEndpoint<TApi extends Api>(model: Pick<Model<TApi>, "baseUrl">): boolean {
+	return BEDROCK_OPENAI_BASE_URL.test(model.baseUrl ?? "");
+}
+
+/**
+ * The OpenAI Responses `service_tier` phi sends for the session's `fast` tier, with its price
+ * multiplier, or undefined when the model uses OpenAI's own `fast` spelling at 2×. Explicit
+ * `compat.fastServiceTier` wins; otherwise GPT-6 Astra and GPT-6.1 Sol on Amazon Bedrock map `fast` to
+ * `ultrafast` (about 4× faster, billed at 6× every rate). Bedrock only accepts the tier on the
+ * Responses API; Converse rejects it.
+ */
+export function getOpenAIResponsesFastServiceTier<TApi extends Api>(
+	model: Model<TApi>,
+): { tier: string; costMultiplier: number } | undefined {
+	if (model.api !== "openai-responses") return undefined;
+	const compat = model.compat as OpenAIResponsesCompat | undefined;
+	if (compat?.fastServiceTier) {
+		return { tier: compat.fastServiceTier, costMultiplier: compat.fastServiceTierCostMultiplier ?? 2 };
+	}
+	if (isBedrockOpenAIEndpoint(model) && BEDROCK_ULTRAFAST_MODEL.test(model.id)) {
+		return { tier: "ultrafast", costMultiplier: compat?.fastServiceTierCostMultiplier ?? 6 };
+	}
+	return undefined;
+}
+
+/**
+ * Error for a `fast` request to an Amazon Bedrock OpenAI endpoint that has no known fast wire
+ * tier for the model, or undefined when the request is fine. Bedrock has no `fast` spelling
+ * (it accepts auto, default, flex, priority, ultrafast) and per-model availability varies, so
+ * phi refuses locally instead of sending an invalid tier or silently running at standard speed.
+ */
+export function getUnsupportedFastServiceTierError<TApi extends Api>(
+	model: Model<TApi>,
+	serviceTier: string | undefined,
+): string | undefined {
+	if (serviceTier !== "fast" || !isBedrockOpenAIEndpoint(model) || getOpenAIResponsesFastServiceTier(model)) {
+		return undefined;
+	}
+	return (
+		`Fast mode is not supported for Amazon Bedrock model ${model.id}: Bedrock has no "fast" service tier. ` +
+		`Use --service-tier default (or /fast off); UltraFast is available on openai.gpt-6-astra and openai.gpt-6.1-sol (--service-tier ultrafast).`
+	);
+}
 
 export function getSupportedThinkingLevels<TApi extends Api>(model: Model<TApi>): ModelThinkingLevel[] {
 	if (!model.reasoning) return ["off"];

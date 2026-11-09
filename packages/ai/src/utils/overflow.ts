@@ -13,6 +13,7 @@ import type { AssistantMessage } from "../types.ts";
  * - OpenAI: "Your input exceeds the context window of this model"
  * - OpenAI/LiteLLM: "Requested token count exceeds the model's maximum context length of 131072 tokens"
  * - OpenAI-compatible: "Input length (265330) exceeds model's maximum context length (262144)."
+ * - LiteLLM/OpenAI-compatible: "integer_below_min_value ... max_output_tokens ..."
  * - Google: "The input token count (1196265) exceeds the maximum number of tokens allowed (1048575)"
  * - xAI: "This model's maximum prompt length is 131072 but the request contains 537812 tokens"
  * - Groq: "Please reduce the length of the messages or completion"
@@ -61,12 +62,25 @@ const OVERFLOW_PATTERNS = [
 	/context[_ ]length[_ ]exceeded/i, // Generic fallback
 	/too many tokens/i, // Generic fallback
 	/token limit exceeded/i, // Generic fallback
+	/(?:max_output_tokens|max_tokens|max_completion_tokens)[\s\S]{0,200}integer_below_min_value|integer_below_min_value[\s\S]{0,200}(?:max_output_tokens|max_tokens|max_completion_tokens)/i, // LiteLLM/OpenAI-compatible gateways: a computed below-minimum output budget means the input filled the context window, so compaction is the right recovery
+	/(?:invalid\s+['"\\]*(?:max_output_tokens|max_tokens|max_completion_tokens)['"\\]*\s*:\s*)integer\s+below\s+minimum\s+value/i, // LiteLLM/OpenAI-compatible gateways: human-readable below-minimum output budget is semantically context overflow
 	// HTTP 413 means request-size overflow regardless of provider or body text.
 	// Match raw SDK errors and formatProviderError's prefix, not a status mentioned in the body.
-	/^(?:[\w -]+ API error \(413\):|413(?:\s|:|$))/i,
+	// phi: also tolerate attributeProviderError's `provider/model[ (gateway served x)]: ` prefix, for
+	// messages that reach this check without a providerErrorMessage.
+	/^(?:[^\s/]+\/\S+?(?: \(gateway served [^)]*\))?: )?(?:[\w -]+ API error \(413\):|413(?:\s|:|$))/i,
 ];
 
-const CEREBRAS_BODYLESS_OVERFLOW_PATTERN = /^4(?:00|13)\s*(?:status code)?\s*\(no body\)/i;
+/**
+ * Cerebras: 400/413 with no body (other providers send a bodyless 400/413 for
+ * unrelated failures, so this only counts for `provider === "cerebras"`).
+ * Deliberately unanchored: phi prefixes a provider error with the model it asked
+ * (`cerebras/<model>: 400 status code (no body)`), which an anchored pattern
+ * stops matching when `providerErrorMessage` is absent. `(no body)` is specific
+ * enough on its own; it is the OpenAI SDK's wording for an error response that
+ * carried nothing to parse.
+ */
+const CEREBRAS_BODYLESS_OVERFLOW_PATTERN = /4(?:00|13)\s*(?:status code)?\s*\(no body\)/i;
 
 /**
  * Patterns that indicate non-overflow errors (e.g. rate limiting, server errors).
@@ -78,7 +92,11 @@ const CEREBRAS_BODYLESS_OVERFLOW_PATTERN = /^4(?:00|13)\s*(?:status code)?\s*\(n
  * pattern without this exclusion.
  */
 const NON_OVERFLOW_PATTERNS = [
-	/^(Throttling error|Service unavailable):/i, // AWS Bedrock non-overflow errors (human-readable prefixes from formatBedrockError)
+	// AWS Bedrock non-overflow errors (human-readable prefixes from formatBedrockError).
+	// Unanchored for the same reason as the Cerebras pattern above: an attribution
+	// prefix, or any wrapper that quotes the provider message, moves it off the start
+	// of the string. Both phrases are distinctive enough to stand alone.
+	/(Throttling error|Service unavailable):/i,
 	/rate limit/i, // Generic rate limiting
 	/too many requests/i, // Generic HTTP 429 style
 ];
@@ -142,13 +160,21 @@ const NON_OVERFLOW_PATTERNS = [
 export function isContextOverflow(message: AssistantMessage, contextWindow?: number): boolean {
 	// Case 1: Check error message patterns
 	if (message.stopReason === "error" && message.errorMessage) {
+		// The provider's own text when phi attributed the message to a model, so the
+		// patterns below never match against phi's `provider/modelId` prefix. See
+		// AssistantMessage.providerErrorMessage.
+		const errorMessage = message.providerErrorMessage ?? message.errorMessage;
 		// Skip messages matching known non-overflow patterns (e.g. throttling / rate-limit)
-		const isNonOverflow = NON_OVERFLOW_PATTERNS.some((p) => p.test(message.errorMessage!));
+		const isNonOverflow = NON_OVERFLOW_PATTERNS.some((p) => p.test(errorMessage));
 		if (!isNonOverflow) {
-			if (OVERFLOW_PATTERNS.some((p) => p.test(message.errorMessage!))) {
+			if (OVERFLOW_PATTERNS.some((p) => p.test(errorMessage))) {
 				return true;
 			}
-			if (message.provider === "cerebras" && CEREBRAS_BODYLESS_OVERFLOW_PATTERN.test(message.errorMessage)) {
+			// phi: a LiteLLM gateway may forward the same bodyless 400/413 from its upstream.
+			if (
+				(message.provider === "cerebras" || message.provider === "gateway") &&
+				CEREBRAS_BODYLESS_OVERFLOW_PATTERN.test(errorMessage)
+			) {
 				return true;
 			}
 		}

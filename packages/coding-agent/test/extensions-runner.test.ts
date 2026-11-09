@@ -17,6 +17,7 @@ import {
 } from "../src/core/extensions/loader.ts";
 import { ExtensionRunner, emitProjectTrustEvent } from "../src/core/extensions/runner.ts";
 import type {
+	EntryRenderer,
 	ExtensionActions,
 	ExtensionContextActions,
 	ExtensionFactory,
@@ -106,6 +107,7 @@ describe("ExtensionRunner", () => {
 		hasPendingMessages: () => false,
 		shutdown: () => {},
 		getContextUsage: () => undefined,
+		getCompactionSettings: () => ({ enabled: true, reserveTokens: 16384, keepRecentTokens: 20000 }),
 		compact: () => {},
 		getSystemPrompt: () => "",
 		getScopedModels: () => [],
@@ -599,6 +601,156 @@ describe("ExtensionRunner", () => {
 		});
 	});
 
+	describe("ui prompt events", () => {
+		type RecordedUIPromptEvent = { type: string; reason: string; kind: string; title?: string; hasUI: boolean };
+		const recordKey = "__phiUIPromptEventsTest";
+		const flush = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+		const events = () => (globalThis as Record<string, unknown>)[recordKey] as RecordedUIPromptEvent[];
+
+		const createRunner = async (handlerBody = "") => {
+			(globalThis as Record<string, unknown>)[recordKey] = [];
+			fs.writeFileSync(
+				path.join(extensionsDir, "ui-prompt-events.ts"),
+				`
+				export default function(pi) {
+					for (const type of ["ui_prompt_start", "ui_prompt_end"]) {
+						pi.on(type, async (event, ctx) => {
+							globalThis.${recordKey}.push({ ...event, hasUI: ctx.hasUI });
+							${handlerBody}
+						});
+					}
+				}
+			`,
+			);
+			const result = await discoverAndLoadExtensions([], tempDir, tempDir);
+			const runner = new ExtensionRunner(result.extensions, result.runtime, tempDir, sessionManager, modelRegistry);
+			runner.bindCore(extensionActions, extensionContextActions);
+			return runner;
+		};
+
+		const createUI = (overrides: Partial<ExtensionUIContext> = {}): ExtensionUIContext =>
+			({
+				select: async () => "a",
+				confirm: async () => true,
+				input: async () => "typed",
+				editor: async () => "edited",
+				custom: async () => "custom",
+				...overrides,
+			}) as unknown as ExtensionUIContext;
+
+		afterEach(() => {
+			delete (globalThis as Record<string, unknown>)[recordKey];
+		});
+
+		it("emits start and end around each ctx.ui dialog kind", async () => {
+			const runner = await createRunner();
+			runner.setUIContext(createUI(), "tui");
+			const ui = runner.createContext().ui;
+
+			expect(await ui.confirm("Proceed?", "really")).toBe(true);
+			await flush();
+			expect(events()).toEqual([
+				{ type: "ui_prompt_start", reason: "ui_prompt", kind: "confirm", title: "Proceed?", hasUI: true },
+				{ type: "ui_prompt_end", reason: "ui_prompt", kind: "confirm", title: "Proceed?", hasUI: true },
+			]);
+
+			events().length = 0;
+			await ui.select("Pick", ["a"]);
+			await ui.input("Name");
+			await ui.editor("Edit");
+			await ui.custom(() => ({ render: () => [], invalidate: () => {} }) as never);
+			await flush();
+			expect(events().map((e) => `${e.type}:${e.kind}:${e.title ?? ""}`)).toEqual([
+				"ui_prompt_start:select:Pick",
+				"ui_prompt_end:select:Pick",
+				"ui_prompt_start:input:Name",
+				"ui_prompt_end:input:Name",
+				"ui_prompt_start:editor:Edit",
+				"ui_prompt_end:editor:Edit",
+				"ui_prompt_start:custom:",
+				"ui_prompt_end:custom:",
+			]);
+			expect(events().find((e) => e.kind === "custom")).not.toHaveProperty("title");
+		});
+
+		it("coalesces nested prompts into one outer span", async () => {
+			const runner = await createRunner();
+			let releaseOuter!: (value: string) => void;
+			runner.setUIContext(
+				createUI({
+					select: () =>
+						new Promise<string | undefined>((resolve) => {
+							releaseOuter = resolve;
+						}),
+				}),
+				"tui",
+			);
+			const ui = runner.createContext().ui;
+
+			const outer = ui.select("Outer", ["x"]);
+			await ui.confirm("Inner", "nested");
+			await flush();
+			expect(events().map((e) => e.type)).toEqual(["ui_prompt_start"]);
+
+			releaseOuter("x");
+			expect(await outer).toBe("x");
+			await flush();
+			expect(events().map((e) => `${e.type}:${e.kind}:${e.title}`)).toEqual([
+				"ui_prompt_start:select:Outer",
+				"ui_prompt_end:select:Outer",
+			]);
+		});
+
+		it("does not wait for handlers before showing or closing the prompt", async () => {
+			const runner = await createRunner("await new Promise(() => {});");
+			runner.setUIContext(createUI(), "tui");
+
+			await expect(runner.createContext().ui.input("Never blocked")).resolves.toBe("typed");
+		});
+
+		it("ends the span when the host dialog throws or rejects", async () => {
+			const runner = await createRunner();
+			runner.setUIContext(
+				createUI({
+					confirm: () => {
+						throw new Error("sync boom");
+					},
+					input: async () => {
+						throw new Error("async boom");
+					},
+				}),
+				"tui",
+			);
+			const ui = runner.createContext().ui;
+
+			expect(() => ui.confirm("Sync", "x")).toThrow("sync boom");
+			await expect(ui.input("Async")).rejects.toThrow("async boom");
+			await flush();
+			expect(events().map((e) => `${e.type}:${e.title}`)).toEqual([
+				"ui_prompt_start:Sync",
+				"ui_prompt_end:Sync",
+				"ui_prompt_start:Async",
+				"ui_prompt_end:Async",
+			]);
+		});
+
+		it("emits nothing without a UI and keeps the host theme getter live", async () => {
+			const runner = await createRunner();
+			runner.setUIContext(undefined);
+			expect(await runner.createContext().ui.confirm("Headless", "x")).toBe(false);
+			await flush();
+			expect(events()).toEqual([]);
+
+			let currentTheme = "dark";
+			const host = createUI();
+			Object.defineProperty(host, "theme", { get: () => currentTheme, enumerable: true });
+			runner.setUIContext(host, "tui");
+			currentTheme = "light";
+			expect(runner.createContext().ui.theme as unknown).toBe("light");
+		});
+	});
+
 	describe("error handling", () => {
 		it("calls error listeners when handler throws", async () => {
 			const extCode = `
@@ -752,6 +904,40 @@ describe("ExtensionRunner", () => {
 
 			expect(runner.getEntryRenderer("my-entry")).toBeDefined();
 			expect(runner.getEntryRenderer("not-exists")).toBeUndefined();
+		});
+
+		it("C1: registerBuiltinEntryRenderer is returned when no extension overrides it", async () => {
+			const noExtResult = await discoverAndLoadExtensions([], tempDir, tempDir);
+			const runner = new ExtensionRunner([], noExtResult.runtime, tempDir, sessionManager, modelRegistry);
+			const builtinRenderer: EntryRenderer = vi.fn(() => undefined);
+			runner.registerBuiltinEntryRenderer("btw", builtinRenderer);
+			expect(runner.getEntryRenderer("btw")).toBe(builtinRenderer);
+			expect(runner.getEntryRenderer("other-type")).toBeUndefined();
+		});
+
+		it("C1: extension entry renderer overrides built-in for the same type", async () => {
+			const extCode = `
+				export default function(pi) {
+					pi.registerEntryRenderer("btw", (entry, options, theme) => undefined);
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "btw-override.ts"), extCode);
+
+			const extResult = await discoverAndLoadExtensions([], tempDir, tempDir);
+			const extRunner = new ExtensionRunner(
+				extResult.extensions,
+				extResult.runtime,
+				tempDir,
+				sessionManager,
+				modelRegistry,
+			);
+			const builtinRenderer: EntryRenderer = vi.fn(() => undefined);
+			extRunner.registerBuiltinEntryRenderer("btw", builtinRenderer);
+
+			const resolved = extRunner.getEntryRenderer("btw");
+			// Extension renderer is a separate function registered by the extension, not the builtin.
+			expect(resolved).toBeDefined();
+			expect(resolved).not.toBe(builtinRenderer);
 		});
 	});
 

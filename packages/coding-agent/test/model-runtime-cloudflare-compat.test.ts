@@ -30,6 +30,24 @@ function createCapturingFetch(): { fetch: typeof globalThis.fetch; requests: Cap
 	return { fetch, requests };
 }
 
+/**
+ * The subject of these tests is endpoint materialization for the
+ * `cloudflare-ai-gateway` provider, not any particular vendor model. Naming a
+ * catalog model made them hostage to Cloudflare's line-up: the generated
+ * provider data is regenerated on every build, and when Cloudflare retired the
+ * model this test used to name, the lookup returned undefined and both tests
+ * failed for reasons unrelated to the code under test. Picking any model from
+ * the gateway's compat family keeps the assertions (the `/compat` base URL and
+ * the `cf-aig-authorization` header) exactly as they were, while surviving
+ * catalog churn.
+ */
+function compatModelId(modelRuntime: ModelRuntime): string {
+	const model = modelRuntime.getModels("cloudflare-ai-gateway").find((entry) => entry.api === "openai-completions");
+	if (!model)
+		throw new Error("cloudflare-ai-gateway exposes no openai-completions model; the generated catalog is wrong");
+	return model.id;
+}
+
 async function createCloudflareRuntime(): Promise<{ modelRuntime: ModelRuntime; modelRegistry: ModelRegistry }> {
 	const authStorage = AuthStorage.inMemory();
 	await authStorage.modify("cloudflare-ai-gateway", async () => ({
@@ -49,7 +67,7 @@ const CLOUDFLARE_COMPAT_URL = "https://gateway.ai.cloudflare.com/v1/test-account
 describe("ModelRegistry Cloudflare compat streaming", () => {
 	it("materializes the Cloudflare endpoint through ModelRuntime streaming", async () => {
 		const { modelRuntime } = await createCloudflareRuntime();
-		const model = modelRuntime.getModel("cloudflare-ai-gateway", "workers-ai/@cf/moonshotai/kimi-k2.6");
+		const model = modelRuntime.getModel("cloudflare-ai-gateway", compatModelId(modelRuntime));
 		expect(model).toBeDefined();
 
 		resetApiProviders();
@@ -63,8 +81,8 @@ describe("ModelRegistry Cloudflare compat streaming", () => {
 	});
 
 	it("materializes the Cloudflare endpoint after extension-style auth resolution", async () => {
-		const { modelRegistry } = await createCloudflareRuntime();
-		const model = modelRegistry.find("cloudflare-ai-gateway", "workers-ai/@cf/moonshotai/kimi-k2.6");
+		const { modelRegistry, modelRuntime } = await createCloudflareRuntime();
+		const model = modelRegistry.find("cloudflare-ai-gateway", compatModelId(modelRuntime));
 		expect(model).toBeDefined();
 
 		resetApiProviders();

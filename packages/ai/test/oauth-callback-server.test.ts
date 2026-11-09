@@ -71,9 +71,10 @@ describe.sequential("OAuth callback server", () => {
 		expect(success).toMatchObject({ status: 200, contentType: "text/html; charset=utf-8" });
 		expect(success.body).toContain("Authentication successful");
 		expect(success.body).toContain("Signed in to Example.");
-		expect(success.body).toContain('fill="#F09082"');
-		expect(success.body).toContain('fill="#4D9ABF"');
-		expect(success.body).toContain('fill="#F1BE58"');
+		// phi logo: the page draws the block φ, not the tri-colour pi logo.
+		expect(success.body).toContain('viewBox="-58.68 0 704.16 704.16"');
+		expect(success.body).toContain('fill="#F5F5F5"');
+		expect(success.body).not.toContain('fill="#F09082"');
 		await expect(server.wait()).resolves.toBe("completed:the-code");
 	});
 

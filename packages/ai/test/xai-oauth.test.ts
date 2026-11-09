@@ -322,14 +322,22 @@ describe("xAI OAuth device flow", () => {
 		await expect(refreshXaiForTest("old-refresh")).rejects.toThrow("Invalid xAI OAuth response field: access_token");
 	});
 
-	it("surfaces the upstream error code and description on refresh failure", async () => {
+	it("returns structured invalid_grant without retaining the refresh response", async () => {
 		vi.stubGlobal(
 			"fetch",
-			vi.fn(async () => jsonResponse({ error: "invalid_grant", error_description: "refresh token revoked" }, 400)),
+			vi.fn(async () =>
+				jsonResponse({ error: "invalid_grant", error_description: "sentinel-refresh-token-detail" }, 400),
+			),
 		);
 
-		await expect(refreshXaiForTest("old-refresh")).rejects.toThrow(
-			"xAI OAuth token refresh failed (HTTP 400): invalid_grant: refresh token revoked",
-		);
+		let thrown: unknown;
+		try {
+			await refreshXaiForTest("old-refresh");
+		} catch (error) {
+			thrown = error;
+		}
+		expect(thrown).toMatchObject({ oauthErrorCode: "invalid_grant", status: 400 });
+		expect(JSON.stringify(thrown)).not.toContain("sentinel-refresh-token-detail");
+		expect((thrown as Error).message).not.toContain("sentinel-refresh-token-detail");
 	});
 });

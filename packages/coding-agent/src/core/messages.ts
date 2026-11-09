@@ -49,6 +49,8 @@ export interface CustomMessage<T = unknown> {
 	content: string | (TextContent | ImageContent)[];
 	display: boolean;
 	details?: T;
+	/** When true, the message participates in LLM context only until the next assistant message exists; afterwards it is dropped from context (but stays in the session for display/forensics). */
+	ephemeral?: boolean;
 	timestamp: number;
 }
 
@@ -126,6 +128,7 @@ export function createCustomMessage(
 	display: boolean,
 	details: unknown | undefined,
 	timestamp: string,
+	ephemeral = false,
 ): CustomMessage {
 	return {
 		role: "custom",
@@ -133,6 +136,7 @@ export function createCustomMessage(
 		content,
 		display,
 		details,
+		...(ephemeral ? { ephemeral: true } : {}),
 		timestamp: new Date(timestamp).getTime(),
 	};
 }
@@ -147,7 +151,7 @@ export function createCustomMessage(
  */
 export function convertToLlm(messages: AgentMessage[]): Message[] {
 	return messages
-		.map((m): Message | undefined => {
+		.map((m, index): Message | undefined => {
 			switch (m.role) {
 				case "bashExecution":
 					// Skip messages excluded from context (!! prefix)
@@ -160,6 +164,9 @@ export function convertToLlm(messages: AgentMessage[]): Message[] {
 						timestamp: m.timestamp,
 					};
 				case "custom": {
+					if (m.ephemeral === true && messages.slice(index + 1).some((later) => later.role === "assistant")) {
+						return undefined;
+					}
 					const content = typeof m.content === "string" ? [{ type: "text" as const, text: m.content }] : m.content;
 					return {
 						role: "user",

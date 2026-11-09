@@ -10,6 +10,7 @@
  */
 
 import { normalizeRadiusGatewayUrl } from "../../providers/radius-config.ts";
+import { OAuthTokenError } from "../errors.ts";
 import type { OAuthAuth, OAuthCredential, ProviderAuthInteraction } from "../types.ts";
 import { startOAuthCallbackServer } from "./callback-server.ts";
 import { pollOAuthDeviceCodeFlow } from "./device-code.ts";
@@ -302,16 +303,22 @@ export function createRadiusOAuth(options: RadiusOAuthOptions): OAuthAuth {
 		},
 
 		async refresh(credential, signal): Promise<OAuthCredential> {
-			const refreshed = await requestOAuthToken(
-				gateway,
-				new URLSearchParams({
-					grant_type: "refresh_token",
-					client_id: OAUTH_CLIENT_ID,
-					refresh_token: credential.refresh,
-				}),
-				signal,
-			);
-			return refreshed;
+			try {
+				return await requestOAuthToken(
+					gateway,
+					new URLSearchParams({
+						grant_type: "refresh_token",
+						client_id: OAUTH_CLIENT_ID,
+						refresh_token: credential.refresh,
+					}),
+					signal,
+				);
+			} catch (error) {
+				if (error instanceof OAuthResponseError && error.oauthError === "invalid_grant") {
+					throw new OAuthTokenError("invalid_grant", error.status, new URL("/v1/oauth/token", gateway).href);
+				}
+				throw error;
+			}
 		},
 
 		async toAuth(credential) {

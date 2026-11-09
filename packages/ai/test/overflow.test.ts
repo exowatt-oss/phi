@@ -91,6 +91,33 @@ describe("isContextOverflow", () => {
 		expect(isContextOverflow(message, 131072)).toBe(true);
 	});
 
+	it("detects LiteLLM max_output_tokens minimum errors as context overflow", () => {
+		const message = createErrorMessage(
+			'400: {"message":"litellm.BadRequestError: OpenAIException - {\\"error\\":{\\"code\\":\\"integer_below_min_value\\",\\"message\\":\\"Invalid \'max_output_tokens\': integer below minimum value. Expected a value >= 16, but got 1 instead.", \\"param\\":\\"max_output_tokens\\", \\"type\\":\\"invalid_request_error\\"}}"}',
+		);
+		expect(isContextOverflow(message)).toBe(true);
+	});
+
+	it("detects LiteLLM max_tokens minimum errors", () => {
+		const message = createErrorMessage(
+			'OpenAIException: {"code":"integer_below_min_value","param":"max_tokens","message":"Invalid \'max_tokens\': integer below minimum value"}',
+		);
+		expect(isContextOverflow(message)).toBe(true);
+	});
+
+	it("does not detect integer minimum errors for unrelated parameters", () => {
+		const message = createErrorMessage(
+			'OpenAIException: {"code":"integer_below_min_value","param":"n","message":"Invalid \'n\': integer below minimum value"}',
+		);
+		expect(isContextOverflow(message)).toBe(false);
+	});
+
+	it("requires an error stop reason for LiteLLM minimum-token detection", () => {
+		const message = createErrorMessage("Invalid 'max_output_tokens': integer below minimum value");
+		message.stopReason = "stop";
+		expect(isContextOverflow(message)).toBe(false);
+	});
+
 	it("detects OpenAI-compatible parenthesized maximum context length errors", () => {
 		const message = createErrorMessage(
 			"Error: 400 Input length (265330) exceeds model's maximum context length (262144).",

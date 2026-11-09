@@ -654,7 +654,8 @@ describe("openai-completions tool_choice", () => {
 		).result();
 
 		expect(response.stopReason).toBe("error");
-		expect(response.errorMessage).toBe("Provider finish_reason: network_error");
+		// Attributed to the requested model; the original wording follows the prefix.
+		expect(response.errorMessage).toBe("zai/glm-5.2: Provider finish_reason: network_error");
 	});
 
 	it("ignores null stream chunks from openai-compatible providers", async () => {
@@ -728,7 +729,7 @@ describe("openai-completions tool_choice", () => {
 		).result();
 
 		expect(response.stopReason).toBe("error");
-		expect(response.errorMessage).toBe("Stream ended without finish_reason");
+		expect(response.errorMessage).toBe("openai/gpt-4o-mini: Stream ended without finish_reason");
 	});
 
 	it("accepts streams without finish_reason when compat disables it", async () => {
@@ -1425,6 +1426,7 @@ describe("openai-completions tool_choice", () => {
 		expect(messages[0]).not.toHaveProperty("reasoning");
 	});
 
+	// Kimi K2.6 has left OpenCode Go; OpenCode Zen still serves it with the same thinking format.
 	it("sends thinking disabled for OpenCode Kimi K2.6 when thinking is off", async () => {
 		const model = getModel("opencode", "kimi-k2.6")!;
 		let payload: unknown;

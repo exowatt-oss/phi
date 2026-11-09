@@ -1,5 +1,6 @@
 name: CI
 
+# Run the fork build, check and tests on each pull request; release automation is separate.
 on:
   push:
     branches: [main]
@@ -10,9 +11,13 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
   build-check-test:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -23,6 +28,8 @@ jobs:
           node-version: 22
           cache: npm
 
+      # canvas needs cairo/pango/jpeg/gif/rsvg; the agent's own tools shell out
+      # to fd and ripgrep, and several tests exercise those code paths.
       - name: Install system dependencies
         run: |
           sudo apt-get update
@@ -32,6 +39,8 @@ jobs:
       - name: Install dependencies
         run: npm ci --ignore-scripts
 
+      # Uses the committed model data in packages/ai/src/providers/data; only
+      # release builds fetch live model data, so CI never drifts with it.
       - name: Build
         run: npm run build
 
@@ -41,25 +50,11 @@ jobs:
       - name: Build the pi-env daemon
         run: npm run build:daemon --workspace packages/env
 
+      # Deliberately ./test.sh rather than a bare `npm test`: it runs the suite
+      # in an empty environment with an isolated HOME, so the credential-gated
+      # e2e tests stay skipped instead of reaching live provider APIs. Running
+      # vitest in an environment that happens to hold provider keys turns ~36
+      # e2e tests into failures that look like regressions. The script already
+      # forwards CI and GITHUB_ACTIONS through for runner behaviour.
       - name: Test
-        run: npm test
-
-  mcp-conformance:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Setup Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: 22
-          cache: npm
-
-      - name: Install dependencies
-        run: npm ci --ignore-scripts
-
-      # Runs pi's MCP client from source against the pinned official conformance suite and fails on
-      # regressions against packages/coding-agent/test/mcp-conformance/baseline.json.
-      - name: MCP client conformance
-        run: npm run test:mcp-conformance
+        run: ./test.sh

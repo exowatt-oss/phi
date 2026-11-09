@@ -39,7 +39,7 @@ export class InMemoryCredentialStore implements CredentialStore {
 
 	modify(
 		providerId: string,
-		fn: (current: Credential | undefined) => Promise<Credential | undefined>,
+		fn: (current: Credential | undefined) => Promise<Credential | null | undefined>,
 		options?: AuthOperationOptions,
 	): Promise<Credential | undefined> {
 		return this.enqueue(
@@ -48,6 +48,10 @@ export class InMemoryCredentialStore implements CredentialStore {
 				const current = this.credentials.get(providerId);
 				const next = await fn(current);
 				options?.signal?.throwIfAborted();
+				if (next === null) {
+					this.credentials.delete(providerId);
+					return undefined;
+				}
 				if (next !== undefined) this.credentials.set(providerId, next);
 				return next ?? current;
 			},

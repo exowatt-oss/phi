@@ -49,6 +49,14 @@ Type `/` to search the available commands. The commands you will use most often 
 - `/thinking` selects how much reasoning the current model uses. Press `Shift+Tab` to cycle through supported levels.
 - `/login` and `/logout` manage provider access.
 - `/settings` changes common preferences.
+- `/fast on`, `/fast off`, and `/fast status` switch the processing tier for the current session only.
+
+To pick a processing tier for one run, pass `--service-tier <tier>`: `fast`, `default`, `flex` (OpenAI only), or `ultrafast` (sent verbatim; Amazon Bedrock UltraFast). Fast mode costs more; see [Service tier](settings.md#service-tier) for availability and pricing.
+
+```bash
+# OpenAI Fast mode for one run
+pi --service-tier fast --model openai/gpt-5.6-sol "Solve this quickly"
+```
 
 Prompt templates, skills, and extensions can add more commands to the same menu. See [Choose a Model](models.md), [Configuration](configuration.md), or the complete [Slash Commands reference](slash-commands.md).
 

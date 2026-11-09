@@ -17,16 +17,18 @@ import {
 	ANTHROPIC_SERVICE_ACCOUNT_ID_ENV,
 	ANTHROPIC_WORKSPACE_ID_ENV,
 } from "../env-api-keys.ts";
-import { calculateCost } from "../models.ts";
+import { calculateCost, supportsFastMode } from "../models.ts";
 import type {
 	Api,
 	AssistantMessage,
 	CacheRetention,
 	ImageContent,
+	InferenceSpeed,
 	Message,
 	Model,
 	ProviderEnv,
 	ProviderHeaders,
+	RefusalDetails,
 	SimpleStreamOptions,
 	StopReason,
 	StreamFunction,
@@ -37,13 +39,14 @@ import type {
 	ToolCall,
 	ToolResultMessage,
 } from "../types.ts";
-import { appendAssistantMessageDiagnostic } from "../utils/diagnostics.ts";
+import { appendAssistantMessageDiagnostic, createAssistantMessageDiagnostic } from "../utils/diagnostics.ts";
+import { attributeProviderError, extractResponseModelFromError } from "../utils/error-body.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { headersToRecord } from "../utils/headers.ts";
 import { type ClientIdentity, getIdentityHeaders } from "../utils/identity.ts";
 import { parseJsonWithRepair, parseStreamingJson, parseToolCallArguments } from "../utils/json-parse.ts";
 import { getProviderEnvValue } from "../utils/provider-env.ts";
-import { retryProviderRequest } from "../utils/provider-retry.ts";
+import { isRetryableProviderError, retryProviderRequest } from "../utils/provider-retry.ts";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.ts";
 import { getSystemMessageText, renderSystemMessageUpdate } from "../utils/text.ts";
 import {
@@ -93,6 +96,11 @@ function getCacheControl(
 }
 
 // Stealth mode: Mimic Claude Code's tool naming exactly
+// Anthropic gates newer models on the claude-cli user-agent version: requesting
+// claude-opus-5-5 with 2.1.251 fails with "Claude Code 2.1.251 does not support this
+// model; version 2.1.280 or newer is required". Keep this at or above the newest
+// model's floor; a per-model `headers: { "user-agent": ... }` override in
+// models.json should not be needed to reach a GA model.
 const claudeCodeVersion = "2.1.280";
 
 // Claude Code 2.x tool names (canonical casing)
@@ -194,6 +202,207 @@ export type AnthropicThinkingDisplay = "summarized" | "omitted";
 const FINE_GRAINED_TOOL_STREAMING_BETA = "fine-grained-tool-streaming-2025-05-14";
 const INTERLEAVED_THINKING_BETA = "interleaved-thinking-2025-05-14";
 const SERVER_SIDE_FALLBACK_BETA = "server-side-fallback-2026-07-01";
+const FAST_MODE_BETA = "fast-mode-2026-02-01";
+
+/** Fast-mode requests rejected for capacity (429/529) skip fast mode for this long when no retry-after is given. */
+const FAST_MODE_DEFAULT_COOLDOWN_MS = 60_000;
+/** Upper bound on a server-requested fast-mode cooldown; a longer retry-after is clamped. */
+const FAST_MODE_MAX_COOLDOWN_MS = 5 * 60_000;
+/** An organization with fast mode switched off is re-probed this often (an admin may enable it any time). */
+const FAST_MODE_DISABLED_COOLDOWN_MS = 5 * 60_000;
+/** A model that rejects `speed` outright stays at standard speed for this long before fast mode is retried. */
+const FAST_MODE_UNSUPPORTED_COOLDOWN_MS = 60 * 60_000;
+
+/**
+ * Why a fast-mode request was turned down:
+ * - "capacity": the fast-mode rate limit or capacity (429/529); also how the API
+ *   answers when usage credits run out. Shared by every Opus model on the account.
+ * - "disabled": fast mode is not enabled for the organization (400). An admin
+ *   has to turn it on; nothing the session does changes that.
+ * - "unsupported": the API rejected `speed` for this model (400).
+ */
+export type AnthropicFastModeRejection = "capacity" | "disabled" | "unsupported";
+
+/**
+ * Process-wide fast-mode cooldowns, keyed by provider (capacity: the fast-mode
+ * rate limit is one pool shared by every Opus model on the account) or by
+ * provider+model (the API rejected `speed` for that model). While a key is
+ * cooling down, requests that ask for fast mode go out at standard speed
+ * immediately instead of paying a rejected round trip per call, mirroring
+ * Claude Code's fallback-and-cooldown behavior.
+ */
+const fastModeCooldowns = new Map<string, number>();
+
+function fastModeProviderKey(model: Model<"anthropic-messages">): string {
+	return `${model.provider}@${model.baseUrl}`;
+}
+
+function fastModeModelKey(model: Model<"anthropic-messages">): string {
+	return `${fastModeProviderKey(model)}#${model.id}`;
+}
+
+function isFastModeCoolingDown(model: Model<"anthropic-messages">, now = Date.now()): boolean {
+	for (const key of [fastModeProviderKey(model), fastModeModelKey(model)]) {
+		const until = fastModeCooldowns.get(key);
+		if (until === undefined) continue;
+		if (until > now) return true;
+		fastModeCooldowns.delete(key);
+	}
+	return false;
+}
+
+/** Test hook: forget every fast-mode cooldown recorded in this process. */
+export function resetAnthropicFastModeCooldowns(): void {
+	fastModeCooldowns.clear();
+}
+
+/**
+ * The API's own error text, without the SDK's `400 {json}` wrapping: the parsed
+ * body the Anthropic SDK attaches to the error, else the JSON inside the
+ * message, else the message itself.
+ */
+function anthropicErrorMessage(error: Error): string {
+	const parsed = (error as { error?: { error?: { message?: unknown } } }).error?.error?.message;
+	if (typeof parsed === "string" && parsed.length > 0) return parsed;
+	const start = error.message.indexOf("{");
+	if (start >= 0) {
+		try {
+			const body = JSON.parse(error.message.slice(start)) as { error?: { message?: unknown } };
+			if (typeof body.error?.message === "string") return body.error.message;
+		} catch {
+			// Not a JSON body; fall through to the raw message.
+		}
+	}
+	return error.message;
+}
+
+/**
+ * A fast-mode request the API turned down for reasons that do not apply at
+ * standard speed. Anything else (auth, malformed request, server error) would
+ * fail at standard speed too and follows the normal retry path.
+ */
+function classifyFastModeRejection(error: unknown): AnthropicFastModeRejection | undefined {
+	if (!(error instanceof Error) || !("status" in error)) return undefined;
+	const status = (error as { status?: unknown }).status;
+	if (status === 429 || status === 529) return "capacity";
+	if (status !== 400) return undefined;
+	const message = anthropicErrorMessage(error);
+	// "Fast mode is not enabled for your organization. An organization admin must enable this feature."
+	if (/not enabled for your organization|organization admin/i.test(message)) return "disabled";
+	if (/\bspeed\b|fast[ -]mode/i.test(message)) return "unsupported";
+	return undefined;
+}
+
+function fastModeCooldownMs(error: unknown, kind: AnthropicFastModeRejection): number {
+	if (kind === "unsupported") return FAST_MODE_UNSUPPORTED_COOLDOWN_MS;
+	if (kind === "disabled") return FAST_MODE_DISABLED_COOLDOWN_MS;
+	const headers = (error as { headers?: Headers }).headers;
+	const retryAfterMs = Number.parseFloat(headers?.get?.("retry-after-ms") ?? "");
+	if (Number.isFinite(retryAfterMs) && retryAfterMs > 0) return Math.min(retryAfterMs, FAST_MODE_MAX_COOLDOWN_MS);
+	const retryAfter = headers?.get?.("retry-after");
+	if (retryAfter) {
+		const seconds = Number.parseFloat(retryAfter);
+		const delayMs = Number.isNaN(seconds) ? Date.parse(retryAfter) - Date.now() : seconds * 1000;
+		if (Number.isFinite(delayMs) && delayMs > 0) return Math.min(delayMs, FAST_MODE_MAX_COOLDOWN_MS);
+	}
+	return FAST_MODE_DEFAULT_COOLDOWN_MS;
+}
+
+function readReportedSpeed(usage: unknown): InferenceSpeed | undefined {
+	const speed = (usage as { speed?: unknown } | null | undefined)?.speed;
+	return speed === "fast" || speed === "standard" ? speed : undefined;
+}
+
+/**
+ * Cost for an Anthropic response. Fast-mode responses (`usage.speed: "fast"`)
+ * bill every rate at `compat.fastModeCostMultiplier` and ignore long-context
+ * tiers: Anthropic prices fast mode flat across the full context window.
+ */
+function calculateAnthropicCost(model: Model<"anthropic-messages">, output: AssistantMessage): void {
+	if (output.speed !== "fast") {
+		calculateCost(model, output.usage);
+		return;
+	}
+	const multiplier = getAnthropicCompat(model).fastModeCostMultiplier;
+	calculateCost(
+		{
+			...model,
+			cost: {
+				input: model.cost.input * multiplier,
+				output: model.cost.output * multiplier,
+				cacheRead: model.cost.cacheRead * multiplier,
+				cacheWrite: model.cost.cacheWrite * multiplier,
+			},
+		},
+		output.usage,
+	);
+}
+
+type AnthropicFallbacks = "default" | Array<{ model: string }>;
+
+/**
+ * Resolve the server-side refusal-fallback configuration for this request.
+ *
+ * Claude Fable 5 / Opus 5 safety classifiers can decline a request with
+ * `stop_reason: "refusal"`. With the `server-side-fallback-2026-07-01` beta and a
+ * `fallbacks` request parameter, the API retries the declined request on another
+ * model inside the same call (and applies fallback credit automatically), so a
+ * spurious classifier decline does not kill the agent turn.
+ *
+ * Resolution order: `options.fallbacks` > `PI_ANTHROPIC_FALLBACKS` env > the
+ * model's catalog allow-list (`compat.allowedFallbackModels`) > "default".
+ * The env value is "off", "default", or a comma-separated list of model ids
+ * (tried in order, max 3 per the API contract). A model with per-turn effort
+ * (`compat.supportsMidConvoEffort`) and no allow-list gets no implicit fallback:
+ * the replayed request carries effort-only `system` messages that Anthropic's
+ * default routing could hand to a model without that support.
+ *
+ * Only first-party `anthropic` API-key requests are eligible for the env/option
+ * and "default" paths: the beta is Claude API only (not Bedrock/Vertex/proxies),
+ * OAuth (Claude Code) requests carry their own locked beta set, and injected
+ * clients (`options.client`) target other platforms. Another provider only gets
+ * fallbacks from an explicit `compat.allowedFallbackModels`.
+ */
+function resolveFallbacks(
+	model: Model<"anthropic-messages">,
+	isOAuth: boolean,
+	options?: AnthropicOptions,
+): AnthropicFallbacks | undefined {
+	if (isOAuth || options?.client) return undefined;
+	const configured = options?.fallbacks ?? getProviderEnvValue("PI_ANTHROPIC_FALLBACKS", options?.env);
+	if (configured === "off" || configured === "none") return undefined;
+	const allowList = model.compat?.allowedFallbackModels?.map((fallback) => ({ model: fallback.model })) ?? [];
+	if (model.provider !== "anthropic") return allowList.length > 0 ? allowList : undefined;
+	if (Array.isArray(configured)) return configured.length > 0 ? configured : undefined;
+	if (configured === "default") return "default";
+	if (configured === undefined || configured === "") {
+		if (allowList.length > 0) return allowList;
+		return model.compat?.supportsMidConvoEffort === true ? undefined : "default";
+	}
+	const entries = configured
+		.split(",")
+		.map((id) => id.trim())
+		.filter((id) => id.length > 0)
+		.map((id) => ({ model: id }));
+	return entries.length > 0 ? entries : "default";
+}
+
+/**
+ * The catalog model to bill a response against. A server-side fallback serves the
+ * turn from another model; when the requested model's allow-list prices that
+ * model, its rates apply (fast-mode compat still comes from the requested model).
+ */
+function resolveUsageModel(
+	model: Model<"anthropic-messages">,
+	servedModelId: string | undefined,
+): Model<"anthropic-messages"> {
+	if (!servedModelId || servedModelId === model.id) return model;
+	const fallbackCost = model.compat?.allowedFallbackModels?.find(
+		(fallback) => fallback.provider === model.provider && fallback.model === servedModelId,
+	)?.cost;
+	return fallbackCost ? { ...model, id: servedModelId, cost: fallbackCost } : model;
+}
+
 const MID_CONVERSATION_OUTPUT_CONFIG_BETA = "mid-conversation-output-config-2026-07-01";
 const THINKING_BINDING_CONTROLS_BETA = "thinking-binding-controls-2026-08-01";
 const INLINE_TOOLS_BETA = "inline-tools-2026-09-15";
@@ -212,13 +421,11 @@ const DEFERRED_TOOL_PLACEHOLDER: BetaTool = {
 	defer_loading: true,
 };
 
-function shouldUseServerSideFallbackBeta(model: Model<"anthropic-messages">): boolean {
-	return (model.compat?.allowedFallbackModels?.length ?? 0) > 0;
-}
-
 function getAnthropicCompat(model: Model<"anthropic-messages">) {
 	const isOpenRouter = model.provider === "openrouter" || model.baseUrl.includes("openrouter.ai");
 	return {
+		supportsFastMode: supportsFastMode(model),
+		fastModeCostMultiplier: model.compat?.fastModeCostMultiplier ?? 2,
 		supportsEagerToolInputStreaming: model.compat?.supportsEagerToolInputStreaming ?? true,
 		supportsLongCacheRetention: model.compat?.supportsLongCacheRetention ?? true,
 		sendSessionAffinityHeaders: model.compat?.sendSessionAffinityHeaders ?? isOpenRouter,
@@ -292,6 +499,34 @@ export interface AnthropicOptions extends StreamOptions {
 	 * `AnthropicVertex` that shares the same messaging API.
 	 */
 	client?: Anthropic;
+	/**
+	 * Anthropic fast mode (`speed: "fast"` with the `fast-mode-2026-02-01` beta):
+	 * the same model served at up to 2.5x output tokens per second for a
+	 * per-token premium. Sent only when the model supports it (see
+	 * `supportsFastMode`); otherwise the request goes out at standard speed.
+	 * When the API turns a fast request down for fast-mode capacity (429/529) or
+	 * rejects `speed` for the model (400), the request is retried once at standard
+	 * speed, the response records `speed: "standard"` plus a diagnostic, and fast
+	 * mode is skipped for a cooldown. Cost follows the speed the response reports.
+	 * Default: omitted (standard speed). `streamSimple()` maps
+	 * `serviceTier: "fast"` to this option.
+	 */
+	speed?: InferenceSpeed;
+	/**
+	 * Server-side refusal fallback (Claude API beta). When the model's safety
+	 * classifier declines a request, the API retries it on another model within
+	 * the same call and splices the answer onto the open stream.
+	 * - "default": Anthropic's recommended per-category fallback routing.
+	 * - "off": disable (a refusal surfaces as a stream error, as before).
+	 * - Array: explicit chain of up to three `{ model }` entries, tried in order.
+	 * Default for first-party anthropic API-key requests: the model's catalog
+	 * allow-list (`compat.allowedFallbackModels`) when it has one, else "default"
+	 * (none for per-turn-effort models without an allow-list). Always off for
+	 * OAuth and injected clients; other providers only use an explicit
+	 * `compat.allowedFallbackModels`. Env override: PI_ANTHROPIC_FALLBACKS
+	 * ("off" | "default" | comma-separated model ids).
+	 */
+	fallbacks?: "default" | "off" | Array<{ model: string }>;
 }
 
 function mergeHeaders(...headerSources: (ProviderHeaders | undefined)[]): ProviderHeaders {
@@ -471,6 +706,7 @@ function consumeLine(text: string): { line: string; rest: string } | null {
 async function* iterateSseMessages(
 	body: ReadableStream<Uint8Array>,
 	signal?: AbortSignal,
+	onActivity?: () => void,
 ): AsyncGenerator<ServerSentEvent> {
 	const reader = body.getReader();
 	const decoder = new TextDecoder();
@@ -488,6 +724,7 @@ async function* iterateSseMessages(
 				break;
 			}
 
+			onActivity?.();
 			buffer += decoder.decode(value, { stream: true });
 			let consumed = consumeLine(buffer);
 			while (consumed) {
@@ -530,6 +767,7 @@ async function* iterateSseMessages(
 async function* iterateAnthropicEvents(
 	response: Response,
 	signal?: AbortSignal,
+	onActivity?: () => void,
 ): AsyncGenerator<RawMessageStreamEvent> {
 	if (!response.body) {
 		throw new Error("Attempted to iterate over an Anthropic response with no body");
@@ -538,7 +776,7 @@ async function* iterateAnthropicEvents(
 	let sawMessageStart = false;
 	let sawMessageEnd = false;
 
-	for await (const sse of iterateSseMessages(response.body, signal)) {
+	for await (const sse of iterateSseMessages(response.body, signal, onActivity)) {
 		if (sse.event === "error") {
 			throw new Error(sse.data);
 		}
@@ -599,6 +837,11 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 		try {
 			let client: Anthropic;
 			let isOAuth: boolean;
+			// Fast mode is requested for the model, so the beta rides on the request; the
+			// `speed` parameter itself is withheld while a cooldown from an earlier
+			// rejection is still running.
+			const fastModeRequested = options?.speed === "fast" && supportsFastMode(model);
+			let sendFast = fastModeRequested && !isFastModeCoolingDown(model);
 			let usageModel = model;
 			let inputTransformations: BetaInputTransformation[] | undefined;
 
@@ -640,26 +883,78 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 				...(options?.timeoutMs !== undefined ? { timeout: options.timeoutMs } : {}),
 				maxRetries: 0,
 			};
+			const retryOptions = {
+				maxRetries: options?.maxRetries,
+				maxRetryDelayMs: options?.maxRetryDelayMs,
+				signal: options?.signal,
+			};
+			const requestFeatures: AnthropicRequestFeatures = {
+				fallbacks: resolveFallbacks(model, isOAuth, options),
+				fastMode: fastModeRequested,
+			};
 			let disablePreferredStrictTools = false;
 			let response: Response;
 			for (;;) {
 				options?.signal?.throwIfAborted();
-				const built = buildParams(model, normalizedContext, isOAuth, options, disablePreferredStrictTools);
+				const built = buildParams(
+					model,
+					normalizedContext,
+					isOAuth,
+					options,
+					requestFeatures,
+					disablePreferredStrictTools,
+				);
 				if (built.providerThinkingLevel) output.providerThinkingLevel = built.providerThinkingLevel;
 				let params = built.params;
+				// `speed` needs the fast-mode beta; a configured `anthropic-beta` header
+				// that leaves it out keeps the request at standard speed.
+				let requestFast = sendFast && params.betas?.includes(FAST_MODE_BETA) === true;
+				if (requestFast) params.speed = "fast";
 				const nextParams = await options?.onPayload?.(params, model);
 				if (nextParams !== undefined) {
 					params = { ...(nextParams as MessageCreateParamsStreaming), stream: true };
 				}
+				requestFast = params.speed === "fast";
+				const send = () => client.beta.messages.create(params, requestOptions).asResponse();
 				try {
-					response = await retryProviderRequest(
-						() => client.beta.messages.create(params, requestOptions).asResponse(),
-						{
-							maxRetries: options?.maxRetries,
-							maxRetryDelayMs: options?.maxRetryDelayMs,
-							signal: options?.signal,
-						},
-					);
+					if (requestFast) {
+						try {
+							// A fast-mode rejection is handled below by dropping to standard speed,
+							// not by waiting out the fast-mode limit with the generic backoff.
+							response = await retryProviderRequest(send, {
+								...retryOptions,
+								shouldRetry: (error) =>
+									isRetryableProviderError(error) && classifyFastModeRejection(error) === undefined,
+							});
+						} catch (error) {
+							const rejection = classifyFastModeRejection(error);
+							if (rejection === undefined || options?.signal?.aborted) throw error;
+							const cooldownMs = fastModeCooldownMs(error, rejection);
+							// Only a per-model rejection is scoped to the model; capacity and org
+							// policy apply to every fast-mode model on this provider.
+							fastModeCooldowns.set(
+								rejection === "unsupported" ? fastModeModelKey(model) : fastModeProviderKey(model),
+								Date.now() + cooldownMs,
+							);
+							appendAssistantMessageDiagnostic(
+								output,
+								createAssistantMessageDiagnostic("anthropic_fast_mode_fallback", error, {
+									reason: rejection,
+									status: (error as { status?: number }).status ?? null,
+									message: error instanceof Error ? anthropicErrorMessage(error) : String(error),
+									cooldownMs,
+								}),
+							);
+							delete params.speed;
+							requestFast = false;
+							// A strict-tools rebuild below must not put `speed` back.
+							sendFast = false;
+							response = await retryProviderRequest(send, retryOptions);
+						}
+					} else {
+						response = await retryProviderRequest(send, retryOptions);
+					}
+					sendFast = requestFast;
 					break;
 				} catch (error) {
 					// Only downgrade a rejected request, never an already-started stream.
@@ -687,27 +982,57 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 					});
 				}
 			}
+			// The response's own `usage.speed` overrides this below when present. Until
+			// then a successful fast request is billed as fast (the API contract), and a
+			// fast request that was withheld or downgraded is recorded as standard.
+			if (fastModeRequested) output.speed = sendFast ? "fast" : "standard";
 			await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
 			stream.push({ type: "start", partial: output });
 
 			type Block = (ThinkingContent | TextContent | (ToolCall & { partialJson: string })) & { index: number };
 			const blocks = output.content as Block[];
+			// Content length at the most recent server-side fallback boundary. -1 = no
+			// fallback happened. Blocks before the final boundary belong to the model
+			// that declined; per the fallback contract, its thinking/tool_use blocks
+			// must not be echoed on the next turn (their signatures belong to the
+			// declining model), while its text carries over.
+			let fallbackBoundary = -1;
+			// Non-empty text/thinking carried on content_block_start, keyed by SSE block
+			// index, until that block's first delta arrives. Anthropic always starts a
+			// block empty, but the LiteLLM gateway's Bedrock-Converse translation seeds
+			// content_block_start.thinking with the first chunk AND re-sends that chunk as
+			// the first thinking_delta, which doubled the block ("ByBy design…"). When the
+			// first delta repeats the seed, the delta supersedes it; any other seed is
+			// genuine leading content and is kept.
+			const startSeeds = new Map<number, string>();
+			const appendAfterSeed = (sseIndex: number, current: string, delta: string): string => {
+				const seed = startSeeds.get(sseIndex);
+				if (seed === undefined) return current + delta;
+				startSeeds.delete(sseIndex);
+				return delta.startsWith(seed) && current === seed ? delta : current + delta;
+			};
 
-			for await (const event of iterateAnthropicEvents(response, options?.signal)) {
+			for await (const event of iterateAnthropicEvents(response, options?.signal, options?.onStreamActivity)) {
 				await options?.onProviderStreamEvent?.(event, model);
 				if (event.type === "message_start") {
 					output.responseId = event.message.id;
 					const transformations = event.message.input_transformations;
 					if (Array.isArray(transformations)) inputTransformations = transformations;
-					const responseModel = event.message.model;
-					if (responseModel !== model.id) output.responseModel = responseModel;
-					const fallbackCost =
-						responseModel === model.id
-							? undefined
-							: model.compat?.allowedFallbackModels?.find(
-									(fallback) => fallback.provider === model.provider && fallback.model === responseModel,
-								)?.cost;
-					usageModel = fallbackCost ? { ...model, id: responseModel, cost: fallbackCost } : model;
+					// Server-side fallback (or sticky routing) can serve the turn from a
+					// different model than requested; record who actually answered.
+					const servingModel = event.message.model as string | undefined;
+					// `model` stays the model the request asked for and `responseModel`
+					// names who answered, exactly as the OpenAI-compatible path does.
+					// Overwriting `model` made the two identical on this path, so nothing
+					// downstream could see that a server-side fallback had served the turn
+					// from a different (often weaker) model — a host comparing requested
+					// against served could never fire, and the transcript silently
+					// reattributed the turn. Recorded even when it equals the requested
+					// id: behind a gateway that is a confirmation, and an absent value
+					// means the server never said, which hosts (P3 Code) show differently.
+					if (servingModel) output.responseModel ||= servingModel;
+					// Bill a fallback-served turn at the served model's catalog rates.
+					usageModel = resolveUsageModel(model, output.responseModel);
 					// Capture initial token usage from message_start event
 					// This ensures we have input token counts even if the stream is aborted early
 					output.usage.input = event.message.usage.input_tokens || 0;
@@ -715,23 +1040,22 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 					output.usage.cacheRead = event.message.usage.cache_read_input_tokens || 0;
 					output.usage.cacheWrite = event.message.usage.cache_creation_input_tokens || 0;
 					output.usage.cacheWrite1h = event.message.usage.cache_creation?.ephemeral_1h_input_tokens || 0;
+					// With the fast-mode beta the API reports which speed actually served
+					// the request; that value, not the request, is what gets billed.
+					const reportedSpeed = readReportedSpeed(event.message.usage);
+					if (reportedSpeed) output.speed = reportedSpeed;
 					// Anthropic doesn't provide total_tokens, compute from components
 					output.usage.totalTokens =
 						output.usage.input + output.usage.output + output.usage.cacheRead + output.usage.cacheWrite;
-					calculateCost(usageModel, output.usage);
+					calculateAnthropicCost(usageModel, output);
 				} else if (event.type === "content_block_start") {
-					if (event.content_block.type === "fallback") {
-						if (output.content.length > 0) {
-							throw new Error("Anthropic performed an unsupported mid-output model fallback");
-						}
-						continue;
-					}
 					if (event.content_block.type === "text") {
 						const block: Block = {
 							type: "text",
 							text: event.content_block.text ?? "",
 							index: event.index,
 						};
+						if (block.text) startSeeds.set(event.index, block.text);
 						output.content.push(block);
 						stream.push({ type: "text_start", contentIndex: output.content.length - 1, partial: output });
 					} else if (event.content_block.type === "thinking") {
@@ -741,6 +1065,7 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 							thinkingSignature: event.content_block.signature ?? "",
 							index: event.index,
 						};
+						if (block.thinking) startSeeds.set(event.index, block.thinking);
 						output.content.push(block);
 						stream.push({ type: "thinking_start", contentIndex: output.content.length - 1, partial: output });
 					} else if (event.content_block.type === "redacted_thinking") {
@@ -753,6 +1078,20 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 						};
 						output.content.push(block);
 						stream.push({ type: "thinking_start", contentIndex: output.content.length - 1, partial: output });
+					} else if (event.content_block.type === "fallback") {
+						// A mid-stream refusal handoff: the declining model's output ends here
+						// and the named fallback model continues. No block is stored (phi's
+						// content model carries text/thinking/toolCall only); instead the
+						// boundary is remembered so pre-boundary thinking is pruned at the end,
+						// which keeps the next turn's echo valid without the boundary marker.
+						const handoffModel = (event.content_block.to as { model?: string } | undefined)?.model;
+						// Same split as message_start: the request still went to `model`, and
+						// `responseModel` names the model that finished the turn.
+						if (handoffModel && handoffModel !== model.id) {
+							output.responseModel = handoffModel;
+							usageModel = resolveUsageModel(model, handoffModel);
+						}
+						fallbackBoundary = output.content.length;
 					} else if (event.content_block.type === "tool_use") {
 						const block: Block = {
 							type: "toolCall",
@@ -772,7 +1111,7 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 						const index = blocks.findIndex((b) => b.index === event.index);
 						const block = blocks[index];
 						if (block && block.type === "text") {
-							block.text += event.delta.text;
+							block.text = appendAfterSeed(event.index, block.text, event.delta.text);
 							stream.push({
 								type: "text_delta",
 								contentIndex: index,
@@ -784,7 +1123,7 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 						const index = blocks.findIndex((b) => b.index === event.index);
 						const block = blocks[index];
 						if (block && block.type === "thinking") {
-							block.thinking += event.delta.thinking;
+							block.thinking = appendAfterSeed(event.index, block.thinking, event.delta.thinking);
 							stream.push({
 								type: "thinking_delta",
 								contentIndex: index,
@@ -855,6 +1194,9 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 						if (stopReasonResult.errorMessage) {
 							output.errorMessage = stopReasonResult.errorMessage;
 						}
+						if (stopReasonResult.refusal) {
+							output.refusal = stopReasonResult.refusal;
+						}
 					}
 					// Only update usage fields if present (not null).
 					// Preserves input_tokens from message_start when proxies omit it in message_delta.
@@ -883,11 +1225,13 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 						if (thinkingTokens != null) {
 							output.usage.reasoning = thinkingTokens;
 						}
+						const reportedSpeed = readReportedSpeed(event.usage);
+						if (reportedSpeed) output.speed = reportedSpeed;
 					}
 					// Anthropic doesn't provide total_tokens, compute from components
 					output.usage.totalTokens =
 						output.usage.input + output.usage.output + output.usage.cacheRead + output.usage.cacheWrite;
-					calculateCost(usageModel, output.usage);
+					calculateAnthropicCost(usageModel, output);
 				}
 			}
 
@@ -915,6 +1259,15 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 				});
 			}
 
+			if (fallbackBoundary > 0) {
+				// Drop the declining model's thinking and tool_use blocks (text stays:
+				// the serving model continued from it). Streamed deltas already showed
+				// them; this prunes only the persisted message that later turns echo.
+				const kept = output.content.filter((block, index) => index >= fallbackBoundary || block.type === "text");
+				output.content.length = 0;
+				output.content.push(...kept);
+			}
+
 			stream.push({ type: "done", reason: output.stopReason, message: output });
 			stream.end();
 		} catch (error) {
@@ -924,7 +1277,12 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 				delete (block as { partialJson?: string }).partialJson;
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
-			output.errorMessage = error instanceof Error ? error.message : JSON.stringify(error);
+			const providerErrorMessage = error instanceof Error ? error.message : JSON.stringify(error);
+			// A failing response can still have named its serving model before it failed.
+			output.responseModel ||= extractResponseModelFromError(error, model.id);
+			output.errorMessage = attributeProviderError(providerErrorMessage, model, output.responseModel);
+			// Classifiers read this, not the prefixed text. See AssistantMessage.providerErrorMessage.
+			if (output.errorMessage !== providerErrorMessage) output.providerErrorMessage = providerErrorMessage;
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
 		}
@@ -935,15 +1293,34 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 
 /**
  * Map ThinkingLevel to Anthropic effort levels for adaptive thinking.
- * Note: effort "max" is available on all adaptive-thinking Claude models, while native
- * "xhigh" is only available on Opus 4.7/4.8, Sonnet 5, and Fable 5.
+ *
+ * Three cases, in the order they are checked:
+ *
+ * - The catalog maps the level to a string: send that.
+ * - The catalog maps it to an explicit `null`: the model does NOT accept an
+ *   effort value for this level, so return undefined and omit
+ *   `output_config.effort` entirely. `getSupportedThinkingLevels` already reads
+ *   `null` that way; this function used to disagree and fall through to the
+ *   switch below, which invented a plausible-looking value. That is how a turn
+ *   rerouted onto claude-fable-5 — a model whose adaptive effort vocabulary is
+ *   just `"low"` — put `output_config.effort: "medium"` on the wire and got
+ *   `400 invalid_request_error: Invalid effort level` back. Omitting the field
+ *   leaves adaptive thinking at the model's own default, which every
+ *   adaptive-thinking model accepts.
+ * - The level is absent from the map (or there is no map): fall through to the
+ *   standard low/medium/high vocabulary. An absent key means "passes through
+ *   unchanged", which is the catalog convention for the common levels.
+ *
+ * Note: effort "max" is available on most adaptive-thinking Claude models, while native
+ * "xhigh" is only available on Opus 4.7/4.8, Opus 5, and Sonnet 5.
  */
 function mapThinkingLevelToEffort(
 	model: Model<"anthropic-messages">,
 	level: SimpleStreamOptions["reasoning"],
-): AnthropicEffort {
+): AnthropicEffort | undefined {
 	const mapped = level ? model.thinkingLevelMap?.[level] : undefined;
 	if (typeof mapped === "string") return mapped as AnthropicEffort;
+	if (mapped === null) return undefined;
 
 	switch (level) {
 		case "minimal":
@@ -967,9 +1344,12 @@ export const streamSimple: StreamFunction<"anthropic-messages", SimpleStreamOpti
 		assertRequestAuth(model.provider, options?.apiKey, options?.headers);
 	}
 
+	// The "fast" processing tier is Anthropic fast mode here; "flex" has no
+	// Anthropic equivalent and is ignored.
 	const base = {
 		...buildBaseOptions(model, context, options, options?.apiKey),
 		toolChoice: options?.toolChoice,
+		...(options?.serviceTier === "fast" ? { speed: "fast" as const } : {}),
 	} satisfies AnthropicOptions;
 	if (!options?.reasoning) {
 		return stream(model, context, {
@@ -985,7 +1365,7 @@ export const streamSimple: StreamFunction<"anthropic-messages", SimpleStreamOpti
 		return stream(model, context, {
 			...base,
 			thinkingEnabled: true,
-			effort,
+			...(effort !== undefined ? { effort } : {}),
 		} satisfies AnthropicOptions);
 	}
 
@@ -1113,12 +1493,21 @@ function createClient(
 	return { client, isOAuthToken: false };
 }
 
+/** Per-request features resolved in `stream()` that need a beta and a request parameter. */
+interface AnthropicRequestFeatures {
+	/** Server-side refusal fallbacks (see `resolveFallbacks`). */
+	fallbacks?: AnthropicFallbacks;
+	/** Fast mode was requested for a model that supports it (see `AnthropicOptions.speed`). */
+	fastMode?: boolean;
+}
+
 function getBetaFeatures(
 	model: Model<"anthropic-messages">,
 	context: TranscriptContext,
 	isOAuthToken: boolean,
 	nativeToolChanges: boolean,
 	options?: AnthropicOptions,
+	requestFeatures: AnthropicRequestFeatures = {},
 ): NonNullable<MessageCreateParamsStreaming["betas"]> {
 	let configuredFeatures: string | null | undefined;
 	for (const headers of [model.headers, options?.headers]) {
@@ -1149,7 +1538,12 @@ function getBetaFeatures(
 	) {
 		features.push(INTERLEAVED_THINKING_BETA);
 	}
-	if (shouldUseServerSideFallbackBeta(model)) features.push(SERVER_SIDE_FALLBACK_BETA);
+	// Grants the `fallbacks` request parameter and applies fallback credit
+	// automatically on server-side retries (no separate credit header needed).
+	if (requestFeatures.fallbacks !== undefined) features.push(SERVER_SIDE_FALLBACK_BETA);
+	// Grants the `speed` request parameter and makes the response report
+	// `usage.speed`. Harmless on a request that ends up without `speed`.
+	if (requestFeatures.fastMode === true) features.push(FAST_MODE_BETA);
 	if (model.compat?.supportsMidConvoEffort === true) {
 		features.push(MID_CONVERSATION_OUTPUT_CONFIG_BETA, THINKING_BINDING_CONTROLS_BETA);
 	}
@@ -1162,6 +1556,7 @@ function buildParams(
 	context: TranscriptContext,
 	isOAuthToken: boolean,
 	options?: AnthropicOptions,
+	requestFeatures: AnthropicRequestFeatures = {},
 	disablePreferredStrictTools = false,
 ): {
 	params: MessageCreateParamsStreaming;
@@ -1215,7 +1610,7 @@ function buildParams(
 		nativeToolChanges ? convertToolDefinitions : undefined,
 	);
 	const activeEffort = options?.effort ?? "high";
-	const betaFeatures = getBetaFeatures(model, context, isOAuthToken, nativeToolChanges, options);
+	const betaFeatures = getBetaFeatures(model, context, isOAuthToken, nativeToolChanges, options, requestFeatures);
 	const params: MessageCreateParamsStreaming = {
 		model: model.id,
 		messages: effortMessages ? insertThinkingLevelMessages(converted, activeEffort) : converted.messages,
@@ -1323,9 +1718,10 @@ function buildParams(
 		}
 	}
 
-	const allowedFallbackModels = model.compat?.allowedFallbackModels;
-	if (allowedFallbackModels && allowedFallbackModels.length > 0) {
-		params.fallbacks = allowedFallbackModels.map((fallback) => ({ model: fallback.model }));
+	// `fallbacks` needs the server-side-fallback beta; a configured `anthropic-beta`
+	// header that leaves it out keeps the parameter off the wire.
+	if (requestFeatures.fallbacks !== undefined && betaFeatures.includes(SERVER_SIDE_FALLBACK_BETA)) {
+		params.fallbacks = requestFeatures.fallbacks;
 	}
 
 	return { params, hasPreferredStrictTools, providerThinkingLevel: effortMessages ? activeEffort : undefined };
@@ -1664,7 +2060,7 @@ function convertTools(
 function mapStopReason(
 	reason: BetaStopReason | string,
 	stopDetails?: RefusalStopDetails | null,
-): { stopReason: StopReason; errorMessage?: string } {
+): { stopReason: StopReason; errorMessage?: string; refusal?: RefusalDetails } {
 	switch (reason) {
 		case "end_turn":
 			return { stopReason: "stop" };
@@ -1672,11 +2068,22 @@ function mapStopReason(
 			return { stopReason: "length" };
 		case "tool_use":
 			return { stopReason: "toolUse" };
-		case "refusal":
+		case "refusal": {
+			// A terminal refusal *for this request*: either fallbacks were off, or every
+			// model in the chain declined / the category had no recommended fallback.
+			// Name the category so the user can tell a policy decline from a model
+			// error, and hand the same facts to consumers structurally in `refusal` so
+			// the harness can escalate to another model without parsing this sentence.
+			const category = stopDetails?.category;
+			const explanation = stopDetails?.explanation;
 			return {
+				refusal: { category: category ?? null, ...(explanation ? { explanation } : {}) },
 				stopReason: "error",
-				errorMessage: stopDetails?.explanation || `The model refused to complete the request`,
+				errorMessage: `The model's safety classifier declined this request${
+					category ? ` (category: ${category})` : ""
+				}${explanation ? `: ${explanation}` : ""}. Retrying the same request on a different model (e.g. an Opus 4.x) usually succeeds.`,
 			};
+		}
 		case "pause_turn": // Stop is good enough -> resubmit
 			return { stopReason: "stop" };
 		case "stop_sequence":

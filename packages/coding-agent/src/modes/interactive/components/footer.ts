@@ -1,9 +1,12 @@
 import { isAbsolute, relative, resolve, sep } from "node:path";
+import { type AssistantMessage, getUnsupportedFastServiceTierError } from "@earendil-works/pi-ai";
 import { type Component, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { AgentSession } from "../../../core/agent-session.ts";
 import { areExperimentalFeaturesEnabled } from "../../../core/experimental.ts";
 import type { ContextUsage } from "../../../core/extensions/types.ts";
 import type { ReadonlyFooterDataProvider } from "../../../core/footer-data-provider.ts";
+import { isAutoRouted } from "../../../core/routing.ts";
+import { getSupportedServiceTiers } from "../../../core/service-tier.ts";
 import { addUsageToTotals, createUsageTotals, type UsageTotals } from "../../../core/usage-totals.ts";
 import { theme } from "../theme/theme.ts";
 
@@ -53,6 +56,8 @@ interface SessionStats {
 	usageTotals: UsageTotals;
 	latestCacheHitRate: number | undefined;
 	contextUsage: ContextUsage | undefined;
+	/** Routing of the latest `gateway/auto` response (phi). */
+	lastRouting: AssistantMessage["routing"] | undefined;
 }
 
 /**
@@ -120,12 +125,16 @@ export class FooterComponent implements Component {
 		// Calculate cumulative usage from ALL session entries (not just post-compaction messages)
 		const usageTotals = createUsageTotals();
 		let latestCacheHitRate: number | undefined;
+		let lastRouting: AssistantMessage["routing"] | undefined;
 
 		for (const entry of sessionManager.getEntries()) {
 			if (entry.type === "usage") {
 				addUsageToTotals(usageTotals, entry.usage);
 			} else if (entry.type === "message" && entry.message.role === "assistant") {
 				addUsageToTotals(usageTotals, entry.message.usage);
+				if (isAutoRouted(entry.message)) {
+					lastRouting = entry.message.routing;
+				}
 
 				const latestPromptTokens =
 					entry.message.usage.input + entry.message.usage.cacheRead + entry.message.usage.cacheWrite;
@@ -150,13 +159,14 @@ export class FooterComponent implements Component {
 			usageTotals,
 			latestCacheHitRate,
 			contextUsage,
+			lastRouting,
 		};
 		return this.sessionStats;
 	}
 
 	render(width: number): string[] {
 		const state = this.session.state;
-		const { usageTotals, latestCacheHitRate, contextUsage } = this.getSessionStats();
+		const { usageTotals, latestCacheHitRate, contextUsage, lastRouting } = this.getSessionStats();
 		const contextWindow = contextUsage?.contextWindow ?? state.model?.contextWindow ?? 0;
 		const contextPercentValue = contextUsage?.percent ?? 0;
 		const contextPercent = contextUsage?.percent !== null ? contextPercentValue.toFixed(1) : "?";
@@ -218,6 +228,7 @@ export class FooterComponent implements Component {
 
 		// Add model name on the right side, plus thinking level if model supports it
 		const modelName = state.model?.id || "no-model";
+		const isAutoModel = state.model?.provider === "gateway" && state.model.id === "auto";
 
 		let statsLeftWidth = visibleWidth(statsLeft);
 
@@ -230,38 +241,70 @@ export class FooterComponent implements Component {
 		// Calculate available space for padding (minimum 2 spaces between stats and model)
 		const minPadding = 2;
 
-		// Add thinking level indicator if model supports reasoning
-		let rightSideWithoutProvider = modelName;
+		// Processing tier as the session will request it (`/fast`, --service-tier,
+		// setting). `↯ fast` = fast mode requested and available on this model;
+		// `(standard)` = the last response was downgraded (fast-mode limit or
+		// capacity); `(n/a)` = this model has no fast tier, so requests run standard;
+		// `(unsupported)` = Amazon Bedrock has no fast tier for this model and phi
+		// refuses the request. Explicit `ultrafast` is sent as-is: `↯` only where the
+		// model is known to serve it.
+		const serviceTier = this.session.serviceTier;
+		let tierLabel: string = serviceTier;
+		if (serviceTier === "fast") {
+			if (!this.session.fastTierKind) {
+				tierLabel =
+					state.model && getUnsupportedFastServiceTierError(state.model, "fast")
+						? "fast (unsupported)"
+						: "fast (n/a)";
+			} else if (this.session.lastResponseSpeed === "standard") tierLabel = "↯ fast (standard)";
+			else tierLabel = "↯ fast";
+		} else if (serviceTier === "ultrafast" && getSupportedServiceTiers(state.model).includes("ultrafast")) {
+			tierLabel = this.session.lastResponseSpeed === "standard" ? "↯ ultrafast (standard)" : "↯ ultrafast";
+		}
+		const autoModelPrefix = "auto → ";
+		const servedModel = isAutoModel ? lastRouting?.servedModel : undefined;
+		const autoModelName = `${autoModelPrefix}${servedModel ?? "?"}`;
+		const autoModelHighlight = servedModel ? theme.bold(theme.fg("accent", servedModel)) : undefined;
+		const autoModelStyled = autoModelHighlight ? `${autoModelPrefix}${autoModelHighlight}` : autoModelName;
+		let rightSideWithoutProvider = `${isAutoModel ? autoModelName : modelName} • ${tierLabel}`;
+		let styledRightSideWithoutProvider = `${isAutoModel ? autoModelStyled : modelName} • ${tierLabel}`;
 		if (state.model?.reasoning) {
 			const thinkingLevel = state.thinkingLevel || "off";
-			rightSideWithoutProvider =
-				thinkingLevel === "off" ? `${modelName} • thinking off` : `${modelName} • ${thinkingLevel}`;
+			const thinkingText = ` • ${thinkingLevel === "off" ? "thinking off" : thinkingLevel}`;
+			rightSideWithoutProvider = `${rightSideWithoutProvider}${thinkingText}`;
+			styledRightSideWithoutProvider = `${styledRightSideWithoutProvider}${thinkingText}`;
 		}
 		// A virtual model routes each request; show where the latest response went.
 		const routed = this.session.routedModel;
 		if (routed) {
 			const level = routed.thinkingLevel ? ` • ${routed.thinkingLevel}` : "";
 			rightSideWithoutProvider += ` → ${routed.model.id}${level}`;
+			styledRightSideWithoutProvider += ` → ${routed.model.id}${level}`;
 		}
 
 		// Prepend the provider in parentheses if there are multiple providers and there's enough room
 		let rightSide = rightSideWithoutProvider;
+		let styledRightSide = styledRightSideWithoutProvider;
 		if (this.footerData.getAvailableProviderCount() > 1 && state.model) {
-			rightSide = `(${state.model!.provider}) ${rightSideWithoutProvider}`;
+			rightSide = `(${state.model.provider}) ${rightSideWithoutProvider}`;
+			styledRightSide = `(${state.model.provider}) ${styledRightSideWithoutProvider}`;
 			if (statsLeftWidth + minPadding + visibleWidth(rightSide) > width) {
 				// Too wide, fall back
 				rightSide = rightSideWithoutProvider;
+				styledRightSide = styledRightSideWithoutProvider;
 			}
 		}
 
 		const rightSideWidth = visibleWidth(rightSide);
 		const totalNeeded = statsLeftWidth + minPadding + rightSideWidth;
+		let highlightedRightSide = false;
 
 		let statsLine: string;
 		if (totalNeeded <= width) {
 			// Both fit - add padding to right-align model
 			const padding = " ".repeat(width - statsLeftWidth - rightSideWidth);
-			statsLine = statsLeft + padding + rightSide;
+			statsLine = statsLeft + padding + (isAutoModel ? styledRightSide : rightSide);
+			highlightedRightSide = isAutoModel && autoModelHighlight !== undefined;
 		} else {
 			// Need to truncate right side
 			const availableForRight = width - statsLeftWidth - minPadding;
@@ -281,7 +324,15 @@ export class FooterComponent implements Component {
 		// before and after the colored section independently.
 		const dimStatsLeft = theme.fg("dim", statsLeft);
 		const remainder = statsLine.slice(statsLeft.length); // padding + rightSide
-		const dimRemainder = theme.fg("dim", remainder);
+		let dimRemainder = theme.fg("dim", remainder);
+		if (highlightedRightSide && autoModelHighlight) {
+			const highlightIndex = remainder.indexOf(autoModelHighlight);
+			if (highlightIndex >= 0) {
+				const beforeHighlight = remainder.slice(0, highlightIndex);
+				const afterHighlight = remainder.slice(highlightIndex + autoModelHighlight.length);
+				dimRemainder = theme.fg("dim", beforeHighlight) + autoModelHighlight + theme.fg("dim", afterHighlight);
+			}
+		}
 
 		const pwdLine = truncateToWidth(theme.fg("dim", pwd), width, theme.fg("dim", "..."));
 		const lines = [pwdLine, dimStatsLeft + dimRemainder];

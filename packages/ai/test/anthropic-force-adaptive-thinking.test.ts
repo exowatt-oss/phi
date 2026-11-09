@@ -3,8 +3,14 @@ import { getModel, streamSimple } from "../src/compat.ts";
 import type { Context, Model, SimpleStreamOptions } from "../src/types.ts";
 
 interface AnthropicThinkingPayload {
-	thinking?: { type: string; budget_tokens?: number; display?: string };
+	thinking?: {
+		type: string;
+		budget_tokens?: number;
+		display?: string;
+		block_binding?: { prefix_mismatch_behavior: string };
+	};
 	output_config?: { effort?: string };
+	messages?: Array<{ role: string; content: unknown; output_config?: { effort?: string } }>;
 }
 
 class PayloadCaptured extends Error {
@@ -82,11 +88,23 @@ describe("Anthropic forceAdaptiveThinking compat override", () => {
 		expect(payload.output_config).toEqual({ effort: "medium" });
 	});
 
-	it("uses adaptive thinking with native xhigh effort for Claude Fable 5", async () => {
-		const payload = await capturePayload(getModel("anthropic", "claude-fable-5"), { reasoning: "xhigh" });
+	// Was claude-fable-5 until that model was measured against the API: it accepts
+	// only effort "low", so its catalog entry no longer claims xhigh. See
+	// anthropic-adaptive-effort-mapping.test.ts.
+	// Fable 5.1 is a managed (mid-conversation) effort model since upstream v1.x: the
+	// request-level effort stays "high", the native effort rides on a trailing system
+	// marker message, and adaptive thinking drops mismatched blocks via block_binding.
+	// See anthropic-mid-conversation-effort.test.ts.
+	it("uses adaptive thinking with native xhigh effort for Claude Fable 5.1", async () => {
+		const payload = await capturePayload(getModel("anthropic", "claude-fable-5-1"), { reasoning: "xhigh" });
 
-		expect(payload.thinking).toEqual({ type: "adaptive", display: "summarized" });
-		expect(payload.output_config).toEqual({ effort: "xhigh" });
+		expect(payload.thinking).toEqual({
+			type: "adaptive",
+			display: "summarized",
+			block_binding: { prefix_mismatch_behavior: "drop_block" },
+		});
+		expect(payload.output_config).toEqual({ effort: "high" });
+		expect(payload.messages?.at(-1)).toEqual({ role: "system", content: [], output_config: { effort: "xhigh" } });
 	});
 
 	it("allows built-in adaptive models to opt out with compat.forceAdaptiveThinking false", async () => {

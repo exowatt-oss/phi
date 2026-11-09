@@ -7,6 +7,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, w
 import { dirname, join } from "path";
 import { CONFIG_DIR_NAME, getAgentDir, getBinDir } from "./config.ts";
 import { migrateKeybindingsConfig } from "./core/keybindings.ts";
+import { migrateHubPackageLinks } from "./extensions/hub/link-repair.ts";
 import { stripBom } from "./utils/text.ts";
 
 const MIGRATION_GUIDE_URL =
@@ -305,11 +306,17 @@ export async function showDeprecationWarnings(warnings: string[]): Promise<void>
 export function runMigrations(cwd: string): {
 	migratedAuthProviders: string[];
 	deprecationWarnings: string[];
+	/** Hub bundles whose stale `packages` entry was dropped (`owner/slug`). */
+	unlinkedHubBundles: string[];
 } {
 	const migratedAuthProviders = migrateAuthToAuthJson();
 	migrateSessionsFromAgentRoot();
 	migrateToolsToBin();
 	migrateKeybindingsConfigFile();
+	// Must precede package discovery: a stale entry left in `packages` is resolved
+	// as an extension and fails to load, so repairing it from a session event is
+	// strictly too late — the error would still happen on this startup.
+	const unlinkedHubBundles = migrateHubPackageLinks(cwd, getAgentDir());
 	const deprecationWarnings = migrateExtensionSystem(cwd);
-	return { migratedAuthProviders, deprecationWarnings };
+	return { migratedAuthProviders, deprecationWarnings, unlinkedHubBundles };
 }

@@ -214,6 +214,7 @@ Content`,
 		});
 
 		it("should resolve symlinked user and project resources once", async () => {
+			mkdirSync(join(tempDir, ".git")); // The fixture is its own project root.
 			const previousHome = process.env.HOME;
 			process.env.HOME = tempDir;
 
@@ -2004,6 +2005,7 @@ Content`,
 		});
 
 		it("should resolve autoload-disabled package entries as positive-only without a global package", async () => {
+			mkdirSync(join(tempDir, ".git")); // Stop at the fixture, not host ancestors.
 			vi.stubEnv("HOME", tempDir);
 			const pkgDir = join(tempDir, "positive-only-pkg");
 			mkdirSync(join(pkgDir, "extensions"), { recursive: true });

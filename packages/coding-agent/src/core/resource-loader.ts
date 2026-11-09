@@ -1,5 +1,5 @@
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
-import { basename, dirname, join, resolve, sep } from "node:path";
+import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { detectCapabilities, getTerminalColorMode, type TerminalColorMode } from "@earendil-works/pi-tui";
 import chalk from "chalk";
 import { CONFIG_DIR_NAME } from "../config.ts";
@@ -200,6 +200,40 @@ function loadContextFileFromDir(dir: string): { path: string; content: string } 
 		}
 	}
 	return null;
+}
+
+/**
+ * Return whether an extension path is one of the old MCP bridge entry points.
+ *
+ * This is deliberately a path-identity check rather than a content or recursive
+ * directory scan. Only the user extension directory and the exact Hub bundle
+ * layout are eligible; a separately supplied path named mcp-bridge elsewhere is
+ * left alone.
+ */
+export function isLegacyMcpBridgeExtensionPath(extensionPath: string, agentDir: string): boolean {
+	if (extensionPath.startsWith("<")) {
+		return false;
+	}
+
+	const resolvedPath = resolvePath(extensionPath);
+	const resolvedAgentDir = resolvePath(agentDir);
+	const userBridgePath = join(resolvedAgentDir, "extensions", "mcp-bridge");
+	if (resolvedPath === userBridgePath || resolvedPath === join(userBridgePath, "index.ts")) {
+		return true;
+	}
+
+	const hubRelativePath = relative(join(resolvedAgentDir, "hub", "bundles"), resolvedPath);
+	const hubPathParts = hubRelativePath.split(sep);
+	if (hubPathParts.length !== 5 && hubPathParts.length !== 6) {
+		return false;
+	}
+
+	return (
+		/^v\d+$/.test(hubPathParts[2]) &&
+		hubPathParts[3] === "extensions" &&
+		hubPathParts[4] === "mcp-bridge" &&
+		(hubPathParts.length === 5 || hubPathParts[5] === "index.ts")
+	);
 }
 
 /**
@@ -550,7 +584,9 @@ export class DefaultResourceLoader implements ResourceLoader {
 
 		const getEnabledPaths = (resources: ResolvedResource[]): string[] =>
 			getEnabledResources(resources).map((r) => r.path);
-		const enabledExtensions = getEnabledPaths(resolvedPaths.extensions);
+		const getEnabledExtensionPaths = (resources: ResolvedResource[]): string[] =>
+			this.filterLegacyMcpBridgePaths(getEnabledPaths(resources));
+		const enabledExtensions = getEnabledExtensionPaths(resolvedPaths.extensions);
 		const enabledSkillResources = getEnabledResources(resolvedPaths.skills);
 		const enabledPrompts = getEnabledPaths(resolvedPaths.prompts);
 		const enabledThemes = getEnabledPaths(resolvedPaths.themes);
@@ -569,7 +605,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 			}
 		}
 
-		const cliEnabledExtensions = getEnabledPaths(cliExtensionPaths.extensions);
+		const cliEnabledExtensions = getEnabledExtensionPaths(cliExtensionPaths.extensions);
 		const cliEnabledSkills = getEnabledPaths(cliExtensionPaths.skills);
 		const cliEnabledPrompts = getEnabledPaths(cliExtensionPaths.prompts);
 		const cliEnabledThemes = getEnabledPaths(cliExtensionPaths.themes);
@@ -682,8 +718,13 @@ export class DefaultResourceLoader implements ResourceLoader {
 		const cliExtensionPaths = await this.packageManager.resolveExtensionSources(this.additionalExtensionPaths, {
 			temporary: true,
 		});
-		const enabledExtensions = resolvedPaths.extensions.filter((r) => r.enabled).map((r) => r.path);
-		const cliEnabledExtensions = cliExtensionPaths.extensions.filter((r) => r.enabled).map((r) => r.path);
+		// phi: legacy mcp-bridge copies are superseded by the native MCP runtime and never loaded.
+		const enabledExtensions = this.filterLegacyMcpBridgePaths(
+			resolvedPaths.extensions.filter((r) => r.enabled).map((r) => r.path),
+		);
+		const cliEnabledExtensions = this.filterLegacyMcpBridgePaths(
+			cliExtensionPaths.extensions.filter((r) => r.enabled).map((r) => r.path),
+		);
 		// Built-in extensions wait for the final pass: project settings can disable them, and a loaded
 		// extension cannot be unloaded.
 		const extensionPaths = (
@@ -748,15 +789,25 @@ export class DefaultResourceLoader implements ResourceLoader {
 		return result;
 	}
 
+	private filterLegacyMcpBridgePaths(paths: string[]): string[] {
+		return paths.filter((path) => !isLegacyMcpBridgeExtensionPath(path, this.agentDir));
+	}
+
 	private async loadFinalExtensionSet(
 		extensionPaths: string[],
 		preTrustExtensions: LoadExtensionsResult | undefined,
 	): Promise<LoadExtensionsResult> {
+		// phi: legacy mcp-bridge copies are superseded by the native MCP runtime and never loaded.
+		extensionPaths = this.filterLegacyMcpBridgePaths(extensionPaths);
 		// Without a pre-trust pass nothing is preloaded, and inline extensions load here.
 		const preloaded = preTrustExtensions?.extensions ?? [];
 		const preloadedByPath = new Map(
 			preloaded
-				.filter((extension) => !extension.path.startsWith("<inline:"))
+				.filter(
+					(extension) =>
+						!extension.path.startsWith("<inline:") &&
+						!isLegacyMcpBridgeExtensionPath(extension.resolvedPath, this.agentDir),
+				)
 				.map((extension) => [extension.resolvedPath, extension]),
 		);
 		const failedPreloadPaths = new Set(

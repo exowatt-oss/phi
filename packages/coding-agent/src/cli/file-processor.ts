@@ -17,7 +17,7 @@ export interface ProcessedFiles {
 }
 
 export interface ProcessFileOptions {
-	/** Whether to auto-resize images. Default: true */
+	/** Whether to fit images to Claude's native resolution (2576px long edge, 4784 visual tokens). Default: true */
 	autoResizeImages?: boolean;
 }
 

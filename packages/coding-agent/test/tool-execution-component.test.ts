@@ -502,15 +502,18 @@ describe("ToolExecutionComponent parity", () => {
 		const output = Array.from({ length: 15 }, (_, index) => `line-${index + 1}`).join("\n");
 		component.updateResult({ content: [{ type: "text", text: output }], details: {}, isError: false }, false);
 
+		// phi's fallback keeps the last `toolOutputLines` (default 5) visual lines, not the first 10.
 		const collapsed = stripAnsi(component.render(120).join("\n"));
 		expect(collapsed).toContain("custom_tool");
-		expect(collapsed).toContain("line-10");
-		expect(collapsed).not.toContain("line-11");
-		expect(collapsed).toContain("5 more lines");
+		expect(collapsed).toContain("line-15");
+		expect(collapsed).toContain("line-11");
+		expect(collapsed).not.toContain("line-10");
+		expect(collapsed).toContain("10 more lines");
 		expect(collapsed).toContain("to expand");
 
 		component.setExpanded(true);
 		const expanded = stripAnsi(component.render(120).join("\n"));
+		expect(expanded).toMatch(/line-1\s/);
 		expect(expanded).toContain("line-15");
 		expect(expanded).not.toContain("more lines");
 	});

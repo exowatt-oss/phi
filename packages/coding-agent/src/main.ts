@@ -23,17 +23,32 @@ import {
 	getAuthCommandUsage,
 	isAuthCommandHelp,
 	parseAuthCommand,
-	printAuthCommandHelp,
 	validateAuthCommandArgs,
 } from "./cli/auth-command.ts";
-import { resolveCredentialForPrint } from "./cli/credential-print.ts";
+import { runAuthTokenCommand } from "./cli/auth-token.ts";
+import { printCredentialPrintHelp, resolveCredentialForPrint } from "./cli/credential-print.ts";
 import { processFileArguments } from "./cli/file-processor.ts";
 import { buildInitialMessage } from "./cli/initial-message.ts";
 import { listModels } from "./cli/list-models.ts";
+import { PIPED_STDIN_FIRST_DATA_TIMEOUT_MS, readPipedStdin } from "./cli/piped-stdin.ts";
 import { createProjectTrustContext } from "./cli/project-trust.ts";
 import { selectSession } from "./cli/session-picker.ts";
-import { shouldRunFirstTimeSetup, showFirstTimeSetup, showStartupSelector } from "./cli/startup-ui.ts";
-import { APP_NAME, ENV_SESSION_DIR, expandTildePath, getAgentDir, getPackageDir, VERSION } from "./config.ts";
+import {
+	type StartupProgressHandle,
+	shouldRunFirstTimeSetup,
+	showFirstTimeSetup,
+	showStartupSelector,
+	startStartupProgress,
+} from "./cli/startup-ui.ts";
+import {
+	APP_NAME,
+	expandTildePath,
+	getAgentDir,
+	getEnvSessionDir,
+	getPackageDir,
+	setSessionInteractive,
+	VERSION,
+} from "./config.ts";
 import { type CreateAgentSessionRuntimeFactory, createAgentSessionRuntime } from "./core/agent-session-runtime.ts";
 import {
 	type AgentSessionRuntimeDiagnostic,
@@ -59,42 +74,22 @@ import {
 import { assertValidSessionId, SessionManager } from "./core/session-manager.ts";
 import { collectSettingsDiagnostics, deduplicateDiagnostics } from "./core/settings-diagnostics.ts";
 import { SettingsManager } from "./core/settings-manager.ts";
+import { isSubagentControlEnabled } from "./core/subagent-control.ts";
 import { printTimings, resetTimings, time } from "./core/timings.ts";
 import { hasTrustRequiringProjectResources, ProjectTrustStore } from "./core/trust-manager.ts";
+import { migrateHubPackageLinks } from "./extensions/hub/link-repair.ts";
 import { builtInExtensions } from "./extensions/index.ts";
-import { loadMcpCommand } from "./extensions/mcp/cli.lazy.ts";
+import { handleMcpCommand } from "./extensions/mcp/cli.ts";
 import { runMigrations, showDeprecationWarnings } from "./migrations.ts";
 import { InteractiveMode, runPrintMode, runRpcMode } from "./modes/index.ts";
 import { initTheme, setThemeJsonValidator, stopThemeWatcher } from "./modes/interactive/theme/theme.ts";
 import { validateThemeJson } from "./modes/interactive/theme/theme-schema.ts";
 import { cleanupManagedInstall, handleConfigCommand, handlePackageCommand } from "./package-manager-cli.ts";
+import { runRemoteCommand } from "./remote/cli.ts";
 import { isLocalPath, normalizePath, resolvePath } from "./utils/paths.ts";
 import { cleanupWindowsSelfUpdateQuarantine } from "./utils/windows-self-update.ts";
 
 const EXTENSION_LOAD_FAILURE_HINT = `Hint: Start without extensions using "${APP_NAME} -ne".`;
-
-/**
- * Read all content from piped stdin.
- * Returns undefined if stdin is a TTY (interactive terminal).
- */
-async function readPipedStdin(): Promise<string | undefined> {
-	// If stdin is a TTY, we're running interactively - don't read stdin
-	if (process.stdin.isTTY) {
-		return undefined;
-	}
-
-	return new Promise((resolve) => {
-		let data = "";
-		process.stdin.setEncoding("utf8");
-		process.stdin.on("data", (chunk) => {
-			data += chunk;
-		});
-		process.stdin.on("end", () => {
-			resolve(data.trim() || undefined);
-		});
-		process.stdin.resume();
-	});
-}
 
 function reportDiagnostics(diagnostics: readonly AgentSessionRuntimeDiagnostic[]): void {
 	for (const diagnostic of diagnostics) {
@@ -126,13 +121,19 @@ function toPrintOutputMode(appMode: AppMode): Exclude<Mode, "rpc"> {
 	return appMode === "json" ? "json" : "text";
 }
 
+/** Reserve stdin for JSONL subagent commands only in opt-in JSON mode. */
+export function shouldReadPipedStdin(appMode: AppMode, env: NodeJS.ProcessEnv = process.env): boolean {
+	return appMode !== "rpc" && !(appMode === "json" && isSubagentControlEnabled(env));
+}
+
 function isPlainRuntimeMetadataCommand(parsed: Args): boolean {
 	return !parsed.print && parsed.mode === undefined && (parsed.help === true || parsed.listModels !== undefined);
 }
 
 async function runAuthCommand(args: string[]): Promise<boolean> {
 	if (isAuthCommandHelp(args)) {
-		printAuthCommandHelp();
+		printCredentialPrintHelp();
+		process.exitCode = 0;
 		return true;
 	}
 
@@ -296,6 +297,21 @@ async function promptConfirm(message: string): Promise<boolean> {
 	});
 }
 
+async function withStartupProgressPaused<T>(
+	startupProgress: Pick<StartupProgressHandle, "pause" | "resume"> | undefined,
+	prompt: () => Promise<T>,
+): Promise<T> {
+	if (!startupProgress) {
+		return prompt();
+	}
+	await startupProgress.pause();
+	try {
+		return await prompt();
+	} finally {
+		await startupProgress.resume();
+	}
+}
+
 function validateForkFlags(parsed: Args): void {
 	if (!parsed.fork) return;
 
@@ -335,9 +351,9 @@ function validateSessionIdFlags(parsed: Args): void {
 	}
 }
 
-function openSessionOrExit(path: string, sessionDir?: string): SessionManager {
+function openSessionOrExit(path: string, sessionDir?: string, cwdOverride?: string): SessionManager {
 	try {
-		return SessionManager.open(path, sessionDir);
+		return SessionManager.open(path, sessionDir, cwdOverride);
 	} catch (error: unknown) {
 		const message = error instanceof Error ? error.message : String(error);
 		console.error(chalk.red(`Error: ${message}`));
@@ -360,6 +376,7 @@ export async function createSessionManager(
 	cwd: string,
 	sessionDir: string | undefined,
 	settingsManager: SettingsManager,
+	startupProgress?: Pick<StartupProgressHandle, "pause" | "resume">,
 ): Promise<SessionManager> {
 	if (parsed.noSession || parsed.help || parsed.listModels !== undefined) {
 		return SessionManager.inMemory(cwd, parsed.sessionId !== undefined ? { id: parsed.sessionId } : undefined);
@@ -394,15 +411,26 @@ export async function createSessionManager(
 		switch (resolved.type) {
 			case "path":
 			case "local":
-				return openSessionOrExit(resolved.path, sessionDir);
+				// --session-cwd keeps the session's id and file and only moves where it runs (phi remote
+				// resumes a stored session whose folder is gone or lives on another machine's path).
+				return openSessionOrExit(
+					resolved.path,
+					sessionDir,
+					parsed.sessionCwd ? resolvePath(parsed.sessionCwd, cwd) : undefined,
+				);
 
 			case "global": {
-				console.log(chalk.yellow(`Session found in different project: ${resolved.cwd}`));
-				const shouldFork = await promptConfirm("Fork this session into current directory?");
-				if (!shouldFork) {
-					console.log(chalk.dim("Aborted."));
-					process.exit(0);
+				if (parsed.sessionCwd) {
+					return openSessionOrExit(resolved.path, sessionDir, resolvePath(parsed.sessionCwd, cwd));
 				}
+				await withStartupProgressPaused(startupProgress, async () => {
+					console.log(chalk.yellow(`Session found in different project: ${resolved.cwd}`));
+					const shouldFork = await promptConfirm("Fork this session into current directory?");
+					if (!shouldFork) {
+						console.log(chalk.dim("Aborted."));
+						process.exit(0);
+					}
+				});
 				return forkSessionOrExit(resolved.path, cwd, sessionDir);
 			}
 
@@ -414,10 +442,12 @@ export async function createSessionManager(
 
 	if (parsed.resume) {
 		try {
-			const selectedPath = await selectSession(
-				(onProgress, signal) => SessionManager.list(cwd, sessionDir, onProgress, signal),
-				(onProgress, signal) => SessionManager.listAll(sessionDir, onProgress, signal),
-				settingsManager,
+			const selectedPath = await withStartupProgressPaused(startupProgress, () =>
+				selectSession(
+					(onProgress, signal) => SessionManager.list(cwd, sessionDir, onProgress, signal),
+					(onProgress, signal) => SessionManager.listAll(sessionDir, onProgress, signal),
+					settingsManager,
+				),
 			);
 			if (!selectedPath) {
 				console.log(chalk.dim("No session selected"));
@@ -524,6 +554,10 @@ function buildSessionOptions(
 		options.thinkingLevel = parsed.thinking;
 	}
 
+	if (parsed.serviceTier) {
+		options.serviceTier = parsed.serviceTier;
+	}
+
 	// Scoped models for Ctrl+P cycling
 	// Keep thinking level undefined when not explicitly set in the model pattern.
 	// Undefined means "inherit current session thinking level" during cycling.
@@ -573,6 +607,22 @@ export interface MainOptions {
 
 export async function main(args: string[], options?: MainOptions) {
 	resetTimings();
+
+	// Keep the external-tool credential contract strictly read-only: dispatch it
+	// before migrations, settings initialization, or any other startup work that
+	// may write to the agent directory.
+	const authTokenExitCode = runAuthTokenCommand(args, {
+		stdoutIsTTY: process.stdout.isTTY === true,
+	});
+	if (authTokenExitCode !== undefined) {
+		process.exitCode = authTokenExitCode;
+		return;
+	}
+	// `phi remote ...` (hub for the phone app) needs no settings, migrations or session startup.
+	if (args[0] === "remote") {
+		process.exit(await runRemoteCommand(args.slice(1)));
+	}
+
 	// Commands and startup selectors can load user-authored themes before runtime creation.
 	setThemeJsonValidator(validateThemeJson);
 	const extensionFactories = [...builtInExtensions, ...(options?.extensionFactories ?? [])];
@@ -591,11 +641,34 @@ export async function main(args: string[], options?: MainOptions) {
 	}
 	cleanupManagedInstall();
 
-	const cwd = process.cwd();
+	let cwd: string;
+	try {
+		cwd = process.cwd();
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		console.error(
+			chalk.red(
+				"Error: The current working directory no longer exists. Change to an existing directory and try again.",
+			),
+		);
+		process.exit(1);
+	}
 	const agentDir = getAgentDir();
 	const bootstrapSettingsManager = SettingsManager.create(cwd, agentDir, { projectTrusted: false });
 	applyHttpProxySettings(bootstrapSettingsManager.getGlobalSettings().httpProxy);
 	configureHttpDispatcher();
+
+	// Before anything can resolve `packages`. `pi package` and `pi config` both
+	// build a package manager of their own and would hit a stale hub-only entry
+	// while trying to report or fix it, so the repair cannot wait for the normal
+	// migration phase further down. It is idempotent and writes nothing when there
+	// is nothing stale, so running it here and in `runMigrations` costs one extra
+	// state read on the interactive path.
+	const earlyUnlinkedHubBundles = migrateHubPackageLinks(cwd, agentDir);
+
+	if (await handleMcpCommand(args)) {
+		return;
+	}
 
 	if (await handlePackageCommand(args, { extensionFactories })) {
 		const exitCode = process.exitCode ?? 0;
@@ -611,12 +684,6 @@ export async function main(args: string[], options?: MainOptions) {
 	}
 
 	if (await handleConfigCommand(args, { extensionFactories })) {
-		return;
-	}
-
-	if (args[0] === "mcp") {
-		const { runMcpCommand } = await loadMcpCommand();
-		process.exitCode = await runMcpCommand(args.slice(1), { cwd, agentDir });
 		return;
 	}
 
@@ -666,7 +733,14 @@ export async function main(args: string[], options?: MainOptions) {
 	validateSessionIdFlags(parsed);
 
 	// Run migrations (pass cwd for project-local migrations)
-	const { migratedAuthProviders: migratedProviders, deprecationWarnings } = runMigrations(cwd);
+	const {
+		migratedAuthProviders: migratedProviders,
+		deprecationWarnings,
+		unlinkedHubBundles: migratedUnlinkedHubBundles,
+	} = runMigrations(cwd);
+	// The early repair above normally does the work, so attribute the notice to
+	// whichever call actually found something.
+	const unlinkedHubBundles = earlyUnlinkedHubBundles.length > 0 ? earlyUnlinkedHubBundles : migratedUnlinkedHubBundles;
 	time("runMigrations");
 
 	const startupSettingsManager = SettingsManager.create(cwd, agentDir);
@@ -683,21 +757,31 @@ export async function main(args: string[], options?: MainOptions) {
 		startupSettingsManager.applyOverrides({ theme: parsed.useTheme });
 	}
 
+	// The progress UI starts only after settings and first-time setup, and only for
+	// the interactive path. It deliberately stays out of help/list-models startup.
+	const startupProgress =
+		appMode === "interactive" && !parsed.help && parsed.listModels === undefined
+			? startStartupProgress(startupSettingsManager)
+			: undefined;
+
 	// Decide the final runtime cwd before creating cwd-bound runtime services.
 	// --session and --resume may select a session from another project, so project-local
 	// settings, resources, provider registrations, and models must be resolved only after
 	// the target session cwd is known. The startup-cwd settings manager is used only for
 	// sessionDir lookup during session selection.
-	const envSessionDir = process.env[ENV_SESSION_DIR];
+	const envSessionDir = getEnvSessionDir();
 	const sessionDir =
 		(parsed.sessionDir ? normalizePath(parsed.sessionDir) : undefined) ??
 		(envSessionDir ? expandTildePath(envSessionDir) : undefined) ??
 		startupSettingsManager.getSessionDir();
-	let sessionManager = await createSessionManager(parsed, cwd, sessionDir, startupSettingsManager);
+	let sessionManager = await createSessionManager(parsed, cwd, sessionDir, startupSettingsManager, startupProgress);
+	startupProgress?.update({ current: 2, total: 6, message: "Checking project" });
 	const missingSessionCwdIssue = getMissingSessionCwdIssue(sessionManager, cwd);
 	if (missingSessionCwdIssue) {
 		if (appMode === "interactive") {
-			const selectedCwd = await promptForMissingSessionCwd(missingSessionCwdIssue, startupSettingsManager);
+			const selectedCwd = await withStartupProgressPaused(startupProgress, () =>
+				promptForMissingSessionCwd(missingSessionCwdIssue, startupSettingsManager),
+			);
 			if (!selectedCwd) {
 				process.exit(0);
 			}
@@ -730,6 +814,7 @@ export async function main(args: string[], options?: MainOptions) {
 	const resolvedSkillPaths = resolveCliPaths(cwd, parsed.skills);
 	const resolvedPromptTemplatePaths = resolveCliPaths(cwd, parsed.promptTemplates);
 	const resolvedThemePaths = resolveCliPaths(cwd, parsed.themes);
+	startupProgress?.update({ current: 3, total: 6, message: "Loading extensions, skills, and tools" });
 	const createRuntime: CreateAgentSessionRuntimeFactory = async ({
 		cwd,
 		agentDir,
@@ -771,6 +856,14 @@ export async function main(args: string[], options?: MainOptions) {
 										mode: isInitialRuntime ? trustPromptMode : appMode,
 										settingsManager: startupSettingsManager,
 										hasUI: isInitialRuntime && trustPromptMode === "interactive",
+										pauseStartupProgress:
+											isInitialRuntime && trustPromptMode === "interactive"
+												? () => startupProgress?.pause() ?? Promise.resolve()
+												: undefined,
+										resumeStartupProgress:
+											isInitialRuntime && trustPromptMode === "interactive"
+												? () => startupProgress?.resume() ?? Promise.resolve()
+												: undefined,
 									}),
 								onExtensionError: (message) => projectTrustDiagnostics.push({ type: "warning", message }),
 							});
@@ -810,6 +903,9 @@ export async function main(args: string[], options?: MainOptions) {
 			})),
 		];
 
+		if (isInitialRuntime) {
+			startupProgress?.update({ current: 4, total: 6, message: "Resolving models" });
+		}
 		const modelPatterns = parsed.models ?? settingsManager.getEnabledModels();
 		const scopedModels =
 			modelPatterns && modelPatterns.length > 0
@@ -845,6 +941,7 @@ export async function main(args: string[], options?: MainOptions) {
 			sessionStartEvent,
 			model: sessionOptions.model,
 			thinkingLevel: sessionOptions.thinkingLevel,
+			serviceTier: sessionOptions.serviceTier,
 			scopedModels: sessionOptions.scopedModels,
 			tools: sessionOptions.tools,
 			excludeTools: sessionOptions.excludeTools,
@@ -852,8 +949,10 @@ export async function main(args: string[], options?: MainOptions) {
 			customTools: sessionOptions.customTools,
 		});
 		const cliThinkingOverride = parsed.thinking !== undefined || cliThinkingFromModel;
-		if (created.session.model && cliThinkingOverride) {
-			created.session.setThinkingLevel(created.session.thinkingLevel);
+		if (created.session.model && cliThinkingOverride && sessionOptions.thinkingLevel !== undefined) {
+			// Persist the requested CLI preference, not the capability-clamped live
+			// level (which may be "off" on a non-reasoning model).
+			created.session.setThinkingLevel(sessionOptions.thinkingLevel);
 		}
 
 		return {
@@ -869,6 +968,7 @@ export async function main(args: string[], options?: MainOptions) {
 		sessionManager,
 	});
 	time("createAgentSessionRuntime");
+	startupProgress?.update({ current: 5, total: 6, message: "Preparing interface" });
 	const { services, session, modelFallbackMessage } = runtime;
 	const { settingsManager, modelRuntime, resourceLoader } = services;
 	setCapabilityOverrides(settingsManager.getTerminalCapabilityOverrides());
@@ -891,15 +991,31 @@ export async function main(args: string[], options?: MainOptions) {
 		process.exit(0);
 	}
 
-	// Read piped stdin content (if any) - skip for RPC mode which uses stdin for JSON-RPC
+	// RPC and opt-in JSON subagents reserve stdin for commands, not prompt content.
 	let stdinContent: string | undefined;
-	if (appMode !== "rpc") {
-		stdinContent = await readPipedStdin();
+	if (shouldReadPipedStdin(appMode)) {
+		// With a prompt already on the command line, stdin is optional context. Do not
+		// block forever on a caller that leaves stdin open but never writes or closes it.
+		const hasCliPrompt = parsed.messages.length > 0 || parsed.fileArgs.length > 0;
+		stdinContent = await readPipedStdin(process.stdin, {
+			firstDataTimeoutMs: hasCliPrompt ? PIPED_STDIN_FIRST_DATA_TIMEOUT_MS : undefined,
+			onTimeout: () => {
+				console.error(
+					chalk.dim(
+						`No stdin data received in ${PIPED_STDIN_FIRST_DATA_TIMEOUT_MS / 1000}s; continuing without it. Redirect stdin (< /dev/null) to skip the wait.`,
+					),
+				);
+			},
+		});
 		if (stdinContent !== undefined && appMode === "interactive") {
 			appMode = "print";
 		}
 	}
 	time("readPipedStdin");
+
+	// Last point at which `appMode` can still change: piped stdin turns an
+	// interactive launch into a print run, and that run has no human either.
+	setSessionInteractive(appMode === "interactive");
 
 	const { initialMessage, initialImages } = await prepareInitialMessage(parsed, stdinContent);
 	time("prepareInitialMessage");
@@ -908,20 +1024,25 @@ export async function main(args: string[], options?: MainOptions) {
 
 	// Show deprecation warnings in interactive mode
 	if (appMode === "interactive" && deprecationWarnings.length > 0) {
-		await showDeprecationWarnings(deprecationWarnings);
+		await withStartupProgressPaused(startupProgress, () => showDeprecationWarnings(deprecationWarnings));
 	}
 
 	time("resolveModelScope");
+	// Interactive mode shows startup warnings inside the TUI (startupDiagnostics);
+	// print them here only for non-interactive runs or when startup must abort.
 	const startupDiagnostics = deduplicateDiagnostics([...startupSettingsDiagnostics, ...runtime.diagnostics]);
 	const hasRuntimeErrors = runtime.diagnostics.some((diagnostic) => diagnostic.type === "error");
 	if (appMode !== "interactive" || hasRuntimeErrors) {
+		await startupProgress?.pause();
 		reportDiagnostics(startupDiagnostics);
-	}
-	if (hasRuntimeErrors) {
-		if (runtime.diagnostics.some((diagnostic) => diagnostic.message.includes("Failed to load extension"))) {
-			console.error(chalk.yellow(EXTENSION_LOAD_FAILURE_HINT));
+		if (hasRuntimeErrors) {
+			if (runtime.diagnostics.some((diagnostic) => diagnostic.message.includes("Failed to load extension"))) {
+				console.error(chalk.yellow(EXTENSION_LOAD_FAILURE_HINT));
+			}
+			await startupProgress?.close();
+			process.exit(1);
 		}
-		process.exit(1);
+		await startupProgress?.resume();
 	}
 	time("createAgentSession");
 
@@ -951,7 +1072,9 @@ export async function main(args: string[], options?: MainOptions) {
 		await runRpcMode(runtime);
 	} else if (appMode === "interactive") {
 		const interactiveMode = new InteractiveMode(runtime, {
+			startupProgress,
 			migratedProviders,
+			unlinkedHubBundles,
 			startupDiagnostics,
 			modelFallbackMessage,
 			autoTrustOnReloadCwd,
@@ -964,6 +1087,7 @@ export async function main(args: string[], options?: MainOptions) {
 		});
 		if (startupBenchmark) {
 			await interactiveMode.init();
+			await startupProgress?.close();
 			time("interactiveMode.init");
 			// Give the TUI's stdin handler a brief chance to consume terminal query replies
 			// (Kitty keyboard protocol, device attributes, cell size) before restoring the terminal.
@@ -980,7 +1104,13 @@ export async function main(args: string[], options?: MainOptions) {
 			return;
 		}
 
-		printTimings();
+		if (process.env.PI_TIMING === "1") {
+			await withStartupProgressPaused(startupProgress, async () => {
+				printTimings();
+			});
+		} else {
+			printTimings();
+		}
 		await interactiveMode.run();
 	} else {
 		printTimings();

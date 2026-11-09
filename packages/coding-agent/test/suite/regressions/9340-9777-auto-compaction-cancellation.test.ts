@@ -71,7 +71,13 @@ describe("automatic compaction cancellation regressions", () => {
 
 		await harness.session.prompt("z".repeat(1000));
 
-		expect(harness.eventsOfType("compaction_start")).toHaveLength(0);
+		// phi also compacts at request time (pre-prompt check and request preflight), which this
+		// 200-token window triggers before the run; the regression is compaction after the abort.
+		const runEnd = harness.events.findIndex(
+			(event) => event.type === "message_end" && event.message.role === "assistant",
+		);
+		expect(runEnd).toBeGreaterThanOrEqual(0);
+		expect(harness.events.slice(runEnd).filter((event) => event.type === "compaction_start")).toHaveLength(0);
 	});
 
 	// Regression test for #9777.

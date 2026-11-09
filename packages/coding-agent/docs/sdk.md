@@ -29,6 +29,8 @@ The [complete minimal example](../examples/sdk/01-minimal.ts) also streams text 
 
 Read current state through `session.messages`, `session.model`, `session.thinkingLevel`, `session.systemPrompt`, and `session.getActiveToolNames()`.
 
+`session.setModel(model, options?)` and `session.setThinkingLevel(level, options?)` change the live session, its history, and its events. They are session-scoped by default; pass `{ persist: true }` when an explicit user-facing control should also save the choice as the default for new sessions in `settings.json`.
+
 `session.systemPrompt` is read-only and returns the current effective system prompt, including changes that have not yet been sent to the model. Tool changes are declared to the model before the next request.
 
 <a id="sessionmanager-api"></a>
@@ -113,7 +115,7 @@ Inline extension factories can be supplied through `DefaultResourceLoader`. Give
 
 <a id="codemode-mcp"></a>
 
-The CLI loads `codemode`, `tool_search`, and MCP as built-in extensions. SDK sessions do not; add `createCodemodeExtension()`, `createToolSearchExtension()`, and `createMcpExtension()` to the `extensionFactories` of `DefaultResourceLoader`. `codemode` and `tool_search` are registered inactive: enable them through the `defaultTools` setting (`["+codemode", "+tool_search"]` keeps the other default tools), or let the MCP extension activate them: `codemode` for servers with `codemode` exposure, `tool_search` for servers with `deferred` exposure. The MCP extension connects its servers on `session_start`, so call `session.bindExtensions()`. See [Codemode and MCP](../examples/sdk/14-codemode-mcp.ts).
+The CLI loads `codemode`, `tool_search`, and phi's native MCP runtime as built-in extensions. SDK sessions do not; add `createCodemodeExtension()` and `createToolSearchExtension()` to the `extensionFactories` of `DefaultResourceLoader`. Both are registered inactive: enable them through the `defaultTools` setting (`["+codemode", "+tool_search"]` keeps the other default tools). phi's native MCP runtime (`mcp.json`, `/mcp`, `phi mcp`) ships with the CLI and is not exported as an SDK extension factory (upstream's `createMcpExtension()` is not shipped in phi); see [MCP](mcp.md).
 
 See the focused examples for [models](../examples/sdk/02-custom-model.ts), [tools](../examples/sdk/05-tools.ts), [extensions](../examples/sdk/06-extensions.ts), and [full control](../examples/sdk/12-full-control.ts).
 
@@ -134,7 +136,6 @@ See the focused examples for [models](../examples/sdk/02-custom-model.ts), [tool
 | [Sessions](../examples/sdk/11-sessions.ts) | Control session persistence and restoration |
 | [Full control](../examples/sdk/12-full-control.ts) | Replace default discovery and state services |
 | [Session runtime](../examples/sdk/13-session-runtime.ts) | Replace the active session safely |
-| [Codemode and MCP](../examples/sdk/14-codemode-mcp.ts) | Add the `codemode`, `tool_search`, and MCP extensions |
 
 <a id="exports"></a>
 

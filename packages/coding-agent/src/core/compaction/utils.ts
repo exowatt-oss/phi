@@ -15,6 +15,11 @@ export interface FileOperations {
 	edited: Set<string>;
 }
 
+/** Whether a custom message should be omitted from compacted summaries. */
+export function isEphemeralCustomMessage(message: AgentMessage): boolean {
+	return message.role === "custom" && message.ephemeral === true;
+}
+
 export function createFileOps(): FileOperations {
 	return {
 		read: new Set(),

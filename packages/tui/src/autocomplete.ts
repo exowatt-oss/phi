@@ -93,6 +93,15 @@ function isTokenStart(text: string, index: number): boolean {
 	return PATH_DELIMITERS.has(text[start - 1] ?? "") || tokenStartRegex.test(text.slice(0, start));
 }
 
+function findTokenEnd(text: string, start: number): number {
+	for (let i = start; i < text.length; i += 1) {
+		if (PATH_DELIMITERS.has(text[i] ?? "")) {
+			return i;
+		}
+	}
+	return text.length;
+}
+
 function extractQuotedPrefix(text: string): string | null {
 	const quoteStart = findUnclosedQuoteStart(text);
 	if (quoteStart === null) {
@@ -332,12 +341,10 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 			};
 		}
 
-		const commandText = textBeforeCursor.trimStart();
-		if (!options.force && commandText.startsWith("/")) {
-			const spaceIndex = commandText.indexOf(" ");
-
-			if (spaceIndex === -1) {
-				const prefix = commandText.slice(1);
+		if (!options.force) {
+			const slashToken = this.extractSlashToken(currentLine, cursorCol);
+			if (slashToken && !this.isStartOfLineArgumentToken(currentLine, slashToken.start)) {
+				const commandPrefix = currentLine.slice(slashToken.start, cursorCol).slice(1);
 				const commandItems = this.commands.map((cmd) => {
 					const name = "name" in cmd ? cmd.name : cmd.value;
 					const hint = "argumentHint" in cmd && cmd.argumentHint ? cmd.argumentHint : undefined;
@@ -350,13 +357,13 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 					};
 				});
 
-				const bareNameMatches = fuzzyFilter(commandItems, prefix, (item) =>
+				const bareNameMatches = fuzzyFilter(commandItems, commandPrefix, (item) =>
 					item.name.startsWith("skill:") ? item.name.slice("skill:".length) : item.name,
 				);
 				const bareNameMatchSet = new Set(bareNameMatches);
 				const fullNameOnlyMatches = fuzzyFilter(
 					commandItems.filter((item) => item.name.startsWith("skill:") && !bareNameMatchSet.has(item)),
-					prefix,
+					commandPrefix,
 					(item) => item.name,
 				);
 				const filtered = [...bareNameMatches, ...fullNameOnlyMatches].map((item) => ({
@@ -369,30 +376,37 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 
 				return {
 					items: filtered,
-					prefix: commandText,
+					prefix: currentLine.slice(slashToken.start, cursorCol),
 				};
 			}
 
-			const commandName = commandText.slice(1, spaceIndex);
-			const argumentText = commandText.slice(spaceIndex + 1);
+			// Preserve argument completion for commands at the start of the line (leading whitespace allowed).
+			const commandText = textBeforeCursor.trimStart();
+			if (commandText.startsWith("/")) {
+				const spaceIndex = commandText.indexOf(" ");
+				if (spaceIndex !== -1) {
+					const commandName = commandText.slice(1, spaceIndex);
+					const argumentText = commandText.slice(spaceIndex + 1);
 
-			const command = this.commands.find((cmd) => {
-				const name = "name" in cmd ? cmd.name : cmd.value;
-				return name === commandName;
-			});
-			if (!command || !("getArgumentCompletions" in command) || !command.getArgumentCompletions) {
-				return null;
+					const command = this.commands.find((cmd) => {
+						const name = "name" in cmd ? cmd.name : cmd.value;
+						return name === commandName;
+					});
+					if (!command || !("getArgumentCompletions" in command) || !command.getArgumentCompletions) {
+						return null;
+					}
+
+					const argumentSuggestions = await command.getArgumentCompletions(argumentText);
+					if (!Array.isArray(argumentSuggestions) || argumentSuggestions.length === 0) {
+						return null;
+					}
+
+					return {
+						items: argumentSuggestions,
+						prefix: argumentText,
+					};
+				}
 			}
-
-			const argumentSuggestions = await command.getArgumentCompletions(argumentText);
-			if (!Array.isArray(argumentSuggestions) || argumentSuggestions.length === 0) {
-				return null;
-			}
-
-			return {
-				items: argumentSuggestions,
-				prefix: argumentText,
-			};
 		}
 
 		const pathMatch = this.extractPathPrefix(textBeforeCursor, options.force ?? false);
@@ -425,19 +439,28 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 		const adjustedAfterCursor =
 			isQuotedPrefix && hasTrailingQuoteInItem && hasLeadingQuoteAfterCursor ? afterCursor.slice(1) : afterCursor;
 
-		// Check if we're completing a slash command (prefix starts with "/" but NOT a file path)
-		// Slash commands are at the start of the line and don't contain path separators after the first /
-		const isSlashCommand = prefix.startsWith("/") && beforePrefix.trim() === "" && !prefix.slice(1).includes("/");
+		// A slash command can appear after any natural token boundary. Replace the
+		// whole token so completion also works when the cursor is before following text.
+		const slashToken = this.extractSlashToken(currentLine, cursorCol);
+		const isSlashCommand =
+			prefix.startsWith("/") &&
+			slashToken !== null &&
+			!this.isStartOfLineArgumentToken(currentLine, slashToken.start) &&
+			currentLine.slice(slashToken.start, cursorCol) === prefix &&
+			!item.value.includes("/");
 		if (isSlashCommand) {
-			// This is a command name completion
-			const newLine = `${beforePrefix}/${item.value} ${adjustedAfterCursor}`;
+			const beforeToken = currentLine.slice(0, slashToken.start);
+			const afterToken = currentLine.slice(slashToken.end);
+			const hasTrailingSpace = afterToken.startsWith(" ");
+			const trailingSpace = hasTrailingSpace ? "" : " ";
+			const newLine = `${beforeToken}/${item.value}${trailingSpace}${afterToken}`;
 			const newLines = [...lines];
 			newLines[cursorLine] = newLine;
 
 			return {
 				lines: newLines,
 				cursorLine,
-				cursorCol: beforePrefix.length + item.value.length + 2, // +2 for "/" and space
+				cursorCol: beforeToken.length + item.value.length + 2,
 			};
 		}
 
@@ -494,6 +517,34 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 			cursorLine,
 			cursorCol: beforePrefix.length + cursorOffset,
 		};
+	}
+
+	private isStartOfLineArgumentToken(text: string, tokenStart: number): boolean {
+		const commandStart = text.length - text.trimStart().length;
+		return (
+			text[commandStart] === "/" &&
+			tokenStart > commandStart &&
+			findLastDelimiter(text.slice(commandStart, tokenStart)) !== -1
+		);
+	}
+
+	// Extract a slash command token at the cursor using the same boundaries as @.
+	// A second slash makes the token path-like, so it remains file completion.
+	private extractSlashToken(text: string, cursorCol: number): { start: number; end: number } | null {
+		const textBeforeCursor = text.slice(0, cursorCol);
+		const lastDelimiterIndex = findLastDelimiter(textBeforeCursor);
+		const tokenStart = lastDelimiterIndex === -1 ? 0 : lastDelimiterIndex + 1;
+
+		if (text[tokenStart] !== "/") {
+			return null;
+		}
+
+		const tokenEnd = findTokenEnd(text, tokenStart);
+		if (text.slice(tokenStart + 1, tokenEnd).includes("/")) {
+			return null;
+		}
+
+		return { start: tokenStart, end: tokenEnd };
 	}
 
 	// Extract @ prefix for fuzzy file suggestions

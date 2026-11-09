@@ -235,6 +235,39 @@ describe("AgentSession compaction characterization", () => {
 		);
 	});
 
+	it("merges session_before_compact pinned text into the compaction entry", async () => {
+		const previousTuiMode = process.env.PI_TUI_MODE;
+		process.env.PI_TUI_MODE = "1";
+		try {
+			const harness = await createHarness({
+				settings: { compaction: { keepRecentTokens: 1 } },
+				extensionFactories: [
+					(pi) => {
+						pi.on("session_before_compact", async (event) => ({
+							pinned: ["KEEP THIS"],
+							compaction: {
+								summary: "summary with pinned context",
+								firstKeptEntryId: event.preparation.firstKeptEntryId,
+								tokensBefore: event.preparation.tokensBefore,
+								details: {},
+							},
+						}));
+					},
+				],
+			});
+			harnesses.push(harness);
+			await harness.session.prompt("one");
+			await harness.session.prompt("two");
+			await harness.session.compact();
+
+			const entry = harness.sessionManager.getEntries().find((candidate) => candidate.type === "compaction");
+			expect(entry).toMatchObject({ pinned: expect.arrayContaining(["KEEP THIS"]) });
+		} finally {
+			if (previousTuiMode === undefined) delete process.env.PI_TUI_MODE;
+			else process.env.PI_TUI_MODE = previousTuiMode;
+		}
+	});
+
 	it("allows a queued prompt to start when manual compaction ends", async () => {
 		const harness = await createHarness({
 			settings: { compaction: { keepRecentTokens: 1 } },
@@ -537,7 +570,13 @@ describe("AgentSession compaction characterization", () => {
 			await harness.session.prompt("run the large tool");
 
 			expect(order.slice(0, 2)).toEqual(["compaction", "provider"]);
-			expect(observedSettings[0]).toEqual({ enabled: true, reserveTokens: 400, keepRecentTokens: 1750 });
+			// phi: compaction settings carry the soft ceiling (default 300k).
+			expect(observedSettings[0]).toEqual({
+				enabled: true,
+				reserveTokens: 400,
+				keepRecentTokens: 1750,
+				softCeilingTokens: 300_000,
+			});
 			expect(harness.eventsOfType("agent_start")).toHaveLength(agentStartsBefore + 1);
 			expect(harness.eventsOfType("compaction_start").at(-1)).toEqual({
 				type: "compaction_start",

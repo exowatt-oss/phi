@@ -39,6 +39,10 @@ type LoadedResourcesContext = {
 };
 
 type RebindContext = {
+	// rebindCurrentSession installs the built-in /btw renderer from the session's
+	// extension runner before it rebinds, so the fake context has to carry both.
+	session: { extensionRunner: unknown };
+	registerBuiltinBtwRenderer: (runner: unknown) => void;
 	unsubscribe?: () => void;
 	applyRuntimeSettings: () => void;
 	programStatus: { reset(): void };
@@ -252,6 +256,8 @@ describe("regression #5943: session_start transient UI", () => {
 
 		try {
 			const context: RebindContext = {
+				session: harness.session,
+				registerBuiltinBtwRenderer: () => {},
 				applyRuntimeSettings: () => events.push("apply"),
 				programStatus: { reset: () => {} },
 				renderCurrentSessionState: () => events.push("render"),
@@ -294,6 +300,8 @@ describe("regression #5943: session_start transient UI", () => {
 
 		try {
 			const context: RebindContext = {
+				session: harness.session,
+				registerBuiltinBtwRenderer: () => {},
 				applyRuntimeSettings: () => {},
 				programStatus: { reset: () => {} },
 				renderCurrentSessionState: () => events.push("render"),
@@ -347,6 +355,8 @@ describe("regression #5943: session_start transient UI", () => {
 
 		try {
 			const context: RebindContext = {
+				session: harness.session,
+				registerBuiltinBtwRenderer: () => {},
 				applyRuntimeSettings: () => {},
 				programStatus: { reset: () => {} },
 				renderCurrentSessionState: () => events.push("render"),

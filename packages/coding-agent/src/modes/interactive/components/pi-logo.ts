@@ -25,6 +25,27 @@ export function piLogoLines(): [string, string] {
 	return [top, bottom];
 }
 
+// phi logo, a Greek phi from the same square pixels, 5 cells wide and 3 lines tall:
+//
+//   . . X . .
+//   . X X X .
+//   X . X . X
+//   X . X . X
+//   . X X X .
+//   . . X . .
+//
+// Plain near-white on dark terminals and near-black on light ones, like the P3 icon; no brand colors.
+const PHI_LOGO = [" ▄█▄ ", "█ █ █", " ▀█▀ "] as const;
+const PHI_LIGHT = rgbColor(245, 245, 245);
+const PHI_DARK = rgbColor(15, 15, 15);
+
+export function phiLogoLines(): [string, string, string] {
+	const color = theme.appearance === "light" ? PHI_DARK : PHI_LIGHT;
+	const fg = foregroundAnsi(color, theme.getColorMode());
+	const [top, middle, bottom] = PHI_LOGO;
+	return [`${fg}${top}${RESET}`, `${fg}${middle}${RESET}`, `${fg}${bottom}${RESET}`];
+}
+
 /**
  * Whether the terminal renders the half-block logo correctly. Apple Terminal draws gaps between rows and
  * misaligns the half blocks, so it gets the text wordmark instead.

@@ -34,6 +34,8 @@ import { type AppMode, resolveProjectTrusted } from "./core/project-trust.ts";
 import { DefaultResourceLoader, isBuiltinExtension } from "./core/resource-loader.ts";
 import { SettingsManager } from "./core/settings-manager.ts";
 import { hasTrustRequiringProjectResources, ProjectTrustStore } from "./core/trust-manager.ts";
+import { getPhiInstallerCommand, runPhiUpgrade } from "./extensions/updater/index.ts";
+import { inspectPhiUpdate } from "./extensions/updater/version.ts";
 import { spawnProcess, spawnProcessSync, waitForChildProcess } from "./utils/child-process.ts";
 import { canonicalizePath, getCwdRelativePath } from "./utils/paths.ts";
 import { getPiUserAgent } from "./utils/pi-user-agent.ts";
@@ -360,24 +362,24 @@ Examples:
 			console.log(`${chalk.bold("Usage:")}
   ${getPackageCommandUsage("update")}
 
-Update pi, installed packages, or model catalogs.
+Update ${APP_NAME}, installed packages, or model catalogs.
 
 Options:
-  --self                  Update pi only (default when no target is given)
+  --self                  Update ${APP_NAME} only (default when no target is given)
   --extensions            Update installed packages only
   --models                Refresh model catalogs only
-  --all                   Update pi and installed packages
+  --all                   Update ${APP_NAME} and installed packages
   --extension <source>    Update one package only
   -a, --approve           Trust project-local files for this command
   -na, --no-approve       Ignore project-local files for this command
-  --force                 Reinstall pi even if the current version is latest
+  --force                 Reinstall ${APP_NAME} even if the current version is latest
 
 Short forms:
-  ${APP_NAME} update                Update pi only
-  ${APP_NAME} update --all          Update pi and all extensions
+  ${APP_NAME} update                Update ${APP_NAME} only
+  ${APP_NAME} update --all          Update ${APP_NAME} and all extensions
   ${APP_NAME} update --models       Refresh model catalogs only
   ${APP_NAME} update <source>       Update one package
-  ${APP_NAME} update pi             Update pi only (self works as alias to pi)
+  ${APP_NAME} update ${APP_NAME}      Update ${APP_NAME} only ("self" and "pi" work too)
 `);
 			return;
 
@@ -554,7 +556,7 @@ function parsePackageCommand(args: string[]): PackageCommandOptions | undefined 
 			}
 			updateTarget = { type: "extensions", source: extensionFlagSource };
 		} else if (source) {
-			const sourceIsSelf = source === "self" || source === "pi";
+			const sourceIsSelf = source === "self" || source === "pi" || source === APP_NAME;
 			if (sourceIsSelf) {
 				updateTarget = extensionsFlag ? { type: "all" } : { type: "self" };
 			} else {
@@ -641,7 +643,7 @@ function printSelfUpdateUnavailable(
 	const entrypoint = process.argv[1];
 	if (entrypoint) {
 		console.error("");
-		console.error(`Location of ${APP_NAME} executable: ${entrypoint}`);
+		console.error(`Location of the ${APP_NAME} executable: ${entrypoint}`);
 	}
 }
 
@@ -732,6 +734,57 @@ async function runSelfUpdate(command: SelfUpdateCommand): Promise<void> {
 			});
 		});
 	}
+}
+
+/**
+ * Self-update for the compiled (bun-binary) distribution. Compiled phi is
+ * installed by phi-install.sh from a configured self-hosted release feed, not from npm, so
+ * the upstream package-manager plan does not apply: ask the feed for the
+ * latest release id and re-run the pinned installer for it. Returns whether
+ * the command succeeded; the caller sets the exit code.
+ */
+async function runCompiledSelfUpdate(force: boolean): Promise<boolean> {
+	const installerCommand = getPhiInstallerCommand(APP_NAME);
+	const check = await inspectPhiUpdate();
+	switch (check.status) {
+		case "unmanaged":
+			console.error(`error: ${APP_NAME} cannot self-update this installation.`);
+			console.error(
+				`No release metadata (${APP_NAME}-version.json) sits next to this binary, so it was not installed by the ${APP_NAME} installer.`,
+			);
+			console.error(`Re-run the installer to update: ${installerCommand}`);
+			return false;
+		case "unavailable":
+			console.error(chalk.red(`Could not check for a ${APP_NAME} update: ${check.reason}`));
+			if (check.current) console.error(chalk.dim(`Current release: ${check.current.releaseId}`));
+			console.error(chalk.dim(`Is your update feed available? To update without the check: ${installerCommand}`));
+			return false;
+		case "current":
+			if (!force) {
+				console.log(chalk.green(`${APP_NAME} is already up to date (v${VERSION}, ${check.current.releaseId})`));
+				return true;
+			}
+			console.log(chalk.dim(`Reinstalling ${APP_NAME} ${check.latest.releaseId} (--force)...`));
+			break;
+		case "update":
+			console.log(chalk.dim(`Updating ${APP_NAME} ${check.current.releaseId} → ${check.latest.releaseId}...`));
+			break;
+	}
+
+	try {
+		await runPhiUpgrade({ release: check.latest, inheritStdio: true });
+	} catch (error: unknown) {
+		const message = error instanceof Error ? error.message : "Unknown installer error";
+		console.error(chalk.red(`Error: ${message}`));
+		console.error(chalk.dim(`If this keeps failing, run the installer yourself: ${installerCommand}`));
+		return false;
+	}
+	console.log(
+		chalk.green(
+			`Updated ${APP_NAME} from ${check.current.releaseId} to ${check.latest.releaseId}. Restart ${APP_NAME} to use it.`,
+		),
+	);
+	return true;
 }
 
 function prepareWindowsNpmSelfUpdate(): void {
@@ -1047,6 +1100,14 @@ export async function handlePackageCommand(
 					}
 				}
 				if (updateTargetIncludesSelf(target)) {
+					if (detectInstallMethod() === "bun-binary") {
+						// Compiled phi build: never consult upstream pi.dev/npm, which would
+						// replace phi with upstream pi. Only the configured update feed may provide a compiled phi release.
+						if (!(await runCompiledSelfUpdate(options.force))) {
+							process.exitCode = 1;
+						}
+						return true;
+					}
 					const managedInstallRoot = getActiveManagedInstallRoot();
 					if (managedInstallRoot && options.force) {
 						console.error(

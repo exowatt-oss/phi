@@ -479,6 +479,70 @@ describe("openai-responses provider defaults", () => {
 		expect(captured.clientRequestId).toBeNull();
 	});
 
+	it("serializes the renamed fast service tier through streamSimple", async () => {
+		let capturedPayload: unknown;
+		vi.spyOn(globalThis, "fetch").mockResolvedValue(
+			new Response("data: [DONE]\n\n", {
+				status: 200,
+				headers: { "content-type": "text/event-stream" },
+			}),
+		);
+
+		const stream = streamOpenAIResponses(
+			getModel("openai", "gpt-5.4"),
+			normalizeContext({
+				messages: [{ role: "user", content: "hi", timestamp: Date.now() }],
+			}),
+			{
+				apiKey: "test-key",
+				serviceTier: "fast",
+				onPayload: (payload) => {
+					capturedPayload = payload;
+				},
+			},
+		);
+		for await (const event of stream) {
+			if (event.type === "done" || event.type === "error") break;
+		}
+
+		expect(capturedPayload).toMatchObject({ service_tier: "fast" });
+	});
+
+	it("omits service_tier for github-copilot models", async () => {
+		let capturedPayload: unknown;
+		vi.spyOn(globalThis, "fetch").mockResolvedValue(
+			new Response("data: [DONE]\n\n", {
+				status: 200,
+				headers: { "content-type": "text/event-stream" },
+			}),
+		);
+
+		const model = {
+			...getModel("openai", "gpt-5.4"),
+			provider: "github-copilot",
+			baseUrl: "https://api.individual.githubcopilot.com",
+		} as Model<"openai-responses">;
+
+		const stream = streamOpenAIResponses(
+			model,
+			normalizeContext({
+				messages: [{ role: "user", content: "hi", timestamp: Date.now() }],
+			}),
+			{
+				apiKey: "test-key",
+				serviceTier: "fast",
+				onPayload: (payload) => {
+					capturedPayload = payload;
+				},
+			},
+		);
+		for await (const event of stream) {
+			if (event.type === "done" || event.type === "error") break;
+		}
+
+		expect("service_tier" in (capturedPayload as object)).toBe(false);
+	});
+
 	it.each([
 		["gpt-5.4", "priority", "priority", 2],
 		["gpt-5.5", "priority", "priority", 2.5],
@@ -534,6 +598,322 @@ describe("openai-responses provider defaults", () => {
 			);
 		},
 	);
+
+	describe("Amazon Bedrock GPT-6 Astra", () => {
+		const bedrockAstra = (): Model<"openai-responses"> => ({
+			id: "openai.gpt-6-astra",
+			name: "GPT-6 Astra (Bedrock)",
+			api: "openai-responses",
+			provider: "bedrock-astra",
+			baseUrl: "https://bedrock-mantle.us-east-1.api.aws/openai/v1",
+			reasoning: true,
+			input: ["text", "image"],
+			cost: { input: 11, output: 55, cacheRead: 1.1, cacheWrite: 0 },
+			contextWindow: 1_000_000,
+			maxTokens: 128_000,
+		});
+
+		function completedSse(serviceTier: string | undefined, tokens: number): string {
+			return `data: ${JSON.stringify({
+				type: "response.completed",
+				response: {
+					status: "completed",
+					...(serviceTier ? { service_tier: serviceTier } : {}),
+					usage: {
+						input_tokens: tokens,
+						output_tokens: tokens,
+						total_tokens: tokens * 2,
+						input_tokens_details: { cached_tokens: 0 },
+					},
+				},
+			})}\n\n`;
+		}
+
+		it("sends fast as service_tier ultrafast and bills the served tier at 6x", async () => {
+			let capturedPayload: unknown;
+			vi.spyOn(globalThis, "fetch").mockResolvedValue(
+				new Response(completedSse("ultrafast", 1_000_000), {
+					status: 200,
+					headers: { "content-type": "text/event-stream" },
+				}),
+			);
+			const model = bedrockAstra();
+			const result = await streamOpenAIResponses(
+				model,
+				normalizeContext({ messages: [{ role: "user", content: "hi", timestamp: Date.now() }] }),
+				{
+					apiKey: "test-key",
+					serviceTier: "fast",
+					onPayload: (payload) => {
+						capturedPayload = payload;
+					},
+				},
+			).result();
+
+			expect(capturedPayload).toMatchObject({ service_tier: "ultrafast" });
+			expect(result.speed).toBe("fast");
+			expect(result.usage.cost.input).toBeCloseTo(model.cost.input * 6);
+			expect(result.usage.cost.output).toBeCloseTo(model.cost.output * 6);
+		});
+
+		it("reports standard speed and price when Bedrock serves the default tier", async () => {
+			vi.spyOn(globalThis, "fetch").mockResolvedValue(
+				new Response(completedSse("default", 1_000_000), {
+					status: 200,
+					headers: { "content-type": "text/event-stream" },
+				}),
+			);
+			const model = bedrockAstra();
+			const result = await streamOpenAIResponses(
+				model,
+				normalizeContext({ messages: [{ role: "user", content: "hi", timestamp: Date.now() }] }),
+				{ apiKey: "test-key", serviceTier: "fast" },
+			).result();
+
+			expect(result.speed).toBe("standard");
+			expect(result.usage.cost.input).toBeCloseTo(model.cost.input);
+		});
+
+		it("sorts tool schema keys recursively so the cached prefix is stable", async () => {
+			let capturedPayload: { tools?: Array<{ parameters?: unknown }> } | undefined;
+			vi.spyOn(globalThis, "fetch").mockResolvedValue(
+				new Response("data: [DONE]\n\n", { status: 200, headers: { "content-type": "text/event-stream" } }),
+			);
+			const stream = streamOpenAIResponses(
+				bedrockAstra(),
+				normalizeContext({
+					messages: [{ role: "user", content: "hi", timestamp: Date.now() }],
+					tools: [
+						{
+							name: "edit",
+							description: "Edit a file",
+							parameters: Type.Object({
+								path: Type.String({ description: "Path" }),
+								edits: Type.Array(Type.Object({ oldText: Type.String(), newText: Type.String() })),
+							}),
+						},
+					],
+				}),
+				{
+					apiKey: "test-key",
+					onPayload: (payload) => {
+						capturedPayload = payload as typeof capturedPayload;
+					},
+				},
+			);
+			for await (const event of stream) {
+				if (event.type === "done" || event.type === "error") break;
+			}
+
+			const parameters = capturedPayload?.tools?.[0]?.parameters as Record<string, any>;
+			expect(Object.keys(parameters)).toEqual([...Object.keys(parameters)].sort());
+			expect(Object.keys(parameters.properties)).toEqual(["edits", "path"]);
+			expect(Object.keys(parameters.properties.edits.items.properties)).toEqual(["newText", "oldText"]);
+			expect(parameters.required).toEqual(["path", "edits"]);
+		});
+
+		it("leaves tool schema key order alone for OpenAI itself", async () => {
+			let capturedPayload:
+				| { input?: Array<{ type?: string; tools?: Array<{ name?: string; parameters?: unknown }> }> }
+				| undefined;
+			vi.spyOn(globalThis, "fetch").mockResolvedValue(
+				new Response("data: [DONE]\n\n", { status: 200, headers: { "content-type": "text/event-stream" } }),
+			);
+			const stream = streamOpenAIResponses(
+				getModel("openai", "gpt-5.4"),
+				normalizeContext({
+					messages: [{ role: "user", content: "hi", timestamp: Date.now() }],
+					tools: [
+						{
+							name: "edit",
+							description: "Edit a file",
+							parameters: Type.Object({ path: Type.String(), edits: Type.String() }),
+						},
+					],
+				}),
+				{
+					apiKey: "test-key",
+					onPayload: (payload) => {
+						capturedPayload = payload as typeof capturedPayload;
+					},
+				},
+			);
+			for await (const event of stream) {
+				if (event.type === "done" || event.type === "error") break;
+			}
+			// gpt-5.4 declares its tools in additional_tools input items, not top-level `tools`.
+			const declared = capturedPayload?.input?.find((item) => item.type === "additional_tools")?.tools?.[0];
+			expect(declared?.name).toBe("edit");
+			const parameters = declared?.parameters as Record<string, any>;
+			expect(Object.keys(parameters.properties)).toEqual(["path", "edits"]);
+		});
+
+		it("sends an explicit ultrafast tier verbatim and bills it like Astra's fast tier", async () => {
+			let capturedPayload: unknown;
+			vi.spyOn(globalThis, "fetch").mockResolvedValue(
+				new Response(completedSse("ultrafast", 1_000_000), {
+					status: 200,
+					headers: { "content-type": "text/event-stream" },
+				}),
+			);
+			const model = bedrockAstra();
+			const result = await streamOpenAIResponses(
+				model,
+				normalizeContext({ messages: [{ role: "user", content: "hi", timestamp: Date.now() }] }),
+				{
+					apiKey: "test-key",
+					serviceTier: "ultrafast",
+					onPayload: (payload) => {
+						capturedPayload = payload;
+					},
+				},
+			).result();
+
+			expect(capturedPayload).toMatchObject({ service_tier: "ultrafast" });
+			expect(result.speed).toBe("fast");
+			expect(result.usage.cost.input).toBeCloseTo(model.cost.input * 6);
+			expect(result.usage.cost.output).toBeCloseTo(model.cost.output * 6);
+		});
+
+		it("maps fast to ultrafast and bills GPT-6.1 Sol at 6x like Astra", async () => {
+			let capturedPayload: unknown;
+			vi.spyOn(globalThis, "fetch").mockResolvedValue(
+				new Response(completedSse("ultrafast", 1_000_000), {
+					status: 200,
+					headers: { "content-type": "text/event-stream" },
+				}),
+			);
+			const model: Model<"openai-responses"> = {
+				...bedrockAstra(),
+				id: "openai.gpt-6.1-sol",
+				name: "GPT-6.1 Sol (Bedrock)",
+				cost: { input: 2.2, output: 11, cacheRead: 0.11, cacheWrite: 0 },
+			};
+			const result = await streamOpenAIResponses(
+				model,
+				normalizeContext({ messages: [{ role: "user", content: "hi", timestamp: Date.now() }] }),
+				{
+					apiKey: "test-key",
+					serviceTier: "fast",
+					onPayload: (payload) => {
+						capturedPayload = payload;
+					},
+				},
+			).result();
+
+			expect(capturedPayload).toMatchObject({ service_tier: "ultrafast" });
+			expect(result.speed).toBe("fast");
+			expect(result.usage.cost.input).toBeCloseTo(model.cost.input * 6);
+			expect(result.usage.cost.output).toBeCloseTo(model.cost.output * 6);
+		});
+	});
+
+	describe("Amazon Bedrock GPT-6 Sol (no fast tier)", () => {
+		const bedrockSol = (): Model<"openai-responses"> => ({
+			id: "openai.gpt-6-sol",
+			name: "GPT-6 Sol (Bedrock)",
+			api: "openai-responses",
+			provider: "bedrock-mantle",
+			baseUrl: "https://bedrock-mantle.us-east-1.api.aws/openai/v1",
+			reasoning: true,
+			input: ["text", "image"],
+			cost: { input: 5, output: 30, cacheRead: 0.5, cacheWrite: 0 },
+			contextWindow: 1_000_000,
+			maxTokens: 128_000,
+		});
+
+		async function run(serviceTier: "fast" | "ultrafast" | "flex" | undefined) {
+			let capturedPayload: { service_tier?: string } | undefined;
+			const fetchSpy = vi
+				.spyOn(globalThis, "fetch")
+				.mockResolvedValue(
+					new Response("data: [DONE]\n\n", { status: 200, headers: { "content-type": "text/event-stream" } }),
+				);
+			const result = await streamOpenAIResponses(
+				bedrockSol(),
+				normalizeContext({ messages: [{ role: "user", content: "hi", timestamp: Date.now() }] }),
+				{
+					apiKey: "test-key",
+					serviceTier,
+					onPayload: (payload) => {
+						capturedPayload = payload as typeof capturedPayload;
+					},
+				},
+			).result();
+			return { result, capturedPayload, fetchSpy };
+		}
+
+		it("refuses fast locally with an actionable error instead of sending service_tier fast", async () => {
+			const { result, capturedPayload, fetchSpy } = await run("fast");
+			expect(fetchSpy).not.toHaveBeenCalled();
+			expect(capturedPayload).toBeUndefined();
+			expect(result.stopReason).toBe("error");
+			expect(result.errorMessage).toContain("Fast mode is not supported for Amazon Bedrock model openai.gpt-6-sol");
+			expect(result.errorMessage).toContain("--service-tier default");
+		});
+
+		it("passes an explicit ultrafast through to the provider unchanged", async () => {
+			const { capturedPayload, fetchSpy } = await run("ultrafast");
+			expect(fetchSpy).toHaveBeenCalled();
+			expect(capturedPayload?.service_tier).toBe("ultrafast");
+		});
+
+		it("keeps flex and an omitted tier as they were", async () => {
+			expect((await run("flex")).capturedPayload?.service_tier).toBe("flex");
+			const omitted = await run(undefined);
+			expect(omitted.capturedPayload).toBeDefined();
+			expect(omitted.capturedPayload && "service_tier" in omitted.capturedPayload).toBe(false);
+		});
+
+		it("does not bill an unconfigured model's ultrafast response at an invented multiplier", async () => {
+			vi.spyOn(globalThis, "fetch").mockResolvedValue(
+				new Response(
+					`data: ${JSON.stringify({
+						type: "response.completed",
+						response: {
+							status: "completed",
+							service_tier: "ultrafast",
+							usage: {
+								input_tokens: 1_000_000,
+								output_tokens: 1_000_000,
+								total_tokens: 2_000_000,
+								input_tokens_details: { cached_tokens: 0 },
+							},
+						},
+					})}\n\n`,
+					{ status: 200, headers: { "content-type": "text/event-stream" } },
+				),
+			);
+			const model = bedrockSol();
+			const result = await streamOpenAIResponses(
+				model,
+				normalizeContext({ messages: [{ role: "user", content: "hi", timestamp: Date.now() }] }),
+				{ apiKey: "test-key", serviceTier: "ultrafast" },
+			).result();
+			expect(result.speed).toBe("fast");
+			expect(result.usage.cost.input).toBeCloseTo(model.cost.input);
+			expect(result.usage.cost.output).toBeCloseTo(model.cost.output);
+		});
+	});
+
+	it("still sends fast as-is to OpenAI itself", async () => {
+		let capturedPayload: { service_tier?: string } | undefined;
+		vi.spyOn(globalThis, "fetch").mockResolvedValue(
+			new Response("data: [DONE]\n\n", { status: 200, headers: { "content-type": "text/event-stream" } }),
+		);
+		await streamOpenAIResponses(
+			getModel("openai", "gpt-5.4"),
+			normalizeContext({ messages: [{ role: "user", content: "hi", timestamp: Date.now() }] }),
+			{
+				apiKey: "test-key",
+				serviceTier: "fast",
+				onPayload: (payload) => {
+					capturedPayload = payload as typeof capturedPayload;
+				},
+			},
+		).result();
+		expect(capturedPayload?.service_tier).toBe("fast");
+	});
 });
 
 describe("openai-responses max_output_tokens compat", () => {

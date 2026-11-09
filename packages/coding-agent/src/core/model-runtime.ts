@@ -56,6 +56,7 @@ import {
 	type ProviderRequestOptions,
 	type SimpleStreamOptions,
 	type StreamOptions,
+	withStreamIdleGuard,
 } from "@earendil-works/pi-ai";
 import * as builtinProviderCatalog from "@earendil-works/pi-ai/providers/all";
 import { personalizeOpenRouterCatalog } from "@earendil-works/pi-ai/providers/openrouter";
@@ -70,6 +71,7 @@ import {
 import { getAgentDir } from "../config.ts";
 import { operationSignal, raceWithAbortSignal } from "../utils/abort.ts";
 import { AuthStorage as DefaultAuthStorage } from "./auth-storage.ts";
+import { getModelCatalogBaseUrl } from "./exowatt-hardening.ts";
 import { ModelConfig } from "./model-config.ts";
 import { FileModelsStore, InMemoryCodingAgentModelsStore } from "./models-store.ts";
 import {
@@ -114,6 +116,14 @@ export interface CreateModelRuntimeOptions {
 	modelsPath?: string | null;
 	modelsStore?: ModelsStore;
 	modelsStorePath?: string;
+	/**
+	 * Extra models.json sources to layer *beneath* `modelsPath`, lowest precedence
+	 * first. Resolved lazily on every load/refresh so that enabling, disabling, or
+	 * removing a source between reloads is reflected without recreating the
+	 * runtime. phi passes enabled hub model bundles here; the user's own
+	 * `modelsPath` always wins over every layer.
+	 */
+	modelLayerPathsResolver?: () => readonly string[] | Promise<readonly string[]>;
 	/** Allow create() to refresh model catalogs over the network. Defaults to false. */
 	allowModelNetwork?: boolean;
 	/** Timeout for the create-time network model refresh. */
@@ -182,6 +192,7 @@ export class ModelRuntime implements Models {
 	private readonly virtualModels = new Map<string, Map<string, RegisteredVirtualModel>>();
 	private readonly compositionErrors = new Map<string, string>();
 	private readonly modelsPath: string | undefined;
+	private readonly modelLayerPathsResolver: (() => readonly string[] | Promise<readonly string[]>) | undefined;
 	private readonly modelNetworkEnabled: boolean;
 	private config: ModelConfig;
 	private snapshot: ModelRuntimeSnapshot = {
@@ -204,10 +215,12 @@ export class ModelRuntime implements Models {
 		modelsStore: ModelsStore,
 		providers: readonly Provider[],
 		modelNetworkEnabled: boolean,
+		modelLayerPathsResolver?: () => readonly string[] | Promise<readonly string[]>,
 	) {
 		this.credentials = credentials;
 		this.config = config;
 		this.modelsPath = modelsPath;
+		this.modelLayerPathsResolver = modelLayerPathsResolver;
 		this.modelNetworkEnabled = modelNetworkEnabled;
 		this.defaultBuiltins = new Map(providers.map((provider) => [provider.id, provider]));
 		for (const [providerId, provider] of this.defaultBuiltins) this.builtins.set(providerId, provider);
@@ -219,25 +232,27 @@ export class ModelRuntime implements Models {
 		const credentials = new RuntimeCredentials(options.credentials ?? DefaultAuthStorage.create(options.authPath));
 		const modelsPath =
 			options.modelsPath === null ? undefined : (options.modelsPath ?? join(getAgentDir(), "models.json"));
-		const config = await ModelConfig.load(modelsPath);
+		const config = await ModelRuntime.resolveConfig(modelsPath, options.modelLayerPathsResolver);
 		const modelsStore =
 			options.modelsStore ??
 			(modelsPath
 				? new FileModelsStore(options.modelsStorePath ?? join(dirname(modelsPath), "models-store.json"))
 				: new InMemoryCodingAgentModelsStore());
 		const builtinModelDataGeneratedAt = builtinProviderCatalog.getBuiltinModelDataGeneratedAt();
+		// The remote catalog overlay is attached only when a URL is explicitly configured.
+		const catalogBaseUrl = options.catalogBaseUrl ?? getModelCatalogBaseUrl();
 		const providers = builtinProviderCatalog.builtinProviders().map((provider) => {
-			if (provider.id === "radius") return provider;
+			if (provider.id === "radius" || !catalogBaseUrl) return provider;
 			// OpenRouter narrows the catalog to the models, limits and prices of the user's key.
 			if (provider.id === "openrouter") {
 				return withPersonalizedCatalog(
 					provider,
 					personalizeOpenRouterCatalog,
-					options.catalogBaseUrl,
+					catalogBaseUrl,
 					builtinModelDataGeneratedAt,
 				);
 			}
-			return withRemoteCatalog(provider, options.catalogBaseUrl, builtinModelDataGeneratedAt);
+			return withRemoteCatalog(provider, catalogBaseUrl, builtinModelDataGeneratedAt);
 		});
 		const runtime = new ModelRuntime(
 			credentials,
@@ -246,6 +261,7 @@ export class ModelRuntime implements Models {
 			modelsStore,
 			providers,
 			process.env.PI_OFFLINE === undefined,
+			options.modelLayerPathsResolver,
 		);
 		runtime.configureRadiusProviders();
 		runtime.rebuildProviders();
@@ -266,6 +282,28 @@ export class ModelRuntime implements Models {
 			if (timeout) clearTimeout(timeout);
 		}
 		return runtime;
+	}
+
+	/**
+	 * Load the effective models config: the enabled lower-precedence layers first
+	 * (via the resolver), then the user's own models.json last so it always wins.
+	 * Resolved fresh on every call so a disabled/removed layer stops contributing
+	 * on the next reload without recreating the runtime.
+	 */
+	private static async resolveConfig(
+		modelsPath: string | undefined,
+		resolver: (() => readonly string[] | Promise<readonly string[]>) | undefined,
+	): Promise<ModelConfig> {
+		if (!resolver) return ModelConfig.load(modelsPath);
+		let layers: readonly string[] = [];
+		try {
+			layers = await resolver();
+		} catch {
+			// A broken layer resolver must never take down model loading; fall back to
+			// the user's own models.json alone.
+			layers = [];
+		}
+		return ModelConfig.loadLayered([...layers, modelsPath]);
 	}
 
 	private configureRadiusProviders(): void {
@@ -716,7 +754,13 @@ export class ModelRuntime implements Models {
 				model,
 				options as (StreamOptions & ModelsRequestTransforms) | undefined,
 			);
-			return prepared.provider.stream(prepared.model, transcript, prepared.options as ApiStreamOptions<TApi>);
+			return withStreamIdleGuard(prepared.model as Model<TApi>, prepared.options, (guardedOptions) =>
+				prepared.provider.stream(
+					prepared.model as Model<TApi>,
+					transcript,
+					guardedOptions as ApiStreamOptions<TApi>,
+				),
+			);
 		});
 	}
 
@@ -752,7 +796,9 @@ export class ModelRuntime implements Models {
 		return lazyStream(model, async () => {
 			assertChatModel(model);
 			const prepared = await this.prepareRequest(model, options);
-			return prepared.provider.streamSimple(prepared.model, transcript, prepared.options as SimpleStreamOptions);
+			return withStreamIdleGuard(prepared.model, prepared.options, (guardedOptions) =>
+				prepared.provider.streamSimple(prepared.model, transcript, guardedOptions as SimpleStreamOptions),
+			);
 		});
 	}
 
@@ -854,7 +900,7 @@ export class ModelRuntime implements Models {
 	}
 
 	async refresh(options: ModelsRefreshOptions = {}): Promise<ModelsRefreshResult> {
-		this.config = await ModelConfig.load(this.modelsPath);
+		this.config = await ModelRuntime.resolveConfig(this.modelsPath, this.modelLayerPathsResolver);
 		this.configureRadiusProviders();
 		if (options.providers) {
 			for (const providerId of new Set(options.providers)) this.recomposeProvider(providerId);

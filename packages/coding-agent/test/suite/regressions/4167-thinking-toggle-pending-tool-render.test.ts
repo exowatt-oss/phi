@@ -42,8 +42,11 @@ type RenderSessionContextThis = {
 	settingsManager: {
 		getShowImages(): boolean;
 		getImageWidthCells(): number;
+		getToolOutputLines(): number;
+		getToolDisplay(): "minimal" | "compact" | "full";
 		getShowCacheMissNotices(): boolean;
 	};
+	getCollapsedDisplay(): "minimal" | "compact";
 	sessionManager: { getCwd(): string; getEntries(): SessionEntry[] };
 	session: { retryAttempt: number; modelRegistry: { find(provider: string, modelId: string): undefined } };
 	toolOutputExpanded: boolean;
@@ -74,8 +77,13 @@ function createFakeInteractiveModeThis(): RenderSessionContextThis {
 		settingsManager: {
 			getShowImages: () => false,
 			getImageWidthCells: () => 60,
+			getToolOutputLines: () => 5,
+			getToolDisplay: () => "compact",
 			getShowCacheMissNotices: () => false,
 		},
+		getCollapsedDisplay: (
+			InteractiveMode.prototype as unknown as { getCollapsedDisplay: () => "minimal" | "compact" }
+		).getCollapsedDisplay,
 		sessionManager: { getCwd: () => process.cwd(), getEntries: () => [] },
 		session: { retryAttempt: 0, modelRegistry: { find: () => undefined } },
 		toolOutputExpanded: false,

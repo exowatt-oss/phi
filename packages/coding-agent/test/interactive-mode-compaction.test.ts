@@ -1,3 +1,4 @@
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { Usage } from "@earendil-works/pi-ai";
 import { Container } from "@earendil-works/pi-tui";
 import { describe, expect, test, vi } from "vitest";
@@ -106,7 +107,9 @@ describe("InteractiveMode compaction events", () => {
 		);
 	});
 
-	test("renders retained entries and appends the latest summary cost at the bottom", async () => {
+	// phi keeps the transcript scrollback on compaction (see docs/compaction.md "Display Behavior");
+	// upstream's "renders retained entries" rebuild test is folded in here as the cost-notice check.
+	test("keeps the transcript intact and appends the compaction summary card and its cost", async () => {
 		const usage: Usage = {
 			input: 10,
 			output: 20,
@@ -114,26 +117,6 @@ describe("InteractiveMode compaction events", () => {
 			cacheWrite: 40,
 			totalTokens: 100,
 			cost: { input: 0.01, output: 0.02, cacheRead: 0.03, cacheWrite: 0.065, total: 0.125 },
-		};
-		const latestCompaction: SessionEntry = {
-			type: "compaction",
-			id: "latest",
-			parentId: "previous",
-			timestamp: "2025-01-02T00:00:00Z",
-			summary: "summary",
-			firstKeptEntryId: "kept",
-			tokensBefore: 123,
-			usage,
-		};
-		const previousCompaction: SessionEntry = {
-			type: "compaction",
-			id: "previous",
-			parentId: null,
-			timestamp: "2025-01-01T00:00:00Z",
-			summary: "previous summary",
-			firstKeptEntryId: "kept",
-			tokensBefore: 100,
-			usage,
 		};
 		const fakeThis = {
 			isInitialized: true,
@@ -144,7 +127,7 @@ describe("InteractiveMode compaction events", () => {
 			defaultEditor: {},
 			statusContainer: { clear: vi.fn() },
 			chatContainer: { clear: vi.fn() },
-			sessionManager: { buildContextEntries: vi.fn().mockReturnValue([latestCompaction, previousCompaction]) },
+			rebuildChatFromMessages: vi.fn(),
 			renderSessionEntries: vi.fn(),
 			addMessageToChat: vi.fn(),
 			addCompactionCostNotice: vi.fn(),
@@ -164,6 +147,8 @@ describe("InteractiveMode compaction events", () => {
 				result: { tokensBefore: number; summary: string; usage?: Usage } | undefined;
 				aborted: boolean;
 				willRetry: boolean;
+				contextWindowStarted?: boolean;
+				pendingMessages?: AgentMessage[];
 				errorMessage?: string;
 			},
 		) => Promise<void>;
@@ -180,8 +165,11 @@ describe("InteractiveMode compaction events", () => {
 			willRetry: false,
 		});
 
-		expect(fakeThis.chatContainer.clear).toHaveBeenCalledTimes(1);
-		expect(fakeThis.renderSessionEntries).toHaveBeenCalledWith([previousCompaction]);
+		// Compaction rewrites model context, never the visible history: the
+		// scrollback must survive and only the summary card gets appended.
+		expect(fakeThis.chatContainer.clear).not.toHaveBeenCalled();
+		expect(fakeThis.rebuildChatFromMessages).not.toHaveBeenCalled();
+		expect(fakeThis.renderSessionEntries).not.toHaveBeenCalled();
 		expect(fakeThis.addMessageToChat).toHaveBeenCalledTimes(1);
 		expect(fakeThis.addMessageToChat).toHaveBeenCalledWith(
 			expect.objectContaining({
@@ -190,12 +178,88 @@ describe("InteractiveMode compaction events", () => {
 				summary: "summary",
 			}),
 		);
+		expect(fakeThis.showStatus).toHaveBeenCalledTimes(1);
 		expect(fakeThis.addCompactionCostNotice).toHaveBeenCalledWith({
 			type: "compaction_cost",
 			kind: "compaction",
 			usage,
 		});
 		expect(fakeThis.flushCompactionQueue).toHaveBeenCalledWith({ willRetry: false });
+
+		const pending: AgentMessage = { role: "user", content: "newly submitted request", timestamp: 1 };
+		vi.clearAllMocks();
+		await handleEvent.call(fakeThis, {
+			type: "compaction_end",
+			reason: "threshold",
+			result: { tokensBefore: 123, summary: "summary" },
+			aborted: false,
+			willRetry: false,
+			pendingMessages: [pending],
+		});
+		expect(fakeThis.addMessageToChat.mock.calls.map(([message]) => message)).toEqual([
+			expect.objectContaining({ role: "compactionSummary" }),
+			pending,
+		]);
+
+		vi.clearAllMocks();
+		await handleEvent.call(fakeThis, {
+			type: "compaction_end",
+			reason: "threshold",
+			result: undefined,
+			aborted: true,
+			willRetry: false,
+			contextWindowStarted: true,
+			pendingMessages: [pending],
+		});
+		// The context-window marker is already delivered through normal message events;
+		// compaction_end only appends provider-bound input that has not rendered yet.
+		expect(fakeThis.chatContainer.clear).not.toHaveBeenCalled();
+		expect(fakeThis.addMessageToChat).toHaveBeenCalledExactlyOnceWith(pending);
+	});
+
+	test("renders a prune as a quiet status line, never a compaction card", async () => {
+		const fakeThis = {
+			isInitialized: true,
+			footer: { invalidate: vi.fn() },
+			programStatus: { handleEvent: vi.fn() },
+			autoCompactionEscapeHandler: undefined as (() => void) | undefined,
+			autoCompactionLoader: undefined,
+			defaultEditor: {},
+			statusContainer: { clear: vi.fn() },
+			chatContainer: { clear: vi.fn() },
+			rebuildChatFromMessages: vi.fn(),
+			addMessageToChat: vi.fn(),
+			showError: vi.fn(),
+			showStatus: vi.fn(),
+			clearStatusIndicator: vi.fn(),
+			flushCompactionQueue: vi.fn().mockResolvedValue(undefined),
+			settingsManager: { getShowTerminalProgress: () => false },
+			ui: { requestRender: vi.fn(), terminal: { setProgress: vi.fn() } },
+		};
+
+		const handleEvent = Reflect.get(InteractiveMode.prototype, "handleEvent") as (
+			this: typeof fakeThis,
+			event: unknown,
+		) => Promise<void>;
+
+		await handleEvent.call(fakeThis, {
+			type: "compaction_end",
+			reason: "threshold",
+			result: {
+				tokensBefore: 180_000,
+				estimatedTokensAfter: 95_000,
+				summary: "Elided older tool outputs",
+				firstKeptEntryId: "x",
+			},
+			aborted: false,
+			willRetry: false,
+			prune: true,
+		});
+
+		expect(fakeThis.addMessageToChat).not.toHaveBeenCalled();
+		expect(fakeThis.chatContainer.clear).not.toHaveBeenCalled();
+		expect(fakeThis.showStatus).toHaveBeenCalledTimes(1);
+		expect(String(fakeThis.showStatus.mock.calls[0][0])).toContain("Pruned old tool output");
 	});
 
 	test("updates the working state when the same agent run resumes after compaction", async () => {

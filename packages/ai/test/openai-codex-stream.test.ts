@@ -13,6 +13,7 @@ import {
 } from "../src/api/openai-codex-responses.ts";
 import type { Api, Context, Model } from "../src/types.ts";
 import { formatUserAgent } from "../src/utils/identity.ts";
+import { isStreamIdleTimeoutError, withStreamIdleGuard } from "../src/utils/stream-idle-guard.ts";
 import { normalizeContext } from "../src/utils/transcript.ts";
 
 const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
@@ -2742,5 +2743,65 @@ describe("openai-codex streaming", () => {
 		const result = await resultPromise;
 		expect(result.content.find((content) => content.type === "text")?.text).toBe("Hello");
 		expect(codexRequests).toBe(4);
+	});
+
+	it("resets the shared idle guard on raw WebSocket ping frames and closes after the final stall", async () => {
+		vi.useFakeTimers();
+		const token = mockToken();
+		const close = vi.fn();
+
+		class MockWebSocket extends EventTarget {
+			static OPEN = 1;
+			readyState = MockWebSocket.OPEN;
+
+			constructor() {
+				super();
+				queueMicrotask(() => this.dispatchEvent(new Event("open")));
+			}
+
+			send(): void {
+				for (const delay of [40, 80, 120]) {
+					setTimeout(() => {
+						this.dispatchEvent(Object.assign(new Event("message"), { data: JSON.stringify({ type: "ping" }) }));
+					}, delay);
+				}
+			}
+
+			close(code?: number, reason?: string): void {
+				close(code, reason);
+			}
+		}
+
+		vi.stubGlobal("WebSocket", MockWebSocket);
+		const model: Model<"openai-codex-responses"> = {
+			id: "gpt-5.1-codex",
+			name: "GPT-5.1 Codex",
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			baseUrl: "https://chatgpt.com/backend-api",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 400000,
+			maxTokens: 128000,
+		};
+		const context: Context = {
+			systemPrompt: "You are a helpful assistant.",
+			messages: [{ role: "user", content: "Say hello", timestamp: 1 }],
+		};
+
+		const resultPromise = withStreamIdleGuard(
+			model,
+			{ apiKey: token, transport: "websocket", idleTimeoutMs: 50 },
+			(options) => streamOpenAICodexResponses(model, normalizeContext(context), options),
+		).result();
+		await vi.advanceTimersByTimeAsync(169);
+		expect(close).not.toHaveBeenCalled();
+		await vi.advanceTimersByTimeAsync(1);
+
+		const result = await resultPromise;
+		expect(result.stopReason).toBe("error");
+		expect(isStreamIdleTimeoutError(result.errorMessage)).toBe(true);
+		expect(close).toHaveBeenCalled();
 	});
 });

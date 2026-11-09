@@ -1,5 +1,5 @@
 import type { AgentTool } from "@earendil-works/pi-agent-core";
-import { mkdir as fsMkdir, writeFile as fsWriteFile } from "fs/promises";
+import { appendFile as fsAppendFile, mkdir as fsMkdir, writeFile as fsWriteFile } from "fs/promises";
 import { dirname } from "path";
 import { type Static, Type } from "typebox";
 import type { ExtensionContext, ToolDefinition } from "../extensions/types.ts";
@@ -11,11 +11,21 @@ import { wrapToolDefinition } from "./tool-definition-wrapper.ts";
 const writeSchema = Type.Object({
 	path: Type.String({ description: "Path to the file to write (relative or absolute)" }),
 	content: Type.String({ description: "Content to write to the file" }),
+	mode: Type.Optional(
+		Type.Union([Type.Literal("overwrite"), Type.Literal("append")], {
+			description:
+				'Write mode: "overwrite" replaces the file; "append" adds content to the end (default: "overwrite")',
+			default: "overwrite",
+		}),
+	),
 });
 
 export const writeToolSystemPromptContribution = {
-	snippet: "Create or overwrite files",
-	guidelines: ["Use write only for new files or complete rewrites."],
+	snippet: "Create, overwrite, or append to files",
+	guidelines: [
+		'Use write for new files or complete rewrites; use mode "append" to continue a file in chunks.',
+		'For large files, do not emit one giant write: the response can hit the output token limit and the call will be rejected. Write the first chunk with mode "overwrite" (default), then continue with mode "append" in subsequent calls.',
+	],
 } as const;
 
 export type WriteToolInput = Static<typeof writeSchema>;
@@ -27,12 +37,15 @@ export type WriteToolInput = Static<typeof writeSchema>;
 export interface WriteOperations {
 	/** Write content to a file */
 	writeFile: (absolutePath: string, content: string) => Promise<void>;
+	/** Append content to a file. Required when using append mode with custom operations. */
+	appendFile?: (absolutePath: string, content: string) => Promise<void>;
 	/** Create directory recursively */
 	mkdir: (dir: string) => Promise<void>;
 }
 
-const defaultWriteOperations: WriteOperations = {
+const defaultWriteOperations: Required<WriteOperations> = {
 	writeFile: (path, content) => fsWriteFile(path, content, "utf-8"),
+	appendFile: (path, content) => fsAppendFile(path, content, "utf-8"),
 	mkdir: (dir) => fsMkdir(dir, { recursive: true }).then(() => {}),
 };
 
@@ -50,14 +63,14 @@ export function createWriteToolDefinition(
 		name: "write",
 		label: "write",
 		description:
-			"Write content to a file. Creates the file if it doesn't exist, overwrites if it does. Automatically creates parent directories.",
+			'Write content to a file. By default, creates or overwrites the file; set mode to "append" to add content to the end. Automatically creates parent directories. For large files, do not emit one giant write: the response can hit the output token limit and the call will be rejected. Write the first chunk with mode "overwrite" (default), then continue with mode "append" in subsequent calls.',
 		promptSnippet: writeToolSystemPromptContribution.snippet,
 		promptGuidelines: [...writeToolSystemPromptContribution.guidelines],
 		parameters: writeSchema,
 		constrainedSampling: { type: "json_schema", strict: "prefer" },
 		async execute(
 			_toolCallId,
-			{ path, content }: { path: string; content: string },
+			{ path, content, mode = "overwrite" }: WriteToolInput,
 			signal?: AbortSignal,
 			_onUpdate?,
 			ctx?: ExtensionContext,
@@ -78,8 +91,15 @@ export function createWriteToolDefinition(
 				await ops.mkdir(dir);
 				throwIfAborted();
 
-				// Write the file contents.
-				await ops.writeFile(absolutePath, content);
+				// Write or append the file contents.
+				if (mode === "append") {
+					if (!ops.appendFile) {
+						throw new Error("Append mode is not supported by the configured write operations.");
+					}
+					await ops.appendFile(absolutePath, content);
+				} else {
+					await ops.writeFile(absolutePath, content);
+				}
 				throwIfAborted();
 
 				return {

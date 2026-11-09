@@ -1,594 +1,507 @@
-/**
- * `pi mcp`: add, remove, and check MCP servers and sign in to them outside a session. Agents run it
- * through bash to configure servers, verify an `mcp.json` they wrote, and start an OAuth sign-in;
- * the user only approves access in the browser. Running sessions pick up new credentials on their
- * next turn.
- */
+import { getAgentDir } from "../../config.ts";
+import { loadBridgeConfig, type ManifestAuthMode, type ServerEntry, type ServerManifestEntry } from "./config.ts";
+import { writeEnablement } from "./enablement.ts";
+import { McpManager, type McpProbeResult } from "./index.ts";
+import { errorMessage } from "./json.ts";
+import { auditLogPath, type RecordedEvent, readOAuthEvents } from "./oauth/audit.ts";
+import { isLoginInProgress } from "./oauth/lock.ts";
+import { CredentialStore, type OAuthTokens } from "./oauth/store.ts";
 
-import { existsSync } from "node:fs";
-import { join } from "node:path";
-import { createInterface } from "node:readline/promises";
-import chalk from "chalk";
-import { APP_NAME, CONFIG_DIR_NAME } from "../../config.ts";
-import { validateMcpServerConfig } from "../../core/mcp-servers.ts";
-import { ProjectTrustStore } from "../../core/trust-manager.ts";
-import { openBrowser } from "../../utils/open-browser.ts";
-import {
-	addMcpServerConfig,
-	getMcpToolExposure,
-	type LoadedMcpConfig,
-	loadMcpConfig,
-	type McpServerEntry,
-	removeMcpServerConfig,
-} from "./config.ts";
-import {
-	createDefaultTransport,
-	McpOAuthCredentialStore,
-	McpServerConnection,
-	McpServerLog,
-	McpSignInCancelledError,
-	signInMcpServer,
-} from "./runtime.ts";
+export type McpCredentialStatus = "valid" | "expired" | "absent" | "n/a";
 
-const HELP = `${chalk.bold("Usage:")}
-  ${APP_NAME} mcp add <server> [options] -- <command> [args...]
-  ${APP_NAME} mcp add <server> [options] --url <url>
-  ${APP_NAME} mcp remove <server> [-l]
-  ${APP_NAME} mcp list [--json]
-  ${APP_NAME} mcp login <server> [--timeout <seconds>]
-  ${APP_NAME} mcp logout <server>
-
-Configure and check MCP servers and sign in to OAuth servers without starting a session.
-Reads ~/${CONFIG_DIR_NAME}/agent/mcp.json and, in trusted projects, ${CONFIG_DIR_NAME}/mcp.json.
-
-Commands:
-  add <server>            Add or replace a server in mcp.json
-  remove <server>         Remove a server from mcp.json
-  list                    Show state, tools, and errors (exits 1 on failure)
-  login <server>          Sign in through the browser
-  logout <server>         Delete the stored OAuth credentials
-
-Options for add and remove:
-  -l, --local             Use ${CONFIG_DIR_NAME}/mcp.json in the current project instead of the global file
-
-Options for add:
-  --url <url>             Streamable HTTP server URL (instead of a command)
-  --env <KEY=VALUE>       Environment variable for a stdio server (repeatable)
-  --cwd <dir>             Working directory for a stdio server
-  --header <KEY=VALUE>    HTTP header (repeatable)
-  --bearer-token-env-var <NAME>
-                          Send "Authorization: Bearer \${NAME}"
-  --oauth-client-id <id>  Pre-registered OAuth client id
-  --oauth-client-secret <secret>
-                          OAuth client secret (may be \${NAME} or !command)
-  --oauth-callback-port <port>
-                          Fixed OAuth callback port
-  --oauth-client-name <name>
-                          Client name sent when registering with the OAuth server
-  --exposure <mode>       codemode (default), deferred, direct, or hidden
-  --description <text>    What the server offers, shown in the system prompt
-
-Other options:
-  --json                  Print the list as JSON
-  --timeout <seconds>     Time limit for the whole sign-in (default: 300)`;
-
-const HELP_HINT = chalk.dim(`Use "${APP_NAME} mcp --help" for usage.`);
-
-const DEFAULT_LOGIN_TIMEOUT_SECONDS = 300;
-
-export interface McpCommandOptions {
-	cwd: string;
-	agentDir: string;
-	/** Defaults to `mcp-auth.json` in the agent directory. */
-	credentials?: McpOAuthCredentialStore;
-	/** Defaults to the platform browser. */
-	openUrl?: (url: string) => void;
-	/** Defaults to console output. */
-	log?: (line: string) => void;
-	error?: (line: string) => void;
+export interface McpCliProbeStatus {
+	status: "ready" | "failed";
+	toolCount: number;
+	error: string | null;
 }
 
-interface ServerReport {
+export interface McpCliServerStatus {
 	name: string;
-	scope: string;
-	source: string;
-	/** Project `mcp.json` that overrides `enabled`, `exposure`, or `toolExposure` of this global server. */
-	override?: string;
+	transport: "http" | "stdio";
 	enabled: boolean;
-	exposure: string;
-	transport: string;
-	state: string;
-	tools: string[];
-	/** Tools whose exposure differs from the server's, from `toolExposure`. */
-	toolExposure?: Record<string, string>;
-	/** Whether the server offers resources. They are not listed: listing every one can take long. */
-	resources?: true;
-	error?: string;
+	authMode: ManifestAuthMode;
+	credential: McpCredentialStatus;
+	expiresAt?: string;
+	needsLogin: boolean;
+	loginInProgress: boolean;
+	/** Sanitized load-time failure (parse or `$VAR` interpolation); phi dropped the server. Null when the entry loaded. */
+	configError: string | null;
+	/** Every unset environment variable the entry references; empty when none. Names only. */
+	missingEnv: string[];
+	probe?: McpCliProbeStatus;
 }
 
-function errorMessage(error: unknown): string {
-	return error instanceof Error ? error.message : String(error);
+export interface McpStatusEnvelope {
+	schema: 1;
+	capabilities: { enablement: true };
+	servers: McpCliServerStatus[];
 }
 
-function describeTransport(entry: McpServerEntry): string {
-	const { config } = entry;
-	return "url" in config ? config.url : [config.command, ...(config.args ?? [])].join(" ");
+export interface McpLoginEnvelope {
+	schema: 1;
+	server: string;
+	status: "ready";
+	credential: Exclude<McpCredentialStatus, "n/a">;
 }
 
-function createConnection(entry: McpServerEntry, options: McpCommandOptions, credentials: McpOAuthCredentialStore) {
-	return new McpServerConnection({
-		entry,
-		cwd: options.cwd,
-		createTransport: createDefaultTransport,
-		credentials,
-		log: new McpServerLog(join(options.agentDir, "mcp.log")),
-		onTools: () => {},
-	});
+export interface McpLogoutEnvelope {
+	schema: 1;
+	server: string;
+	loggedOut: true;
 }
 
-/** Short spellings of options. `-l`/`--local` match `pi install`. */
-const OPTION_ALIASES = new Map([["-l", "--local"]]);
+export interface McpEnablementEnvelope {
+	schema: 1;
+	server: string;
+	enabled: boolean;
+}
+
+export interface McpEventsEnvelope {
+	schema: 1;
+	/** Null when logging is switched off, which is itself the answer to "why is it empty". */
+	logPath: string | null;
+	events: RecordedEvent[];
+}
+
+interface StatusOptions {
+	probe?: boolean;
+	timeoutMs?: number;
+	now?: () => number;
+}
 
 interface ParsedOptions {
-	positional: string[];
-	values: Map<string, string | true>;
-	/** Values of `list` options, in order. */
-	lists: Map<string, string[]>;
+	json: boolean;
+	probe: boolean;
+	timeoutMs?: number;
+	limit?: number;
+	sinceMs?: number;
+	positionals: string[];
 }
 
-/**
- * Parse `--name value` options; returns undefined and reports unknown ones. `--` ends the options,
- * as does reaching `maxPositionals` positional arguments: the remaining arguments are positional,
- * so a command's own options (`add <server> <command> --flag`) are passed through.
- */
-function parseOptions(
-	args: string[],
-	known: Record<string, "flag" | "value" | "list">,
-	error: (line: string) => void,
-	maxPositionals = Number.POSITIVE_INFINITY,
-): ParsedOptions | undefined {
-	const positional: string[] = [];
-	const values = new Map<string, string | true>();
-	const lists = new Map<string, string[]>();
-	for (let index = 0; index < args.length; index++) {
-		const arg = OPTION_ALIASES.get(args[index]) ?? args[index];
-		if (arg === "--" || positional.length >= maxPositionals) {
-			positional.push(...args.slice(arg === "--" ? index + 1 : index));
-			break;
+type McpCommand =
+	| { kind: "help"; json: false }
+	| { kind: "status"; json: boolean; probe: boolean; timeoutMs?: number }
+	| { kind: "login"; json: boolean; server: string; timeoutMs?: number }
+	| { kind: "logout"; json: boolean; server: string }
+	| { kind: "enablement"; json: boolean; server: string; enabled: boolean }
+	| { kind: "events"; json: boolean; server?: string; limit: number; sinceMs?: number };
+
+const MCP_CLI_USAGE = [
+	"Usage:",
+	"  phi mcp status [--json] [--probe] [--timeout-ms N]",
+	"  phi mcp login <server> [--json] [--timeout-ms N]",
+	"  phi mcp logout <server> [--json]",
+	"  phi mcp enable <server> [--json]",
+	"  phi mcp disable <server> [--json]",
+	"  phi mcp events [<server>] [--json] [--limit N] [--since 24h|2026-09-13T09:00:00Z]",
+].join("\n");
+
+const DEFAULT_EVENT_LIMIT = 50;
+
+/** Handle the one-shot `phi mcp` control surface before normal session startup. */
+export async function handleMcpCommand(args: string[]): Promise<boolean> {
+	if (args[0] !== "mcp") return false;
+	const jsonRequested = args.includes("--json");
+	try {
+		const command = parseMcpCommand(args.slice(1));
+		if (command.kind === "help") {
+			process.stdout.write(`${MCP_CLI_USAGE}\n`);
+			return true;
 		}
-		if (!arg.startsWith("--")) {
-			positional.push(arg);
-			continue;
+
+		const agentDir = getAgentDir();
+		if (command.kind === "status") {
+			const envelope = await collectMcpStatus(agentDir, command);
+			writeResult(envelope, command.json, formatHumanStatus(envelope));
+		} else if (command.kind === "login") {
+			const envelope = await loginMcpServer(agentDir, command.server, command.timeoutMs);
+			writeResult(
+				envelope,
+				command.json,
+				`MCP server ${envelope.server} is ready (credential: ${envelope.credential}).`,
+			);
+		} else if (command.kind === "events") {
+			const envelope = await collectMcpEvents(command);
+			writeResult(envelope, command.json, formatHumanEvents(envelope));
+		} else if (command.kind === "logout") {
+			const envelope = await logoutMcpServer(agentDir, command.server);
+			writeResult(envelope, command.json, `Logged out of MCP server ${envelope.server}.`);
+		} else {
+			const envelope = await setMcpServerEnabled(agentDir, command.server, command.enabled);
+			writeResult(
+				envelope,
+				command.json,
+				`MCP server ${envelope.server} is ${envelope.enabled ? "enabled" : "disabled"}.`,
+			);
 		}
-		const name = arg.slice(2);
-		const kind = known[name];
-		if (!kind) {
-			error(`Unknown option ${arg}.\n${HELP_HINT}`);
-			return undefined;
-		}
-		if (kind === "flag") {
-			values.set(name, true);
-			continue;
-		}
-		const value = args[++index];
-		if (value === undefined) {
-			error(`${arg} needs a value.`);
-			return undefined;
-		}
-		if (kind === "list") lists.set(name, [...(lists.get(name) ?? []), value]);
-		else values.set(name, value);
+		process.exitCode = 0;
+	} catch (error) {
+		const message = errorMessage(error);
+		process.exitCode = 1;
+		if (jsonRequested) process.stdout.write(`${JSON.stringify({ error: message })}\n`);
+		else process.stderr.write(`Error: ${message}\n`);
 	}
-	return { positional, values, lists };
+	return true;
 }
 
-/** Run `pi mcp <args>` and return the exit code. */
-export async function runMcpCommand(args: string[], options: McpCommandOptions): Promise<number> {
-	const log = options.log ?? ((line: string) => console.log(line));
-	const error = options.error ?? ((line: string) => console.error(line));
-	const [command, ...rest] = args;
-	if (command === undefined || command === "help" || args.includes("--help") || args.includes("-h")) {
-		log(HELP);
-		return 0;
+/** Fast status reads only config, credential files, and the login lock unless probe is requested. */
+export async function collectMcpStatus(agentDir: string, options: StatusOptions = {}): Promise<McpStatusEnvelope> {
+	const config = await loadBridgeConfig(agentDir);
+	let probes = new Map<string, McpProbeResult>();
+	if (options.probe && config.servers.length > 0) {
+		const manager = new McpManager(undefined, agentDir);
+		probes = new Map((await manager.probe(config.servers, options.timeoutMs)).map((result) => [result.name, result]));
 	}
 
-	const projectConfig = join(options.cwd, CONFIG_DIR_NAME, "mcp.json");
-	if (command === "add" || command === "remove") {
-		return command === "add"
-			? add(rest, projectConfig, options, log, error)
-			: remove(rest, projectConfig, options, log, error);
-	}
-	const projectTrusted = new ProjectTrustStore(options.agentDir).get(options.cwd) === true;
-	const loaded = loadMcpConfig({ agentDir: options.agentDir, cwd: options.cwd, projectTrusted });
-	const untrustedNote =
-		!projectTrusted && existsSync(projectConfig)
-			? `${projectConfig} is ignored because the project is not trusted. Start ${APP_NAME} in the project to trust it.`
-			: undefined;
-	const credentials = options.credentials ?? new McpOAuthCredentialStore();
-
-	switch (command) {
-		case "list": {
-			const parsed = parseOptions(rest, { json: "flag" }, error);
-			if (!parsed) return 1;
-			if (parsed.positional.length > 0) {
-				error(`Usage: ${APP_NAME} mcp list [--json]\n${HELP_HINT}`);
-				return 1;
-			}
-			return list(loaded, parsed.values.has("json"), untrustedNote, options, credentials, log);
-		}
-		case "login":
-		case "logout": {
-			const parsed = parseOptions(rest, command === "login" ? { timeout: "value" } : {}, error);
-			if (!parsed) return 1;
-			const [name, ...extra] = parsed.positional;
-			if (!name || extra.length > 0) {
-				error(`Usage: ${APP_NAME} mcp ${command} <server>\n${HELP_HINT}`);
-				return 1;
-			}
-			const entry = loaded.servers.find((server) => server.name === name);
-			if (!entry) {
-				error(
-					`No MCP server named "${name}".${untrustedNote ? ` ${untrustedNote}` : ""} Configured: ${loaded.servers.map((server) => server.name).join(", ") || "none"}.`,
-				);
-				return 1;
-			}
-			const connection = createConnection(entry, options, credentials);
-			const url = connection.oauthUrl;
-			if (!url) {
-				error(`MCP server "${name}" does not use OAuth. Only HTTP servers without an Authorization header do.`);
-				return 1;
-			}
-			if (command === "logout") {
-				const removed = credentials.remove(name, url);
-				log(removed ? `Signed out of MCP server "${name}".` : `No stored credentials for MCP server "${name}".`);
-				return 0;
-			}
-			const timeout = Number(parsed.values.get("timeout") ?? DEFAULT_LOGIN_TIMEOUT_SECONDS);
-			if (!Number.isFinite(timeout) || timeout <= 0) {
-				error("--timeout must be a positive number of seconds.");
-				return 1;
-			}
-			try {
-				return await login(entry, connection, url, timeout * 1000, options, credentials, log, error);
-			} finally {
-				await connection.close();
-			}
-		}
-		default:
-			error(`Unknown mcp command "${command}".\n${HELP_HINT}`);
-			return 1;
-	}
-}
-
-/** Parse `KEY=VALUE` pairs of a repeatable option into a record. */
-function parsePairs(option: string, pairs: string[] | undefined, error: (line: string) => void) {
-	if (!pairs) return {};
-	const record: Record<string, string> = {};
-	for (const pair of pairs) {
-		const separator = pair.indexOf("=");
-		if (separator <= 0) {
-			error(`--${option} expects KEY=VALUE, got "${pair}".`);
-			return undefined;
-		}
-		record[pair.slice(0, separator)] = pair.slice(separator + 1);
-	}
-	return record;
-}
-
-function add(
-	args: string[],
-	projectConfig: string,
-	options: McpCommandOptions,
-	log: (line: string) => void,
-	error: (line: string) => void,
-): number {
-	const usage = `Usage: ${APP_NAME} mcp add <server> [options] (--url <url> | -- <command> [args...])\n${HELP_HINT}`;
-	const parsed = parseOptions(
-		args,
-		{
-			local: "flag",
-			url: "value",
-			env: "list",
-			cwd: "value",
-			header: "list",
-			"bearer-token-env-var": "value",
-			"oauth-client-id": "value",
-			"oauth-client-secret": "value",
-			"oauth-callback-port": "value",
-			"oauth-client-name": "value",
-			exposure: "value",
-			description: "value",
-		},
-		error,
-		2,
-	);
-	if (!parsed) return 1;
-	const { positional, values, lists } = parsed;
-	const [name, ...command] = positional;
-	const url = values.get("url");
-	if (!name || (url === undefined) === (command.length === 0)) {
-		error(usage);
-		return 1;
-	}
-	const value = (option: string) => {
-		const found = values.get(option);
-		return typeof found === "string" ? found : undefined;
-	};
-	const exposure = value("exposure");
-	const httpOnly = [
-		"header",
-		"bearer-token-env-var",
-		"oauth-client-id",
-		"oauth-client-secret",
-		"oauth-callback-port",
-		"oauth-client-name",
-	];
-	const stdioOnly = ["env", "cwd"];
-	const misplaced = (url === undefined ? httpOnly : stdioOnly).find(
-		(option) => values.has(option) || lists.has(option),
-	);
-	if (misplaced) {
-		error(`--${misplaced} only applies to ${url === undefined ? "HTTP servers (--url)" : "stdio servers"}.`);
-		return 1;
-	}
-
-	let config: Record<string, unknown>;
-	if (typeof url === "string") {
-		const headers = parsePairs("header", lists.get("header"), error);
-		if (!headers) return 1;
-		const bearer = value("bearer-token-env-var");
-		if (bearer !== undefined) headers.Authorization = `Bearer \${${bearer}}`;
-		const port = value("oauth-callback-port");
-		const oauth = {
-			...(value("oauth-client-id") === undefined ? {} : { clientId: value("oauth-client-id") }),
-			...(value("oauth-client-secret") === undefined ? {} : { clientSecret: value("oauth-client-secret") }),
-			...(port === undefined ? {} : { callbackPort: Number(port) }),
-			...(value("oauth-client-name") === undefined ? {} : { clientName: value("oauth-client-name") }),
+	const servers: McpCliServerStatus[] = [];
+	for (const manifest of config.manifest) {
+		if (manifest.transport === "unknown") continue;
+		const credential = await credentialState(manifest, options.now ?? Date.now);
+		const status: McpCliServerStatus = {
+			name: manifest.name,
+			transport: manifest.transport,
+			enabled: manifest.enabled,
+			authMode: manifest.authMode,
+			credential: credential.status,
+			...(credential.expiresAt ? { expiresAt: credential.expiresAt } : {}),
+			needsLogin: manifest.enabled && credential.needsLogin,
+			loginInProgress: credential.loginInProgress,
+			configError: manifest.error ?? null,
+			missingEnv: manifest.missingEnv ?? [],
 		};
-		config = {
-			url,
-			...(Object.keys(headers).length > 0 ? { headers } : {}),
-			...(Object.keys(oauth).length > 0 ? { oauth } : {}),
-		};
-	} else {
-		const env = parsePairs("env", lists.get("env"), error);
-		if (!env) return 1;
-		const [executable, ...commandArgs] = command;
-		config = {
-			command: executable,
-			...(commandArgs.length > 0 ? { args: commandArgs } : {}),
-			...(Object.keys(env).length > 0 ? { env } : {}),
-			...(value("cwd") === undefined ? {} : { cwd: value("cwd") }),
-		};
+		if (options.probe) status.probe = probeStatus(manifest, probes.get(manifest.name));
+		servers.push(status);
 	}
-	if (exposure !== undefined) config.exposure = exposure;
-	const description = value("description");
-	if (description !== undefined) config.description = description;
-	const validated = validateMcpServerConfig(name, config);
-	if (typeof validated === "string") {
-		error(validated);
-		return 1;
-	}
-
-	const project = values.has("local");
-	const path = project ? projectConfig : join(options.agentDir, "mcp.json");
-	const scope = project ? "project" : "global";
-	let replaced: boolean;
-	try {
-		replaced = addMcpServerConfig(path, name, validated);
-	} catch (addError) {
-		error(`Could not update ${path}: ${errorMessage(addError)}`);
-		return 1;
-	}
-	log(`${replaced ? "Replaced" : "Added"} ${scope} MCP server "${name}" in ${path}.`);
-	if (project && new ProjectTrustStore(options.agentDir).get(options.cwd) !== true) {
-		log(`The project is not trusted, so ${path} is ignored until you start ${APP_NAME} in the project and trust it.`);
-	}
-	// HTTP servers without an Authorization header may use OAuth.
-	const mayNeedSignIn =
-		"url" in validated &&
-		!Object.keys(validated.headers ?? {}).some((header) => header.toLowerCase() === "authorization");
-	log(
-		`Check it with: ${APP_NAME} mcp list${mayNeedSignIn ? `. If it requires sign-in: ${APP_NAME} mcp login ${name}` : ""}`,
-	);
-	return 0;
+	return { schema: 1, capabilities: { enablement: true }, servers };
 }
 
-function remove(
-	args: string[],
-	projectConfig: string,
-	options: McpCommandOptions,
-	log: (line: string) => void,
-	error: (line: string) => void,
-): number {
-	const parsed = parseOptions(args, { local: "flag" }, error);
-	if (!parsed) return 1;
-	const [name, ...extra] = parsed.positional;
-	if (!name || extra.length > 0) {
-		error(`Usage: ${APP_NAME} mcp remove <server> [-l]\n${HELP_HINT}`);
-		return 1;
-	}
-	const project = parsed.values.has("local");
-	const globalConfig = join(options.agentDir, "mcp.json");
-	const path = project ? projectConfig : globalConfig;
-	const scope = project ? "project" : "global";
-	let removed: boolean;
-	try {
-		removed = removeMcpServerConfig(path, name);
-	} catch (removeError) {
-		error(`Could not update ${path}: ${errorMessage(removeError)}`);
-		return 1;
-	}
-	if (removed) {
-		log(`Removed ${scope} MCP server "${name}" from ${path}.`);
-		return 0;
-	}
-	const other = loadMcpConfig({ agentDir: options.agentDir, cwd: options.cwd, projectTrusted: true }).servers.find(
-		(server) => server.name === name && server.scope !== scope,
-	);
-	error(
-		`No ${scope} MCP server named "${name}" in ${path}.${other ? ` It is defined in ${other.source}${other.scope === "project" ? "; use --local" : "; omit --local"}.` : ""}`,
-	);
-	return 1;
-}
+export async function loginMcpServer(
+	agentDir: string,
+	serverName: string,
+	timeoutMs?: number,
+): Promise<McpLoginEnvelope> {
+	const config = await loadBridgeConfig(agentDir);
+	const manifest = findServer(config.manifest, serverName);
+	const entry = runnableOAuthEntry(manifest);
+	if (entry.config.type !== "http") throw new Error(`MCP server "${manifest.name}" does not use OAuth.`);
+	const httpConfig = entry.config;
+	if (httpConfig.auth.mode !== "oauth") throw new Error(`MCP server "${manifest.name}" does not use OAuth.`);
+	const auth = httpConfig.auth;
 
-async function list(
-	loaded: LoadedMcpConfig,
-	json: boolean,
-	untrustedNote: string | undefined,
-	options: McpCommandOptions,
-	credentials: McpOAuthCredentialStore,
-	log: (line: string) => void,
-): Promise<number> {
-	const reports = await Promise.all(
-		loaded.servers.map(async (entry): Promise<ServerReport> => {
-			const report: ServerReport = {
-				name: entry.name,
-				scope: entry.scope ?? "global",
-				source: entry.source,
-				...(entry.override ? { override: entry.override } : {}),
-				enabled: entry.config.enabled !== false,
-				exposure: entry.config.exposure ?? "codemode",
-				transport: describeTransport(entry),
-				state: "disabled",
-				tools: [],
-			};
-			if (!report.enabled) return report;
-			const connection = createConnection(entry, options, credentials);
-			try {
-				await connection.getClient();
-			} catch {
-				// The connection records the state and error.
-			}
-			report.state = connection.state;
-			report.tools = connection.tools.map((tool) => tool.name);
-			const overrides = connection.tools.flatMap((tool) => {
-				const exposure = getMcpToolExposure(entry.config, tool.name);
-				return exposure === report.exposure ? [] : [[tool.name, exposure] as const];
-			});
-			if (overrides.length > 0) report.toolExposure = Object.fromEntries(overrides);
-			if (connection.hasResources) report.resources = true;
-			if (connection.state !== "connected" && connection.error) report.error = connection.error;
-			await connection.close();
-			return report;
-		}),
-	);
-	const failed = loaded.errors.length > 0 || reports.some((report) => report.enabled && report.state !== "connected");
-
-	if (json) {
-		log(
-			JSON.stringify(
-				{ servers: reports, errors: loaded.errors, ...(untrustedNote ? { note: untrustedNote } : {}) },
-				null,
-				2,
-			),
-		);
-		return failed ? 1 : 0;
-	}
-	if (reports.length === 0 && loaded.errors.length === 0) {
-		log(`No MCP servers configured. Add them to ${join(options.agentDir, "mcp.json")} or .pi/mcp.json.`);
-	}
-	for (const report of reports) {
-		const state =
-			report.state === "connected"
-				? `connected, ${report.tools.length} tool${report.tools.length === 1 ? "" : "s"}`
-				: report.state === "needs-auth"
-					? "needs sign-in"
-					: report.state;
-		log(`${report.name}: ${state} (${report.exposure}, ${report.scope})`);
-		log(`  ${report.transport}`);
-		if (report.override) log(`  project override: ${report.override}`);
-		if (report.state === "needs-auth") log(`  sign in with: ${APP_NAME} mcp login ${report.name}`);
-		if (report.tools.length > 0) {
-			const tools = report.tools.map((tool) => {
-				const exposure = report.toolExposure?.[tool];
-				return exposure ? `${tool} [${exposure}]` : tool;
-			});
-			log(`  tools: ${tools.join(", ")}`);
-		}
-		if (report.resources) log("  offers resources");
-		if (report.error) log(`  ${report.error.split("\n").join("\n  ")}`);
-	}
-	for (const configError of loaded.errors) log(`config error: ${configError}`);
-	if (untrustedNote) log(untrustedNote);
-	return failed ? 1 : 0;
-}
-
-async function login(
-	entry: McpServerEntry,
-	connection: McpServerConnection,
-	url: string,
-	timeoutMs: number,
-	options: McpCommandOptions,
-	credentials: McpOAuthCredentialStore,
-	log: (line: string) => void,
-	error: (line: string) => void,
-): Promise<number> {
-	const { name } = entry;
-	// Connecting first answers whether a sign-in is needed and records the server's challenge.
-	try {
-		await connection.getClient();
-		log(`Already signed in to MCP server "${name}" (${connection.tools.length} tools).`);
-		return 0;
-	} catch {
-		if (connection.state !== "needs-auth") {
-			error(`MCP server "${name}" failed to connect: ${connection.error ?? "unknown error"}`);
-			return 1;
-		}
-	}
-
-	const openUrl = options.openUrl ?? openBrowser;
-	const interactive = process.stdin.isTTY === true && options.openUrl === undefined;
-	try {
-		await signInMcpServer({
-			serverUrl: url,
-			store: credentials.forServer(name, url),
-			settings: connection.oauthSettings(),
-			challenge: connection.challenge,
-			prompt: {
-				showAuthorizationUrl: (authorizationUrl) => {
-					log(`Sign in to MCP server "${name}" in your browser:\n${authorizationUrl.href}`);
-					openUrl(authorizationUrl.href);
-				},
-				promptForRedirectUrl: (signal) => waitForRedirectUrl(signal, interactive),
+	const forcedEntry: ServerEntry = {
+		...entry,
+		config: {
+			...httpConfig,
+			...(timeoutMs === undefined ? {} : { timeoutMs }),
+			auth: {
+				...auth,
+				browser: true,
+				...(timeoutMs === undefined ? {} : { browserTimeoutMs: timeoutMs, lockWaitTimeoutMs: timeoutMs }),
 			},
-			signal: AbortSignal.timeout(timeoutMs),
-		});
-	} catch (signInError) {
-		error(
-			signInError instanceof McpSignInCancelledError
-				? `Sign-in to MCP server "${name}" was cancelled or not completed within ${Math.round(timeoutMs / 1000)} seconds.`
-				: `Sign-in to MCP server "${name}" failed: ${errorMessage(signInError)}`,
-		);
-		return 1;
+		},
+	};
+	const manager = new McpManager(undefined, agentDir);
+	const result = (await manager.probe([forcedEntry], timeoutMs))[0];
+	if (!result || result.status !== "ready") {
+		throw new Error(result?.error ?? `MCP server "${manifest.name}" login failed.`);
 	}
-	connection.challenge = undefined;
-	try {
-		await connection.reconnect();
-	} catch (connectError) {
-		error(`Signed in, but ${errorMessage(connectError)}`);
-		return 1;
-	}
-	log(`Signed in to MCP server "${name}" (${connection.tools.length} tools).`);
-	return 0;
+	const state = await credentialState(manifest, Date.now);
+	if (state.status === "n/a") throw new Error(`MCP server "${manifest.name}" does not use OAuth.`);
+	return { schema: 1, server: manifest.name, status: "ready", credential: state.status };
 }
 
+export async function logoutMcpServer(agentDir: string, serverName: string): Promise<McpLogoutEnvelope> {
+	const config = await loadBridgeConfig(agentDir);
+	const manifest = findServer(config.manifest, serverName);
+	const entry = runnableOAuthEntry(manifest);
+	if (entry.config.type !== "http" || entry.config.auth.mode !== "oauth") {
+		throw new Error(`MCP server "${manifest.name}" does not use OAuth.`);
+	}
+	const store = await CredentialStore.open(entry.config.url);
+	await store.discardTokens();
+	return { schema: 1, server: manifest.name, loggedOut: true };
+}
+
+/** Persist effective enablement through Phi's locked sidecar, never by mutating mcp.json. */
+export async function setMcpServerEnabled(
+	agentDir: string,
+	serverName: string,
+	enabled: boolean,
+): Promise<McpEnablementEnvelope> {
+	const config = await loadBridgeConfig(agentDir);
+	const manifest = findServer(config.manifest, serverName);
+	await writeEnablement(agentDir, config.path, manifest.name, manifest.fingerprint, enabled);
+
+	const updated = findServer((await loadBridgeConfig(agentDir)).manifest, manifest.name);
+	if (updated.enabled !== enabled) {
+		throw new Error(`MCP server "${manifest.name}" could not be ${enabled ? "enabled" : "disabled"}.`);
+	}
+	// Enablement and configuration validity are separate state. The override has
+	// committed successfully even when the newly enabled entry is invalid; status
+	// reports its sanitized configError. Never report a failed toggle after
+	// persisting it (or attempt an unsafe second-lock rollback).
+	return { schema: 1, server: updated.name, enabled: updated.enabled };
+}
+
+function parseMcpCommand(args: string[]): McpCommand {
+	if (args.length === 0 || args[0] === "--help" || args[0] === "-h" || args[0] === "help") {
+		return { kind: "help", json: false };
+	}
+	const verb = args[0];
+	const options = parseOptions(args.slice(1));
+	// `--limit` / `--since` belong to `events` alone; silently ignoring them
+	// elsewhere would make `phi mcp status --limit 1` look like it did something.
+	if (verb !== "events" && (options.limit !== undefined || options.sinceMs !== undefined)) {
+		throw new Error(MCP_CLI_USAGE);
+	}
+	if (verb === "status") {
+		if (options.positionals.length > 0) throw new Error(MCP_CLI_USAGE);
+		return { kind: "status", json: options.json, probe: options.probe, timeoutMs: options.timeoutMs };
+	}
+	if (verb === "login") {
+		if (options.probe || options.positionals.length !== 1) throw new Error(MCP_CLI_USAGE);
+		return {
+			kind: "login",
+			json: options.json,
+			server: options.positionals[0] as string,
+			timeoutMs: options.timeoutMs,
+		};
+	}
+	if (verb === "logout") {
+		if (options.probe || options.timeoutMs !== undefined || options.positionals.length !== 1) {
+			throw new Error(MCP_CLI_USAGE);
+		}
+		return { kind: "logout", json: options.json, server: options.positionals[0] as string };
+	}
+	if (verb === "events") {
+		if (options.probe || options.timeoutMs !== undefined || options.positionals.length > 1) {
+			throw new Error(MCP_CLI_USAGE);
+		}
+		return {
+			kind: "events",
+			json: options.json,
+			server: options.positionals[0],
+			limit: options.limit ?? DEFAULT_EVENT_LIMIT,
+			sinceMs: options.sinceMs,
+		};
+	}
+	if (verb === "enable" || verb === "disable") {
+		if (options.probe || options.timeoutMs !== undefined || options.positionals.length !== 1) {
+			throw new Error(MCP_CLI_USAGE);
+		}
+		return {
+			kind: "enablement",
+			json: options.json,
+			server: options.positionals[0] as string,
+			enabled: verb === "enable",
+		};
+	}
+	throw new Error(MCP_CLI_USAGE);
+}
+
+function parseOptions(args: string[]): ParsedOptions {
+	const parsed: ParsedOptions = { json: false, probe: false, positionals: [] };
+	for (let index = 0; index < args.length; index++) {
+		const arg = args[index] as string;
+		if (arg === "--json") {
+			parsed.json = true;
+			continue;
+		}
+		if (arg === "--probe") {
+			parsed.probe = true;
+			continue;
+		}
+		if (arg === "--timeout-ms") {
+			const value = args[++index];
+			if (value === undefined) throw new Error("--timeout-ms requires a positive integer.");
+			parsed.timeoutMs = parseTimeout(value);
+			continue;
+		}
+		if (arg.startsWith("--timeout-ms=")) {
+			parsed.timeoutMs = parseTimeout(arg.slice("--timeout-ms=".length));
+			continue;
+		}
+		if (arg === "--limit" || arg.startsWith("--limit=")) {
+			const value = arg.startsWith("--limit=") ? arg.slice("--limit=".length) : args[++index];
+			if (value === undefined) throw new Error("--limit requires a positive integer.");
+			parsed.limit = parseLimit(value);
+			continue;
+		}
+		if (arg === "--since" || arg.startsWith("--since=")) {
+			const value = arg.startsWith("--since=") ? arg.slice("--since=".length) : args[++index];
+			if (value === undefined) throw new Error("--since requires a duration or an ISO timestamp.");
+			parsed.sinceMs = parseSince(value);
+			continue;
+		}
+		if (arg.startsWith("-")) throw new Error(`Unknown mcp option: ${arg}`);
+		parsed.positionals.push(arg);
+	}
+	return parsed;
+}
+
+function parseTimeout(value: string): number {
+	const timeout = Number(value);
+	if (!Number.isSafeInteger(timeout) || timeout <= 0 || timeout > 2_147_483_647) {
+		throw new Error("--timeout-ms requires a positive integer no greater than 2147483647.");
+	}
+	return timeout;
+}
+
+function parseLimit(value: string): number {
+	const limit = Number(value);
+	if (!Number.isSafeInteger(limit) || limit <= 0) throw new Error("--limit requires a positive integer.");
+	return limit;
+}
+
+const SINCE_USAGE = "--since requires a duration (90m, 24h, 7d) or an ISO 8601 timestamp.";
+
 /**
- * The pasted redirect URL in a terminal; otherwise only the browser callback can finish the sign-in.
- * Resolves to undefined when `signal` aborts: the callback arrived, or the sign-in timed out.
+ * Accepts `90m`, `24h`, `7d`, or an absolute ISO 8601 timestamp — and nothing
+ * else. `Date.parse` alone would also accept locale-dependent forms like
+ * `09/13/2026`, whose meaning differs by platform, which is not a good property
+ * for the input that decides which evidence you are shown.
  */
-async function waitForRedirectUrl(signal: AbortSignal, interactive: boolean): Promise<string | undefined> {
-	if (!interactive) {
-		if (!signal.aborted) await new Promise((resolve) => signal.addEventListener("abort", resolve, { once: true }));
-		return undefined;
+function parseSince(value: string): number {
+	const trimmed = value.trim();
+	const duration = /^(\d{1,9})([mhd])$/.exec(trimmed);
+	if (duration) {
+		const amount = Number(duration[1]);
+		const unit = { m: 60_000, h: 3_600_000, d: 86_400_000 }[duration[2] as "m" | "h" | "d"];
+		const since = Date.now() - amount * unit;
+		if (!Number.isFinite(since)) throw new Error(SINCE_USAGE);
+		return since;
 	}
-	const readline = createInterface({ input: process.stdin, output: process.stderr });
-	try {
-		return await readline.question("If the browser cannot reach this machine, paste the URL it was redirected to: ", {
-			signal,
-		});
-	} catch {
-		return undefined;
-	} finally {
-		readline.close();
+	const extended = /^\d{4}-\d{2}-\d{2}([T ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})?)?$/;
+	// ISO 8601 basic form, which `Date.parse` does not accept on its own.
+	const basic = /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})(Z|[+-]\d{2}:?\d{2})?$/.exec(trimmed);
+	if (!basic && !extended.test(trimmed)) throw new Error(SINCE_USAGE);
+	const normalized = basic
+		? `${basic[1]}-${basic[2]}-${basic[3]}T${basic[4]}:${basic[5]}:${basic[6]}${basic[7] ?? ""}`
+		: trimmed;
+	const parsed = Date.parse(normalized);
+	if (Number.isNaN(parsed)) throw new Error(SINCE_USAGE);
+	return parsed;
+}
+
+function findServer(manifest: readonly ServerManifestEntry[], serverName: string): ServerManifestEntry {
+	const server = manifest.find((entry) => entry.name.toLowerCase() === serverName.toLowerCase());
+	if (!server) throw new Error(`No configured MCP server named "${serverName}".`);
+	return server;
+}
+
+function runnableOAuthEntry(manifest: ServerManifestEntry): ServerEntry {
+	if (!manifest.enabled) throw new Error(`MCP server "${manifest.name}" is disabled.`);
+	if (manifest.error) throw new Error(`MCP server "${manifest.name}" is invalid: ${manifest.error}`);
+	if (!manifest.entry) throw new Error(`MCP server "${manifest.name}" is not runnable.`);
+	if (manifest.entry.config.type !== "http" || manifest.entry.config.auth.mode !== "oauth") {
+		throw new Error(`MCP server "${manifest.name}" does not use OAuth.`);
 	}
+	return manifest.entry;
+}
+
+async function credentialState(
+	manifest: ServerManifestEntry,
+	now: () => number,
+): Promise<{
+	status: McpCredentialStatus;
+	expiresAt?: string;
+	needsLogin: boolean;
+	loginInProgress: boolean;
+}> {
+	if (manifest.authMode !== "oauth") {
+		return { status: "n/a", needsLogin: false, loginInProgress: false };
+	}
+	const config = manifest.entry?.config;
+	if (config?.type !== "http") {
+		return { status: "absent", needsLogin: false, loginInProgress: false };
+	}
+	const store = await CredentialStore.open(config.url);
+	const tokens = await store.readTokens();
+	const expired = tokens?.expires_at !== undefined && tokens.expires_at <= now();
+	const status: McpCredentialStatus = !tokens ? "absent" : expired ? "expired" : "valid";
+	const expiresAt = tokens?.expires_at === undefined ? undefined : formatExpiry(tokens.expires_at);
+	return {
+		status,
+		...(expiresAt ? { expiresAt } : {}),
+		needsLogin: tokens === undefined || (expired && !hasRefreshToken(tokens)),
+		loginInProgress: await isLoginInProgress(store.paths),
+	};
+}
+
+function hasRefreshToken(tokens: OAuthTokens): boolean {
+	return typeof tokens.refresh_token === "string" && tokens.refresh_token.length > 0;
+}
+
+function formatExpiry(expiresAt: number): string | undefined {
+	const date = new Date(expiresAt);
+	if (Number.isNaN(date.getTime())) return undefined;
+	return date.toISOString().replace(".000Z", "Z");
+}
+
+function probeStatus(manifest: ServerManifestEntry, result: McpProbeResult | undefined): McpCliProbeStatus {
+	if (!manifest.enabled) return { status: "failed", toolCount: 0, error: "Server is disabled." };
+	if (manifest.error) return { status: "failed", toolCount: 0, error: manifest.error };
+	return result ?? { status: "failed", toolCount: 0, error: "Server was not probed." };
+}
+
+function writeResult(value: object, json: boolean, human: string): void {
+	process.stdout.write(`${json ? JSON.stringify(value) : human}\n`);
+}
+
+/** Read the OAuth audit trail. Pure disk read: it never contacts a server. */
+export async function collectMcpEvents(options: {
+	server?: string;
+	limit: number;
+	sinceMs?: number;
+}): Promise<McpEventsEnvelope> {
+	return {
+		schema: 1,
+		logPath: auditLogPath() ?? null,
+		events: await readOAuthEvents({ server: options.server, limit: options.limit, since: options.sinceMs }),
+	};
+}
+
+export function formatHumanEvents(envelope: McpEventsEnvelope): string {
+	if (envelope.logPath === null) {
+		return `OAuth event logging is disabled; unset $PHI_MCP_AUTH_LOG to re-enable it.`;
+	}
+	if (envelope.events.length === 0) return `No OAuth events recorded yet (${envelope.logPath}).`;
+	return envelope.events
+		.map((event) => {
+			const facts = [
+				event.mode,
+				event.accessToken ? `access ${event.accessToken}` : undefined,
+				event.refreshToken ? `refresh ${event.refreshToken}` : undefined,
+				event.rotated === true ? `rotated -> ${event.newRefreshToken ?? "none"}` : undefined,
+				event.expiresAt ? `expires ${event.expiresAt}` : undefined,
+				event.errorCode,
+				event.status === undefined ? undefined : `HTTP ${event.status}`,
+				event.detail,
+			]
+				.filter((part) => part !== undefined)
+				.join(", ");
+			return `${event.ts} pid ${event.pid} ${event.server} ${event.event}${facts ? ` (${facts})` : ""}`;
+		})
+		.join("\n");
+}
+
+export function formatHumanStatus(envelope: McpStatusEnvelope): string {
+	if (envelope.servers.length === 0) return "No MCP servers configured.";
+	return envelope.servers
+		.map((server) => {
+			const login = server.configError
+				? server.missingEnv.length > 0
+					? `config error: missing ${server.missingEnv.map((name) => `$${name}`).join(", ")}`
+					: `config error: ${server.configError}`
+				: server.needsLogin
+					? server.loginInProgress
+						? "login in progress"
+						: "needs login"
+					: "ready";
+			const probe = server.probe
+				? `; probe ${server.probe.status}${server.probe.status === "ready" ? ` (${server.probe.toolCount} tools)` : `: ${server.probe.error ?? "unknown error"}`}`
+				: "";
+			return `${server.name}: ${server.transport}, ${server.enabled ? "enabled" : "disabled"}, ${server.authMode}, credential ${server.credential}, ${login}${probe}`;
+		})
+		.join("\n");
 }

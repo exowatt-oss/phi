@@ -118,6 +118,7 @@ export interface AgentOptions {
 	transformContext?: (messages: AgentMessage[], signal?: AbortSignal) => Promise<AgentMessage[]>;
 	streamFn: StreamFn;
 	getApiKey?: (provider: string) => Promise<string | undefined> | string | undefined;
+	resolveToolCall?: AgentLoopConfig["resolveToolCall"];
 	onPayload?: SimpleStreamOptions["onPayload"];
 	onResponse?: SimpleStreamOptions["onResponse"];
 	onProviderStreamEvent?: SimpleStreamOptions["onProviderStreamEvent"];
@@ -191,6 +192,15 @@ type ActiveRun = {
  * `Agent` owns the current transcript, emits lifecycle events, executes tools,
  * and exposes queueing APIs for steering and follow-up messages.
  */
+/** Options for {@link Agent.continue}. */
+export interface ContinueOptions {
+	/**
+	 * phi: when the last message is a custom message, deliver queued steering/follow-up input first
+	 * instead of running a continuation from it. Default: only an assistant tail drains the queues.
+	 */
+	queuedInputFirst?: boolean;
+}
+
 export class Agent {
 	private _state: MutableAgentState;
 	private readonly listeners = new Set<(event: AgentEvent, signal: AbortSignal) => Promise<void> | void>();
@@ -201,6 +211,7 @@ export class Agent {
 	public transformContext?: (messages: AgentMessage[], signal?: AbortSignal) => Promise<AgentMessage[]>;
 	public streamFunction: StreamFn;
 	public getApiKey?: (provider: string) => Promise<string | undefined> | string | undefined;
+	public resolveToolCall?: AgentLoopConfig["resolveToolCall"];
 	public onPayload?: SimpleStreamOptions["onPayload"];
 	public onResponse?: SimpleStreamOptions["onResponse"];
 	public onProviderStreamEvent?: SimpleStreamOptions["onProviderStreamEvent"];
@@ -243,6 +254,7 @@ export class Agent {
 		this.transformContext = runtimeOptions.transformContext;
 		this.streamFunction = runtimeOptions.streamFn ?? getDefaultStreamFn();
 		this.getApiKey = runtimeOptions.getApiKey;
+		this.resolveToolCall = runtimeOptions.resolveToolCall;
 		this.onPayload = runtimeOptions.onPayload;
 		this.onResponse = runtimeOptions.onResponse;
 		this.onProviderStreamEvent = runtimeOptions.onProviderStreamEvent;
@@ -390,7 +402,7 @@ export class Agent {
 	}
 
 	/** Continue from the current transcript. The last message must be a user or tool-result message. */
-	async continue(): Promise<void> {
+	async continue(options: ContinueOptions = {}): Promise<void> {
 		if (this.activeRun) {
 			throw new Error("Agent is already processing. Wait for completion before continuing.");
 		}
@@ -400,7 +412,13 @@ export class Agent {
 			throw new Error("No messages to continue from");
 		}
 
-		if (lastMessage.role === "assistant") {
+		// phi: a host may continue from a custom message with queued input first (its context-window
+		// rollover marker: the queued follow-up opens the new window instead of a bare continuation).
+		// The `custom` role is declared by the host's CustomAgentMessages augmentation, not here.
+		const queuedInputFirst =
+			lastMessage.role === "assistant" ||
+			(options.queuedInputFirst === true && (lastMessage.role as string) === "custom");
+		if (queuedInputFirst) {
 			const queuedSteering = this.steeringQueue.drain();
 			if (queuedSteering.length > 0) {
 				await this.runPromptMessages(queuedSteering, { skipInitialSteeringPoll: true });
@@ -412,10 +430,9 @@ export class Agent {
 				await this.runPromptMessages(queuedFollowUps);
 				return;
 			}
-
-			throw new Error("Cannot continue from message role: assistant");
 		}
 
+		if (lastMessage.role === "assistant") throw new Error("Cannot continue from message role: assistant");
 		await this.runContinuation();
 	}
 
@@ -488,6 +505,7 @@ export class Agent {
 			identity: this.identity,
 			toolExecution: this.toolExecution,
 			beforeToolCall: this.beforeToolCall,
+			resolveToolCall: this.resolveToolCall,
 			afterToolCall: this.afterToolCall,
 			finishTurn: this.finishTurn,
 			prepareRequest: this.prepareRequest,

@@ -107,6 +107,9 @@ function formatWriteCall(
 
 	if (fileContent === null) {
 		text += `\n\n${theme.fg("error", "[invalid content arg - expected string]")}`;
+	} else if (fileContent && options.display === "minimal" && !options.expanded) {
+		const lineCount = fileContent.split("\n").length;
+		text += theme.fg("muted", ` (${lineCount} ${lineCount === 1 ? "line" : "lines"})`);
 	} else if (fileContent) {
 		const lang = rawPath ? getLanguageFromPath(rawPath) : undefined;
 		const renderedLines = lang
@@ -114,7 +117,7 @@ function formatWriteCall(
 			: normalizeDisplayText(fileContent).split("\n");
 		const lines = trimTrailingEmptyLines(renderedLines);
 		const totalLines = lines.length;
-		const maxLines = options.expanded ? lines.length : 10;
+		const maxLines = options.expanded ? lines.length : (options.collapsedLines ?? 10);
 		const displayLines = lines.slice(0, maxLines);
 		const remaining = lines.length - maxLines;
 		text += `\n\n${displayLines.map((line) => (lang ? line : theme.fg("toolOutput", replaceTabs(line)))).join("\n")}`;
@@ -159,7 +162,7 @@ export const writeRenderers: Pick<ToolDefinition<any, any>, "renderCall" | "rend
 		component.setText(
 			formatWriteCall(
 				renderArgs,
-				{ expanded: context.expanded, isPartial: context.isPartial },
+				{ expanded: context.expanded, isPartial: context.isPartial, display: context.display },
 				theme,
 				component.cache,
 				context.cwd,

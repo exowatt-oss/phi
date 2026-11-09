@@ -81,6 +81,7 @@ export function fauxAssistantMessage(
 		stopReason?: AssistantMessage["stopReason"];
 		deferred?: DeferredHandle;
 		errorMessage?: string;
+		refusal?: AssistantMessage["refusal"];
 		responseId?: string;
 		timestamp?: number;
 	} = {},
@@ -95,6 +96,7 @@ export function fauxAssistantMessage(
 		stopReason: options.stopReason ?? "stop",
 		...(options.deferred === undefined ? {} : { deferred: options.deferred }),
 		...(options.errorMessage === undefined ? {} : { errorMessage: options.errorMessage }),
+		...(options.refusal === undefined ? {} : { refusal: options.refusal }),
 		...(options.responseId === undefined ? {} : { responseId: options.responseId }),
 		timestamp: options.timestamp ?? Date.now(),
 	};

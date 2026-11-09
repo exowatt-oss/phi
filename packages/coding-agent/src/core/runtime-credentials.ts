@@ -38,7 +38,7 @@ export class RuntimeCredentials implements CredentialStore {
 
 	modify(
 		providerId: string,
-		fn: (current: Credential | undefined) => Promise<Credential | undefined>,
+		fn: (current: Credential | undefined) => Promise<Credential | null | undefined>,
 		options?: AuthOperationOptions,
 	): Promise<Credential | undefined> {
 		return this.store.modify(providerId, fn, options);

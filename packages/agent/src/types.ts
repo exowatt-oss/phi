@@ -141,6 +141,10 @@ export interface AgentTurnContext {
 	context: AgentContext;
 	/** Messages that this loop invocation will return if it exits at this point. Prompt runs include the initial prompt messages; continuation runs do not include pre-existing context messages. */
 	newMessages: AgentMessage[];
+	/** A successful tool request to start the next turn with a fresh context window. */
+	newContext?: NewContextRequest;
+	/** A successful tool request to compact the context before the next turn. */
+	compaction?: CompactionRequest;
 }
 
 /** Decision returned by {@link FinishTurn}. Returning undefined preserves normal scheduling. */
@@ -317,6 +321,19 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	toolExecution?: ToolExecutionMode;
 
 	/**
+	 * Resolves a tool call that is not currently in the active tool list.
+	 *
+	 * This is intentionally opt-in: callers decide which registered tools may be
+	 * activated from a transcript tool call. Returning undefined preserves the
+	 * normal "not found" tool result.
+	 */
+	resolveToolCall?: (
+		toolName: string,
+		context: AgentContext,
+		signal?: AbortSignal,
+	) => AgentTool<any> | undefined | Promise<AgentTool<any> | undefined>;
+
+	/**
 	 * Called before a tool is executed, after arguments have been validated.
 	 *
 	 * Return `{ block: true }` to prevent execution. The loop emits an error tool result instead.
@@ -420,6 +437,19 @@ export interface AgentState {
 	readonly errorMessage?: string;
 }
 
+/** Request carried by a successful tool result to start a fresh context window. */
+export interface NewContextRequest {
+	/** Optional continuation state injected into the new window. */
+	handoff?: string;
+}
+
+/** Request carried by a successful tool result to compact context before the next turn. */
+export interface CompactionRequest {
+	notes: string;
+	keep?: string[];
+	mode: "summarize" | "fresh";
+}
+
 /** Final or partial result produced by a tool. */
 export interface AgentToolResult<T = JsonValue | undefined> {
 	/** Text or image content returned to the model. */
@@ -433,6 +463,10 @@ export interface AgentToolResult<T = JsonValue | undefined> {
 	structuredContent?: JsonValue;
 	/** Usage from the final tool execution itself, if available. Not used for main LLM context accounting. */
 	usage?: Usage;
+	/** Start the next turn in a fresh context window after the full tool batch succeeds. */
+	newContext?: NewContextRequest;
+	/** Compact context before the next turn after the full tool batch succeeds. */
+	compaction?: CompactionRequest;
 	/**
 	 * Report a failure without throwing. The model sees `content` as an error result, like a thrown
 	 * error, but `details` and `structuredContent` are kept for the UI and programmatic callers.
@@ -466,6 +500,8 @@ export type AgentToolUpdateCallback<T = any> = (partialResult: AgentToolResult<T
 export interface AgentTool<TParameters extends TSchema = TSchema, TDetails = any> extends Tool<TParameters> {
 	/** Human-readable label for UI display. */
 	label: string;
+	/** Whether a missing-tool resolver may activate this tool from a transcript call. */
+	autoActivateOnCall?: boolean | ((context: AgentContext) => boolean);
 	/**
 	 * Optional compatibility shim for raw tool-call arguments before schema validation.
 	 * Must return an object that matches `TParameters`.

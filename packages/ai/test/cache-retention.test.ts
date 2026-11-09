@@ -1,10 +1,11 @@
+import type { ResponseInput, ResponseInputContent } from "openai/resources/responses/responses.js";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { stream as streamAnthropic } from "../src/api/anthropic-messages.ts";
 import { stream as streamOpenAICompletions } from "../src/api/openai-completions.ts";
-import { stream as streamOpenAIResponses } from "../src/api/openai-responses.ts";
+import { type OpenAIResponsesOptions, stream as streamOpenAIResponses } from "../src/api/openai-responses.ts";
 import { getModel, normalizeContext, stream } from "../src/compat.ts";
 import { MODELS } from "../src/models.generated.ts";
-import type { Model } from "../src/types.ts";
+import type { Context, Model } from "../src/types.ts";
 
 class PayloadCaptured extends Error {
 	constructor() {
@@ -18,15 +19,55 @@ interface OpenAICompletionsCachePayload {
 	prompt_cache_retention?: string;
 }
 
+type OpenAIResponsesCacheContent = ResponseInputContent & {
+	prompt_cache_breakpoint?: { mode: "explicit" };
+};
+
 interface OpenAIResponsesCachePayload extends OpenAICompletionsCachePayload {
+	input?: ResponseInput;
 	prompt_cache_options?: { mode?: "explicit"; ttl?: "30m" };
 }
+
+type InstructionMessage = {
+	role: "system" | "developer";
+	content: string | OpenAIResponsesCacheContent[];
+};
 
 function stopAfterPayload<TPayload>(capture: (payload: TPayload) => void): (payload: unknown) => never {
 	return (payload: unknown): never => {
 		capture(payload as TPayload);
 		throw new PayloadCaptured();
 	};
+}
+
+async function captureOpenAIResponsesPayload(
+	model: Model<"openai-responses">,
+	context: Context,
+	options?: Omit<OpenAIResponsesOptions, "apiKey" | "onPayload">,
+): Promise<OpenAIResponsesCachePayload> {
+	let capturedPayload: OpenAIResponsesCachePayload | undefined;
+	const s = streamOpenAIResponses(model, normalizeContext(context), {
+		...options,
+		apiKey: "sk-fake-key",
+		onPayload: stopAfterPayload<OpenAIResponsesCachePayload>((payload) => {
+			capturedPayload = payload;
+		}),
+	});
+
+	for await (const event of s) {
+		if (event.type === "error") break;
+	}
+
+	if (!capturedPayload) throw new Error("Expected OpenAI Responses payload to be captured");
+	return capturedPayload;
+}
+
+function getInstructionMessage(payload: OpenAIResponsesCachePayload): InstructionMessage {
+	const item = payload.input?.[0];
+	if (!item || !("role" in item) || !("content" in item) || (item.role !== "system" && item.role !== "developer")) {
+		throw new Error("Expected an instruction message at the start of the input");
+	}
+	return item as InstructionMessage;
 }
 
 describe("Cache Retention (PI_CACHE_RETENTION)", () => {
@@ -117,7 +158,7 @@ describe("Cache Retention (PI_CACHE_RETENTION)", () => {
 
 			try {
 				const s = streamAnthropic(proxyModel, context, {
-					apiKey: "fake-key",
+					apiKey: "sk-fake-key",
 					onPayload: stopAfterPayload((payload) => {
 						capturedPayload = payload;
 					}),
@@ -146,7 +187,7 @@ describe("Cache Retention (PI_CACHE_RETENTION)", () => {
 
 			try {
 				const s = streamAnthropic(proxyModel, context, {
-					apiKey: "fake-key",
+					apiKey: "sk-fake-key",
 					cacheRetention: "long",
 					onPayload: stopAfterPayload((payload) => {
 						capturedPayload = payload;
@@ -170,7 +211,7 @@ describe("Cache Retention (PI_CACHE_RETENTION)", () => {
 
 			try {
 				const s = streamAnthropic(baseModel, context, {
-					apiKey: "fake-key",
+					apiKey: "sk-fake-key",
 					cacheRetention: "none",
 					onPayload: stopAfterPayload((payload) => {
 						capturedPayload = payload;
@@ -194,7 +235,7 @@ describe("Cache Retention (PI_CACHE_RETENTION)", () => {
 
 			try {
 				const s = streamAnthropic(baseModel, context, {
-					apiKey: "fake-key",
+					apiKey: "sk-fake-key",
 					onPayload: stopAfterPayload((payload) => {
 						capturedPayload = payload;
 					}),
@@ -220,7 +261,7 @@ describe("Cache Retention (PI_CACHE_RETENTION)", () => {
 
 			try {
 				const s = streamAnthropic(baseModel, context, {
-					apiKey: "fake-key",
+					apiKey: "sk-fake-key",
 					cacheRetention: "long",
 					onPayload: stopAfterPayload((payload) => {
 						capturedPayload = payload;
@@ -377,6 +418,19 @@ describe("Cache Retention (PI_CACHE_RETENTION)", () => {
 			expect(capturedPayload?.prompt_cache_key).toBeUndefined();
 			expect(capturedPayload?.prompt_cache_retention).toBeUndefined();
 			expect(capturedPayload?.prompt_cache_options).toEqual({ mode: "explicit" });
+			expect(JSON.stringify(capturedPayload?.input)).not.toContain("prompt_cache_breakpoint");
+		});
+
+		it("keeps legacy cache fields and input shape for models without explicit caching", async () => {
+			const payload = await captureOpenAIResponsesPayload(getModel("openai", "gpt-4o-mini"), context, {
+				sessionId: "session-legacy",
+				cacheRetention: "short",
+			});
+
+			expect(payload.prompt_cache_key).toBe("session-legacy");
+			expect(payload.prompt_cache_retention).toBeUndefined();
+			expect(payload.prompt_cache_options).toBeUndefined();
+			expect(JSON.stringify(payload.input)).not.toContain("prompt_cache_breakpoint");
 		});
 
 		it("should omit prompt_cache_options for models that reject it", async () => {
@@ -405,11 +459,89 @@ describe("Cache Retention (PI_CACHE_RETENTION)", () => {
 			expect(capturedPayload?.prompt_cache_options).toBeUndefined();
 		});
 
+		it("should use explicit GPT-5.6 caching for the stable instruction prefix", async () => {
+			const model = getModel("openai", "gpt-5.6-sol");
+			const payload = await captureOpenAIResponsesPayload(model, context, {
+				sessionId: "session-explicit",
+				cacheRetention: "long",
+			});
+			const instruction = getInstructionMessage(payload);
+
+			expect(instruction.role).toBe("developer");
+			expect(payload.prompt_cache_key).toBe("session-explicit");
+			expect(payload.prompt_cache_retention).toBeUndefined();
+			expect(payload.prompt_cache_options).toEqual({ mode: "explicit", ttl: "30m" });
+			expect(instruction.content).toEqual([
+				expect.objectContaining({
+					type: "input_text",
+					text: "You are a helpful assistant.",
+					prompt_cache_breakpoint: { mode: "explicit" },
+				}),
+			]);
+
+			const userMessage = payload.input?.find((item) => "role" in item && item.role === "user");
+			expect(userMessage).not.toMatchObject({
+				content: [expect.objectContaining({ prompt_cache_breakpoint: expect.anything() })],
+			});
+		});
+
+		it("does not add an explicit breakpoint without a stable instruction prefix", async () => {
+			const payload = await captureOpenAIResponsesPayload(
+				getModel("openai", "gpt-5.6-sol"),
+				{
+					messages: [{ role: "user", content: "Hello", timestamp: Date.now() }],
+				},
+				{ sessionId: "session-no-prefix" },
+			);
+
+			expect(payload.prompt_cache_key).toBe("session-no-prefix");
+			expect(payload.prompt_cache_options).toEqual({ mode: "explicit", ttl: "30m" });
+			expect(payload.input?.some((item) => JSON.stringify(item).includes("prompt_cache_breakpoint"))).toBe(false);
+		});
+
+		it("marks the last cacheable block in a multi-block instruction prefix", async () => {
+			const payload = await captureOpenAIResponsesPayload(
+				getModel("openai", "gpt-5.6-sol"),
+				{
+					systemPrompt: "Use the attached reference.",
+					messages: [
+						{
+							role: "user",
+							content: [{ type: "text", text: "Question" }],
+							timestamp: Date.now(),
+						},
+					],
+				},
+				{ sessionId: "session-multi-block" },
+			);
+			const instruction = getInstructionMessage(payload);
+			if (typeof instruction.content === "string") throw new Error("Expected structured instruction content");
+			expect(instruction.content).toEqual([
+				expect.objectContaining({ type: "input_text", prompt_cache_breakpoint: { mode: "explicit" } }),
+			]);
+		});
+
+		it("does not mutate the context while adding an explicit breakpoint", async () => {
+			const immutableContext: Context = {
+				systemPrompt: "Stable instructions",
+				messages: [{ role: "user", content: [{ type: "text", text: "Hello" }], timestamp: 1 }],
+			};
+			const before = structuredClone(immutableContext);
+
+			await captureOpenAIResponsesPayload(getModel("openai", "gpt-5.6-sol"), immutableContext, {
+				sessionId: "session-immutable",
+			});
+
+			expect(immutableContext).toEqual(before);
+		});
+
 		it.each([
 			["gpt-4o-mini", "24h", undefined],
-			["gpt-6-astra", undefined, { ttl: "30m" }],
-			["gpt-6-sol", undefined, { ttl: "30m" }],
-			["gpt-6-luna", undefined, { ttl: "30m" }],
+			// phi keeps GPT-5.6+ in explicit mode (stable-instruction breakpoint), so the
+			// long tier is explicit mode with the 30-minute TTL, not upstream's implicit TTL.
+			["gpt-6-astra", undefined, { mode: "explicit", ttl: "30m" }],
+			["gpt-6-sol", undefined, { mode: "explicit", ttl: "30m" }],
+			["gpt-6-luna", undefined, { mode: "explicit", ttl: "30m" }],
 		] as const)("should use the supported long cache field for %s", async (modelId, retention, cacheOptions) => {
 			const model = getModel("openai", modelId);
 			let capturedPayload: OpenAIResponsesCachePayload | undefined;
@@ -459,7 +591,7 @@ describe("Cache Retention (PI_CACHE_RETENTION)", () => {
 
 			try {
 				const s = streamOpenAICompletions(createCompletionsModel(), context, {
-					apiKey: "fake-key",
+					apiKey: "sk-fake-key",
 					cacheRetention: "long",
 					sessionId: "session-completions",
 					onPayload: stopAfterPayload((payload) => {
@@ -484,7 +616,7 @@ describe("Cache Retention (PI_CACHE_RETENTION)", () => {
 
 			try {
 				const s = streamOpenAICompletions(createCompletionsModel({ supportsLongCacheRetention: false }), context, {
-					apiKey: "fake-key",
+					apiKey: "sk-fake-key",
 					cacheRetention: "long",
 					sessionId: "session-completions-false",
 					onPayload: stopAfterPayload((payload) => {
@@ -505,7 +637,6 @@ describe("Cache Retention (PI_CACHE_RETENTION)", () => {
 		});
 
 		it.each([
-			MODELS.opencode["deepseek-v4-flash"],
 			MODELS.opencode["deepseek-v4-pro"],
 			MODELS.opencode["kimi-k2.5"],
 			MODELS.opencode["kimi-k2.6"],
@@ -516,7 +647,7 @@ describe("Cache Retention (PI_CACHE_RETENTION)", () => {
 
 			try {
 				const s = streamOpenAICompletions(model, context, {
-					apiKey: "fake-key",
+					apiKey: "sk-fake-key",
 					cacheRetention: "long",
 					sessionId: "session-opencode-long-cache-unsupported",
 					onPayload: stopAfterPayload<OpenAICompletionsCachePayload>((payload) => {
@@ -578,7 +709,7 @@ describe("Cache Retention (PI_CACHE_RETENTION)", () => {
 
 				try {
 					const s = streamOpenAICompletions(model, contextWithTools as any, {
-						apiKey: "fake-key",
+						apiKey: "sk-fake-key",
 						sessionId: "test",
 						onPayload: stopAfterPayload((payload: any) => {
 							capturedPayload = payload;

@@ -6,7 +6,7 @@ import {
 	TuiMainScreen,
 } from "@earendil-works/pi-tui";
 import { existsSync } from "fs";
-import { APP_NAME, CONFIG_DIR_NAME, ENV_AGENT_DIR, getAgentDir, getSettingsPath, PACKAGE_NAME } from "../config.ts";
+import { APP_NAME, CONFIG_DIR_NAME, getAgentDir, getEnvAgentDir, getSettingsPath, PACKAGE_NAME } from "../config.ts";
 import { areExperimentalFeaturesEnabled } from "../core/experimental.ts";
 import { KeybindingsManager } from "../core/keybindings.ts";
 import { DefaultPackageManager, type ResolvedResource } from "../core/package-manager.ts";
@@ -17,6 +17,10 @@ import {
 	FirstTimeSetupComponent,
 	type FirstTimeSetupResult,
 } from "../modes/interactive/components/first-time-setup.ts";
+import {
+	StartupProgressComponent,
+	type StartupProgressStage,
+} from "../modes/interactive/components/startup-progress.ts";
 import { SYSTEM_THEME_NAME } from "../modes/interactive/theme/system-theme.ts";
 import {
 	getTerminalTheme,
@@ -94,6 +98,160 @@ export async function createStartupTui(settingsManager: SettingsManager): Promis
 	return ui;
 }
 
+export interface StartupProgressHandle {
+	update(stage: StartupProgressStage): void;
+	pause(): Promise<void>;
+	resume(): Promise<void>;
+	close(): Promise<void>;
+}
+
+const INITIAL_STARTUP_PROGRESS_STAGE: StartupProgressStage = {
+	current: 1,
+	total: 6,
+	message: "Loading session",
+};
+
+const STARTUP_UI_CLEAR_DELAY_MS = 25;
+
+function createStartupProgressUi(
+	settingsManager: SettingsManager,
+	stage: StartupProgressStage,
+	onCancel: () => void,
+): { ui: TUI; component: StartupProgressComponent } {
+	// This UI intentionally does not load package resources or query the terminal. It is
+	// the first thing shown while those slower startup steps are still pending. The system
+	// theme with no reported colors uses the terminal's own palette and default colors.
+	setRegisteredThemes([]);
+	initTheme(SYSTEM_THEME_NAME);
+	setKeybindings(KeybindingsManager.create());
+
+	const ui: TUI = new TuiMainScreen(new ProcessTerminal(), settingsManager.getShowHardwareCursor(), getAgentDir());
+	ui.setClearOnShrink(settingsManager.getClearOnShrink());
+	const component = new StartupProgressComponent(ui, stage, onCancel);
+	ui.addChild(component);
+	ui.setFocus(component);
+	ui.start();
+	return { ui, component };
+}
+
+/**
+ * Start the minimal loader shown during interactive startup. Unlike startup prompts,
+ * this path must not resolve packages, custom themes, or terminal color queries.
+ */
+export function startStartupProgress(settingsManager: SettingsManager): StartupProgressHandle {
+	let stage = { ...INITIAL_STARTUP_PROGRESS_STAGE };
+	let ui: TUI | undefined;
+	let component: StartupProgressComponent | undefined;
+	let paused = false;
+	let closed = false;
+	let cancelRequested = false;
+	let closePromise: Promise<void> | undefined;
+	let transition: Promise<void> = Promise.resolve();
+
+	const cleanupOnExit = (): void => {
+		const activeComponent = component;
+		const activeUi = ui;
+		component = undefined;
+		ui = undefined;
+		try {
+			activeComponent?.dispose();
+		} catch {
+			// Process teardown must not be interrupted by component cleanup errors.
+		} finally {
+			try {
+				activeUi?.stop();
+			} catch {
+				// Process teardown must not be interrupted by terminal cleanup errors.
+			}
+		}
+	};
+	process.once("exit", cleanupOnExit);
+
+	const enqueue = (operation: () => Promise<void> | void): Promise<void> => {
+		const next = transition.then(operation);
+		transition = next.catch(() => {});
+		return next;
+	};
+
+	const stopMountedUi = async (): Promise<void> => {
+		const activeUi = ui;
+		const activeComponent = component;
+		ui = undefined;
+		component = undefined;
+		if (!activeUi) return;
+
+		try {
+			activeUi.clear();
+			activeUi.requestRender();
+			await new Promise((resolve) => setTimeout(resolve, STARTUP_UI_CLEAR_DELAY_MS));
+			await activeUi.terminal.drainInput(1000, 50);
+		} catch {
+			// Terminal cleanup below is still attempted if rendering or draining fails.
+		} finally {
+			try {
+				activeComponent?.dispose();
+			} catch {
+				// Cleanup is best effort; restoring the terminal remains the priority.
+			} finally {
+				try {
+					activeUi.stop();
+				} catch {
+					// Cleanup is best effort; restoring the terminal remains the priority.
+				}
+			}
+		}
+	};
+
+	const mount = (): void => {
+		if (closed || paused || ui) return;
+		const mounted = createStartupProgressUi(settingsManager, stage, () => {
+			if (cancelRequested || closed) return;
+			cancelRequested = true;
+			void handle.close().finally(() => process.exit(130));
+		});
+		ui = mounted.ui;
+		component = mounted.component;
+	};
+
+	const handle: StartupProgressHandle = {
+		update(nextStage) {
+			if (closed) return;
+			stage = { ...nextStage };
+			component?.setStage(stage);
+			ui?.invalidate();
+			ui?.requestRender();
+		},
+		pause() {
+			if (closed || paused) return transition;
+			paused = true;
+			return enqueue(stopMountedUi);
+		},
+		resume() {
+			if (closed || !paused) return transition;
+			paused = false;
+			return enqueue(() => {
+				if (!closed && !paused) mount();
+			});
+		},
+		close() {
+			if (closePromise) return closePromise;
+			closed = true;
+			paused = false;
+			closePromise = enqueue(async () => {
+				try {
+					await stopMountedUi();
+				} finally {
+					process.off("exit", cleanupOnExit);
+				}
+			});
+			return closePromise;
+		},
+	};
+
+	mount();
+	return handle;
+}
+
 export function startStartupTui(ui: TUI, settingsManager: SettingsManager): void {
 	ui.start();
 	const themeSetting = settingsManager.getThemeSetting();
@@ -141,7 +299,7 @@ export function shouldRunFirstTimeSetup(settingsPath: string = getSettingsPath()
 	if (!areExperimentalFeaturesEnabled()) {
 		return false;
 	}
-	if (process.env[ENV_AGENT_DIR]) {
+	if (getEnvAgentDir()) {
 		return false;
 	}
 	return !existsSync(settingsPath);

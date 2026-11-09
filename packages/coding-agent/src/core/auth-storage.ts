@@ -449,7 +449,7 @@ export class AuthStorage implements CredentialStore {
 
 	async modify(
 		provider: string,
-		fn: (current: Credential | undefined) => Promise<Credential | undefined>,
+		fn: (current: Credential | undefined) => Promise<Credential | null | undefined>,
 		options?: AuthOperationOptions,
 	): Promise<Credential | undefined> {
 		let latestData = this.readState.data;
@@ -461,6 +461,11 @@ export class AuthStorage implements CredentialStore {
 				latestData = currentData;
 				revision = this.authPath ? getFileRevision(this.authPath) : undefined;
 				return { result: currentData[provider] };
+			}
+			if (next === null) {
+				delete currentData[provider];
+				latestData = currentData;
+				return { result: undefined, next: JSON.stringify(currentData, null, 2) };
 			}
 
 			const merged: AuthStorageData = { ...currentData, [provider]: next };

@@ -41,6 +41,7 @@ import { piMessagesApi } from "./api/pi-messages.lazy.ts";
 import { getEnvApiKey } from "./env-api-keys.ts";
 import type { ModelsApiStreamOptions } from "./models.ts";
 import { builtinModels, getBuiltinModel, getBuiltinModels, getBuiltinProviders } from "./providers/all.ts";
+import { withStreamIdleGuard } from "./utils/stream-idle-guard.ts";
 
 export type { BuiltinProvider } from "./providers/all.ts";
 
@@ -255,15 +256,21 @@ export function stream<TApi extends Api>(
 	options?: ProviderStreamOptions,
 ): AssistantMessageEventStream {
 	const transcript = normalizeContext(context);
-	const builtinProvider = getBuiltinProviderForModel(model);
-	if (builtinProvider) {
-		if (model.provider.startsWith("cloudflare-") && !hasResolvedCloudflareAuth(options)) {
-			return compatModels.stream(model, transcript, options as ModelsApiStreamOptions<TApi> | undefined);
+	return withStreamIdleGuard(model, options, (guardedOptions) => {
+		const builtinProvider = getBuiltinProviderForModel(model);
+		if (builtinProvider) {
+			if (model.provider.startsWith("cloudflare-") && !hasResolvedCloudflareAuth(guardedOptions)) {
+				return compatModels.stream(model, transcript, guardedOptions as ModelsApiStreamOptions<TApi> | undefined);
+			}
+			return builtinProvider.stream(
+				model,
+				transcript,
+				withEnvApiKey(model, guardedOptions) as ApiStreamOptions<TApi>,
+			);
 		}
-		return builtinProvider.stream(model, transcript, withEnvApiKey(model, options) as ApiStreamOptions<TApi>);
-	}
-	const provider = resolveApiProvider(model.api);
-	return provider.stream(model, transcript, withEnvApiKey(model, options) as StreamOptions);
+		const provider = resolveApiProvider(model.api);
+		return provider.stream(model, transcript, withEnvApiKey(model, guardedOptions) as StreamOptions);
+	});
 }
 
 export async function complete<TApi extends Api>(
@@ -281,15 +288,17 @@ export function streamSimple<TApi extends Api>(
 	options?: SimpleStreamOptions,
 ): AssistantMessageEventStream {
 	const transcript = normalizeContext(context);
-	const builtinProvider = getBuiltinProviderForModel(model);
-	if (builtinProvider) {
-		if (model.provider.startsWith("cloudflare-") && !hasResolvedCloudflareAuth(options)) {
-			return compatModels.streamSimple(model, transcript, options);
+	return withStreamIdleGuard(model, options, (guardedOptions) => {
+		const builtinProvider = getBuiltinProviderForModel(model);
+		if (builtinProvider) {
+			if (model.provider.startsWith("cloudflare-") && !hasResolvedCloudflareAuth(guardedOptions)) {
+				return compatModels.streamSimple(model, transcript, guardedOptions);
+			}
+			return builtinProvider.streamSimple(model, transcript, withEnvApiKey(model, guardedOptions));
 		}
-		return builtinProvider.streamSimple(model, transcript, withEnvApiKey(model, options));
-	}
-	const provider = resolveApiProvider(model.api);
-	return provider.streamSimple(model, transcript, withEnvApiKey(model, options));
+		const provider = resolveApiProvider(model.api);
+		return provider.streamSimple(model, transcript, withEnvApiKey(model, guardedOptions));
+	});
 }
 
 export async function completeSimple<TApi extends Api>(

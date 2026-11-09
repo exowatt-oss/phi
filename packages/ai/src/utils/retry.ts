@@ -1,4 +1,5 @@
-import type { AssistantMessage } from "../types.ts";
+import type { AssistantMessage, RefusalDetails } from "../types.ts";
+import { isStreamIdleTimeoutError } from "./stream-idle-guard.ts";
 
 function buildProviderErrorPattern(patterns: readonly string[]): RegExp {
 	return new RegExp(patterns.join("|"), "i");
@@ -28,6 +29,34 @@ const NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN = buildProviderErrorPattern([
 	// Sign in with ChatGPT on a ChatGPT Business plan: a usage limit set by the
 	// workspace admin. Only the admin can raise it.
 	"subscription_sharing_workplace_individual_usage_limit_exceeded",
+]);
+
+/**
+ * Text signatures of a provider whose *credentials* are dead, as opposed to its
+ * endpoint being down: an OAuth refresh token that has been revoked or rotated
+ * away, or a key that no longer authenticates. Deterministic for this provider
+ * until a human re-authenticates, so — exactly like account exhaustion — the
+ * same-model retry budget cannot clear it and only another provider can answer.
+ *
+ * These arise on the auth-resolution path rather than from an HTTP response, so
+ * they carry no status code to key on. `invalid_grant` is the OAuth 2.0 error
+ * code for a refresh token the authorization server rejects; the rest are the
+ * wrappers phi puts around it (see `ModelsError` in packages/ai/src/auth).
+ *
+ * Deliberately narrow: a bare 401/403 stays out, because a single unauthorized
+ * response can also mean a transient upstream auth hiccup, and misclassifying
+ * that would rewrite a whole session's model on a blip.
+ */
+const PROVIDER_AUTH_DEAD_ERROR_PATTERN = buildProviderErrorPattern([
+	// OAuth 2.0 refresh rejection (RFC 6749 §5.2) and its human-readable forms.
+	"invalid_grant",
+	"refresh token not found or invalid",
+	"refresh token (is )?(invalid|expired|revoked)",
+
+	// phi's own auth-layer wrappers, thrown before any request is sent.
+	"oauth refresh failed",
+	"oauth auth derivation failed",
+	"oauth refresh returned a token that expires too soon",
 ]);
 
 const RETRYABLE_PROVIDER_ERROR_PATTERN = buildProviderErrorPattern([
@@ -83,6 +112,12 @@ const RETRYABLE_PROVIDER_ERROR_PATTERN = buildProviderErrorPattern([
 	"timeout",
 	"terminated",
 
+	// aiohttp reports truncated response bodies as payload/transfer-encoding errors.
+	// Match the transport-specific wording, not a bare 400 response.
+	"response payload is not completed",
+	"TransferEncodingError",
+	"not enough data to satisfy transfer length header",
+
 	// WebSocket transports can report close/error text instead of HTTP/fetch text.
 	"websocket.?closed",
 	"websocket.?error",
@@ -118,6 +153,80 @@ const RETRYABLE_PROVIDER_ERROR_PATTERN = buildProviderErrorPattern([
 	// failures can arrive mid-stream without an HTTP 503 in the message.
 	"subscription_sharing_usage_unavailable",
 	"subscription_sharing_user_unavailable",
+]);
+
+/**
+ * Text signatures of a provider that cannot serve *any* request right now, as
+ * opposed to a transient failure of this one: the upstream front door is down
+ * or unreachable (LiteLLM `APIConnectionError` wrapping an nginx-style 503
+ * page, connection refused, DNS failure). Retrying the same model re-asks a
+ * dead endpoint with backoff before giving up; only another model can answer
+ * the turn while the outage lasts.
+ *
+ * Deliberately excludes capacity throttling ("overloaded", rate limits, 429)
+ * and bare 500s — those clear on their own and belong to the same-model retry
+ * budget. A subset of {@link RETRYABLE_PROVIDER_ERROR_PATTERN} on purpose: an
+ * unavailable error is still retryable when no fallback model is configured.
+ */
+const PROVIDER_UNAVAILABLE_ERROR_PATTERN = buildProviderErrorPattern([
+	// LiteLLM/OpenAI-SDK wrapper for "could not reach the upstream at all".
+	"APIConnectionError",
+
+	// HTTP unavailability, bare status codes and gateway/nginx wording.
+	"502",
+	"503",
+	"504",
+	"service.?(temporarily.?)?unavailable",
+	"bad gateway",
+
+	// Transport-level unreachability: nothing is listening / nothing resolves.
+	"connection.?refused",
+	"ECONNREFUSED",
+	"ENOTFOUND",
+	"getaddrinfo",
+]);
+
+/**
+ * Capacity throttling that clears on its own. Checked before
+ * {@link PROVIDER_UNAVAILABLE_ERROR_PATTERN} because throttle responses can
+ * carry a 5xx status (OpenAI's "engine is currently overloaded" 503) while
+ * still being the retry budget's job rather than a reason to switch models.
+ */
+const PROVIDER_CAPACITY_ERROR_PATTERN = buildProviderErrorPattern([
+	"overloaded",
+	"rate.?limit",
+	"too many requests",
+	"429",
+]);
+
+/**
+ * Text signatures of a safety-classifier decline, for providers that do not carry
+ * {@link AssistantMessage.refusal} structurally.
+ *
+ * Deliberately narrow. This list is the *fallback* path: first-party Anthropic
+ * requests set `refusal` from `stop_details`, but the same models reached through
+ * a gateway (LiteLLM/OpenRouter speaking the OpenAI completions API, Bedrock
+ * guardrails) flatten the decline into an error string, and a proxied model is
+ * exactly the case where escalating to another model matters. Every entry here
+ * must be specific to content policy: anything vaguer would turn ordinary errors
+ * into model switches.
+ */
+const REFUSAL_ERROR_PATTERN = buildProviderErrorPattern([
+	// phi's own Anthropic refusal wording (mapStopReason), and the API's.
+	"safety classifier declined",
+	"stop_reason.{0,3}: ?.?refusal",
+
+	// Anthropic non-stream / gateway-wrapped classifier blocks.
+	"blocked under Anthropic's Usage Policy",
+	"violative",
+
+	// OpenAI-compatible content filtering (finish_reason content_filter, Azure text).
+	"content.?filter",
+	"content management policy",
+
+	// Bedrock guardrail interventions.
+	"blocked by .{0,40}guardrail",
+	"guardrail intervened",
 ]);
 
 /**
@@ -255,6 +364,23 @@ export async function retryAssistantCall(
 }
 
 /**
+ * The error text a classifier is allowed to match against: what the provider
+ * said, never phi's attribution prefix.
+ *
+ * Every pattern in this file is an unanchored substring match, several of them
+ * bare status codes, so prefixing the message with `provider/modelId` widens
+ * what they match. It is not hypothetical: the catalog ships
+ * `amazon-bedrock/us.mistral.pixtral-large-2502-v1:0`, whose id contains `502`,
+ * so classifying the prefixed text would read any error from that model —
+ * including a deterministic 400 — as a gateway outage and reroute the session
+ * off it. Custom model ids from settings.json are unbounded and can contain
+ * `429`, `timeout`, or `billing` just as easily.
+ */
+function classifiableErrorText(message: AssistantMessage): string {
+	return message.providerErrorMessage ?? message.errorMessage ?? "";
+}
+
+/**
  * Classifies whether a failed assistant message looks like a transient provider
  * or transport error, so callers can decide if the last assistant turn should be
  * restarted.
@@ -265,7 +391,76 @@ export async function retryAssistantCall(
  */
 export function isRetryableAssistantError(message: AssistantMessage): boolean {
 	if (message.stopReason !== "error" || !message.errorMessage) return false;
-	const errorMessage = message.errorMessage;
+	// Interactive authentication is required. Neither repeating the same request
+	// nor silently changing providers can repair this credential.
+	if (message.authRequired) return false;
+	// A policy decline is deterministic in the request: the same call on the same
+	// model declines again. Escalating to another model is the only way through, so
+	// refusals never enter the same-model retry budget, whatever else their text
+	// happens to match.
+	if (isRefusalAssistantError(message)) return false;
+	const errorMessage = classifiableErrorText(message);
+	if (isStreamIdleTimeoutError(errorMessage)) return true;
 	if (NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN.test(errorMessage)) return false;
+	// Dead credentials are deterministic: re-asking the same provider with the same
+	// revoked token just spends the budget before surfacing the identical failure.
+	if (PROVIDER_AUTH_DEAD_ERROR_PATTERN.test(errorMessage)) return false;
 	return RETRYABLE_PROVIDER_ERROR_PATTERN.test(errorMessage);
+}
+
+/**
+ * Classifies whether a failed assistant message means the provider cannot serve
+ * this session at all right now — the endpoint is down/unreachable, or the
+ * account's quota/billing is exhausted. Both share the property that only a
+ * different model or provider can answer the turn, which is what callers use
+ * this for: same-model retries are wasted against a dead endpoint, and are
+ * guaranteed to fail against an exhausted account.
+ *
+ * This does not implement fallback policy. Callers own the model chain, its
+ * cursor, and how a reroute is surfaced.
+ */
+export function isProviderUnavailableAssistantError(message: AssistantMessage): boolean {
+	if (message.stopReason !== "error" || !message.errorMessage) return false;
+	// Preserve the selected provider and failed turn while the user reauthenticates.
+	if (message.authRequired) return false;
+	// A decline is about the request content, not the provider's health.
+	if (isRefusalAssistantError(message)) return false;
+	const errorMessage = classifiableErrorText(message);
+	// Account-level exhaustion: deterministic for this provider until a human
+	// intervenes — the "another model is the only way through" case exactly.
+	if (NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN.test(errorMessage)) return true;
+	// Dead credentials: same shape as exhaustion — no retry and no other model on
+	// this provider can help, so the turn belongs on a different provider.
+	if (PROVIDER_AUTH_DEAD_ERROR_PATTERN.test(errorMessage)) return true;
+	// Capacity throttling clears on its own; that is the retry budget's job.
+	if (PROVIDER_CAPACITY_ERROR_PATTERN.test(errorMessage)) return false;
+	return PROVIDER_UNAVAILABLE_ERROR_PATTERN.test(errorMessage);
+}
+
+/**
+ * Classifies whether a failed assistant message was declined by a safety
+ * classifier, rather than failing for transport or capacity reasons.
+ *
+ * Structure first: {@link AssistantMessage.refusal} is set by providers that report
+ * a decline as such (Anthropic's `stop_reason: "refusal"`). Text second, for the
+ * proxied paths that lose it — see {@link REFUSAL_ERROR_PATTERN}.
+ *
+ * This does not implement escalation policy. Callers own the model chain, its
+ * cursor, and how a decline is surfaced.
+ */
+export function isRefusalAssistantError(message: AssistantMessage): boolean {
+	if (message.refusal) return true;
+	if (message.stopReason !== "error" || !message.errorMessage) return false;
+	return REFUSAL_ERROR_PATTERN.test(classifiableErrorText(message));
+}
+
+/**
+ * The refusal facts for a declined message, structural when the provider gave
+ * them and synthesized from the error text when it did not, so callers can render
+ * one shape. Returns undefined when the message is not a refusal at all.
+ */
+export function getRefusalDetails(message: AssistantMessage): RefusalDetails | undefined {
+	if (message.refusal) return message.refusal;
+	if (!isRefusalAssistantError(message)) return undefined;
+	return { category: null, ...(message.errorMessage ? { explanation: message.errorMessage } : {}) };
 }

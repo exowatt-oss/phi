@@ -398,7 +398,7 @@ if (modelAuth) {
 }
 ```
 
-Both overloads resolve credentials, refresh expired OAuth when necessary, and may return an auth-derived `apiKey`, `headers`, or `baseUrl`. `getAuth()` resolves `undefined` for unconfigured providers and rejects with `ModelsError` when something is actually broken (`"oauth"`: token refresh failed, credential preserved for re-login; `"auth"`: key resolution or credential store failure). Request paths surface the same failures as stream errors.
+Both overloads resolve credentials, refresh expired OAuth when necessary, and may return an auth-derived `apiKey`, `headers`, or `baseUrl`. `getAuth()` resolves `undefined` for unconfigured providers and rejects with `ModelsError` when something is actually broken (`"oauth"`: non-terminal token refresh failed and the credential is preserved for retry; `"auth_required"`: terminal `invalid_grant`, rejected credential atomically removed and interactive re-login required; `"auth"`: key resolution or credential store failure). Request paths surface the same failures as stream errors.
 
 `getAuth()`, `checkAuth()`, `getAvailable()`, login, and logout accept optional caller cancellation through their existing options or interaction objects and remain unbounded when no signal is supplied. Provider `login`, `ApiKeyAuth.check`, `ApiKeyAuth.resolve`, and `OAuthAuth.refresh` implementations always receive a concrete signal and must honor it for blocking work.
 
@@ -465,7 +465,7 @@ const models = createModels({ credentials: myFileBackedStore });
 // const models = builtinModels({ credentials: myFileBackedStore });
 ```
 
-The contract is small: `read(providerId)`, `list()` for non-secret `{ providerId, type }` metadata, `modify(providerId, fn)` (the only write path — a serialized read-modify-write), and `delete(providerId)`. Each operation accepts optional cancellation options. Enumeration must not resolve secrets or execute configured key commands. OAuth token refresh runs inside `modify`, so concurrent requests and processes cannot double-refresh a rotated token. A stored credential *owns* its provider: environment variables are only consulted when nothing is stored, and a failed refresh never silently falls back to an env key.
+The contract is small: `read(providerId)`, `list()` for non-secret `{ providerId, type }` metadata, `modify(providerId, fn)` (the only write path — a serialized read-modify-write where the callback returns a credential to write, `null` to remove the current entry inside the transaction, or `undefined` to leave it unchanged), and `delete(providerId)`. Each operation accepts optional cancellation options. Enumeration must not resolve secrets or execute configured key commands. OAuth token refresh runs inside `modify`, so concurrent requests and processes cannot double-refresh a rotated token. A stored credential *owns* its provider: environment variables are only consulted when nothing is stored, and a failed refresh never silently falls back to an env key.
 
 API-key credentials use the same discriminator as pi's `auth.json` and can carry provider-scoped env/config values:
 
@@ -1379,6 +1379,8 @@ Some OpenAI-compatible servers do not understand the `developer` role used for r
 
 Use model-level `thinkingLevelMap` to describe model-specific thinking controls. Keys are pi thinking levels (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`). Missing standard levels through `high` use provider defaults; `xhigh` and `max` are opt-in and require a non-null map entry. String values are sent to the provider, `null` marks a level unsupported, and maps may skip levels.
 
+The `off` entry is the exception: for `openai-completions` it is only sent when `compat.sendReasoningEffortOff` is `true`, and otherwise `reasoning_effort` is omitted. The off value is provider-specific vocabulary (`"none"`, in practice), so a gateway model group that re-maps onto an upstream which does not share it rejects the request; omitting the field leaves the upstream at its own default effort instead.
+
 ```typescript
 const ollamaReasoningModel: Model<'openai-completions'> = {
   id: 'gpt-oss:20b',
@@ -1445,6 +1447,7 @@ interface OpenAICompletionsCompat {
   supportsStore?: boolean;           // Whether provider supports the `store` field (default: true)
   supportsDeveloperRole?: boolean;   // Whether provider supports `developer` role vs `system` (default: true)
   supportsReasoningEffort?: boolean; // Whether provider supports `reasoning_effort` (default: true)
+  sendReasoningEffortOff?: boolean;  // Send `reasoning_effort: <thinkingLevelMap.off>` when thinking is off instead of omitting the field (default: false)
   supportsUsageInStreaming?: boolean; // Whether provider supports `stream_options: { include_usage: true }` (default: true)
   supportsStrictMode?: boolean;      // Whether provider supports `strict` in tool definitions (default: false; enabled in metadata for capable built-in models)
   supportsOpenAIGrammarTools?: boolean; // Whether to emit OpenAI custom Lark/regex grammar tools; false falls back to normal function tools (default: false; the generated catalog enables it for capable models)

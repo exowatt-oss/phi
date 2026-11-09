@@ -133,10 +133,11 @@ describe("AgentSession model and extension characterization", () => {
 		await harness.session.setModel(model2);
 		expect(harness.session.thinkingLevel).toBe("low");
 
-		// Switch back to faux-1 → no per-model override, uses global default
+		// Switch back to faux-1 → no per-model override, so the session's own requested
+		// level returns (phi keeps the session preference over the global default).
 		const model1 = harness.getModel("faux-1")!;
 		await harness.session.setModel(model1);
-		expect(harness.session.thinkingLevel).toBe("medium");
+		expect(harness.session.thinkingLevel).toBe("high");
 	});
 
 	it("falls back to current session thinking level when no per-model or global default is configured", async () => {
@@ -172,6 +173,118 @@ describe("AgentSession model and extension characterization", () => {
 		expect(harness.session.thinkingLevel).toBe("minimal");
 	});
 
+	it("extension setModel and setThinkingLevel change the live session without persisting defaults", async () => {
+		let extensionApi: ExtensionAPI | undefined;
+		const harness = await createHarness({
+			models: [
+				{ id: "faux-1", name: "One", reasoning: true },
+				{ id: "faux-2", name: "Two", reasoning: true },
+			],
+			settings: {
+				defaultProvider: "initial-provider",
+				defaultModel: "initial-model",
+				defaultThinkingLevel: "low",
+			},
+			extensionFactories: [
+				(pi) => {
+					extensionApi = pi;
+				},
+			],
+		});
+		harnesses.push(harness);
+		const nextModel = harness.getModel("faux-2")!;
+		expect(extensionApi).toBeDefined();
+
+		expect(await extensionApi!.setModel(nextModel)).toBe(true);
+		extensionApi!.setThinkingLevel("high");
+
+		// Live session state changed.
+		expect(harness.session.model?.id).toBe("faux-2");
+		expect(harness.session.thinkingLevel).toBe("high");
+		expect(extensionApi!.getThinkingLevel()).toBe("high");
+
+		// Session history and events recorded the change.
+		expect(
+			harness.sessionManager
+				.getEntries()
+				.filter((entry) => entry.type === "model_change")
+				.map((entry) => `${entry.provider}/${entry.modelId}`),
+		).toEqual([`${nextModel.provider}/faux-2`]);
+		expect(
+			harness.sessionManager
+				.getEntries()
+				.filter((entry) => entry.type === "thinking_level_change")
+				.map((entry) => entry.thinkingLevel),
+		).toContain("high");
+		expect(harness.eventsOfType("thinking_level_changed").map((event) => event.level)).toContain("high");
+
+		// Settings defaults for new sessions are untouched.
+		expect(harness.settingsManager.getDefaultProvider()).toBe("initial-provider");
+		expect(harness.settingsManager.getDefaultModel()).toBe("initial-model");
+		expect(harness.settingsManager.getDefaultThinkingLevel()).toBe("low");
+
+		// A later explicit, persisted model selection saves the model, but must not
+		// leak the extension-only thinking preference into the global default.
+		await harness.session.setModel(harness.getModel("faux-1")!, { persist: true });
+		expect(harness.settingsManager.getDefaultModel()).toBe("faux-1");
+		expect(harness.settingsManager.getDefaultThinkingLevel()).toBe("low");
+	});
+
+	it("extension model switches re-clamp the thinking level without persisting it", async () => {
+		let extensionApi: ExtensionAPI | undefined;
+		const harness = await createHarness({
+			models: [
+				{ id: "faux-1", name: "One", reasoning: true },
+				{ id: "faux-2", name: "Two", reasoning: true },
+				{ id: "faux-3", name: "Three", reasoning: false },
+			],
+			settings: {
+				defaultProvider: "initial-provider",
+				defaultModel: "initial-model",
+				defaultThinkingLevel: "low",
+			},
+			extensionFactories: [
+				(pi) => {
+					extensionApi = pi;
+				},
+			],
+		});
+		harnesses.push(harness);
+		// faux-1 supports every level; faux-2 tops out at "high"; faux-3 has no reasoning.
+		harness.getModel("faux-1")!.thinkingLevelMap = { xhigh: "xhigh", max: "max" };
+		expect(extensionApi).toBeDefined();
+
+		extensionApi!.setThinkingLevel("max");
+		expect(harness.session.thinkingLevel).toBe("max");
+
+		// Clamping down to a lower-capability reasoning model must not rewrite the default.
+		expect(await extensionApi!.setModel(harness.getModel("faux-2")!)).toBe(true);
+		expect(harness.session.model?.id).toBe("faux-2");
+		expect(harness.session.thinkingLevel).toBe("high");
+		expect(harness.settingsManager.getDefaultThinkingLevel()).toBe("low");
+
+		// A direct hop back to a more capable reasoning model restores the requested
+		// preference instead of treating the intermediate clamp as the preference.
+		expect(await extensionApi!.setModel(harness.getModel("faux-1")!)).toBe(true);
+		expect(harness.session.thinkingLevel).toBe("max");
+
+		// Same for a non-reasoning model, which clamps the session level to "off".
+		expect(await extensionApi!.setModel(harness.getModel("faux-2")!)).toBe(true);
+		expect(await extensionApi!.setModel(harness.getModel("faux-3")!)).toBe(true);
+		expect(harness.session.model?.id).toBe("faux-3");
+		expect(harness.session.thinkingLevel).toBe("off");
+		expect(harness.settingsManager.getDefaultThinkingLevel()).toBe("low");
+
+		// Returning to a reasoning model restores this session's requested level,
+		// not the stale persisted default or another process's preference.
+		expect(await extensionApi!.setModel(harness.getModel("faux-1")!)).toBe(true);
+		expect(harness.session.model?.id).toBe("faux-1");
+		expect(harness.session.thinkingLevel).toBe("max");
+		expect(harness.settingsManager.getDefaultThinkingLevel()).toBe("low");
+		expect(harness.settingsManager.getDefaultProvider()).toBe("initial-provider");
+		expect(harness.settingsManager.getDefaultModel()).toBe("initial-model");
+	});
+
 	it("cycles through scoped models and preserves the scoped thinking preference", async () => {
 		const harness = await createHarness({
 			models: [
@@ -197,12 +310,16 @@ describe("AgentSession model and extension characterization", () => {
 		expect(harness.session.thinkingLevel).toBe("high");
 	});
 
-	it("clamps thinking levels to model capabilities and cycles available levels", async () => {
-		const harness = await createHarness({ models: [{ id: "faux-1", reasoning: false }] });
+	it("clamps thinking levels to model capabilities while persisting the requested preference", async () => {
+		const harness = await createHarness({
+			models: [{ id: "faux-1", reasoning: false }],
+			settings: { defaultThinkingLevel: "low" },
+		});
 		harnesses.push(harness);
 
-		harness.session.setThinkingLevel("high");
+		harness.session.setThinkingLevel("high", { persist: true });
 		expect(harness.session.thinkingLevel).toBe("off");
+		expect(harness.settingsManager.getDefaultThinkingLevel()).toBe("high");
 		expect(harness.session.cycleThinkingLevel()).toBeUndefined();
 	});
 
@@ -501,6 +618,56 @@ describe("AgentSession model and extension characterization", () => {
 
 		expect(providerSystemPrompt).toContain("extra instructions");
 		expect(sawInjectedUserMessage).toBe(true);
+		expect(
+			harness.session.messages.some((message) => message.role === "custom" && message.customType === "before-start"),
+		).toBe(true);
+	});
+
+	// Regression test for https://github.com/earendil-works/pi/issues/5581
+	it("runs before_agent_start for idle custom messages that trigger a turn", async () => {
+		const prompts: string[] = [];
+		let starts = 0;
+		const noopTool: AgentTool = {
+			name: "noop",
+			label: "noop",
+			description: "noop",
+			parameters: Type.Object({}),
+			execute: async () => ({ content: [{ type: "text", text: "done" }], details: {} }),
+		};
+		const harness = await createHarness({
+			tools: [noopTool],
+			extensionFactories: [
+				(pi) => {
+					pi.on("before_agent_start", async (event) => {
+						starts += 1;
+						return {
+							message: { customType: "before-start", content: "injected", display: true },
+							systemPrompt: `${event.systemPrompt}\n\ncustom turn instructions`,
+						};
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		harness.setResponses([
+			(context) => {
+				prompts.push(getCurrentSystemPrompt(context.messages));
+				return fauxAssistantMessage([fauxToolCall("noop", {})], { stopReason: "toolUse" });
+			},
+			(context) => {
+				prompts.push(getCurrentSystemPrompt(context.messages));
+				return fauxAssistantMessage("done");
+			},
+		]);
+
+		await harness.session.sendCustomMessage(
+			{ customType: "wake", content: "wake", display: true },
+			{ triggerTurn: true },
+		);
+
+		expect(starts).toBe(1);
+		expect(prompts).toHaveLength(2);
+		expect(prompts.every((prompt) => prompt.includes("custom turn instructions"))).toBe(true);
 		expect(
 			harness.session.messages.some((message) => message.role === "custom" && message.customType === "before-start"),
 		).toBe(true);

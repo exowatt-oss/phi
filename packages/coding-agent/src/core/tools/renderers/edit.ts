@@ -9,7 +9,7 @@
 import { Box, Container, Spacer, Text } from "@earendil-works/pi-tui";
 import { renderDiff } from "../../../modes/interactive/components/diff.ts";
 import type { Theme } from "../../../modes/interactive/theme/theme.ts";
-import type { ToolDefinition } from "../../extensions/types.ts";
+import type { ToolCollapsedDisplay, ToolDefinition } from "../../extensions/types.ts";
 import type { EditToolDetails } from "../edit.ts";
 import { computeEditsDiff, type Edit, type EditDiffError, type EditDiffResult } from "../edit-diff.ts";
 import { renderToolPath, str } from "../render-utils.ts";
@@ -133,19 +133,39 @@ function buildEditCallComponent(
 	args: RenderableEditArgs | undefined,
 	theme: Theme,
 	cwd: string,
+	display: ToolCollapsedDisplay,
+	expanded: boolean,
 	outputPad: number,
 ): EditCallRenderComponent {
-	component.setBgFn(getEditHeaderBg(component.preview, component.settledError, theme));
+	const preview = component.preview;
+	component.setBgFn(getEditHeaderBg(preview, component.settledError, theme));
 	component.setPaddingX(outputPad);
 	component.clear();
-	component.addChild(new Text(formatEditCall(args, theme, cwd), 0, 0));
 
-	if (!component.preview) {
+	const previewIsError = preview !== undefined && "error" in preview;
+	if (display === "minimal" && !expanded && !component.settledError && !previewIsError) {
+		let title = formatEditCall(args, theme, cwd);
+		if (preview && !("error" in preview)) {
+			let added = 0;
+			let removed = 0;
+			for (const line of preview.diff.split("\n")) {
+				if (line.startsWith("+++") || line.startsWith("---")) continue;
+				if (line.startsWith("+")) added++;
+				else if (line.startsWith("-")) removed++;
+			}
+			title += theme.fg("muted", ` (+${added} -${removed})`);
+		}
+		component.addChild(new Text(title, 0, 0));
 		return component;
 	}
 
-	const body =
-		"error" in component.preview ? theme.fg("error", component.preview.error) : renderDiff(component.preview.diff);
+	component.addChild(new Text(formatEditCall(args, theme, cwd), 0, 0));
+
+	if (!preview) {
+		return component;
+	}
+
+	const body = "error" in preview ? theme.fg("error", preview.error) : renderDiff(preview.diff);
 	component.addChild(new Spacer(1));
 	component.addChild(new Text(body, 0, 0));
 	return component;
@@ -199,6 +219,8 @@ export const editRenderers: Pick<ToolDefinition<any, any>, "renderCall" | "rende
 			args as RenderableEditArgs | undefined,
 			theme,
 			context.cwd,
+			context.display,
+			context.expanded,
 			context.outputPad,
 		);
 	},
@@ -228,6 +250,8 @@ export const editRenderers: Pick<ToolDefinition<any, any>, "renderCall" | "rende
 					context.args as RenderableEditArgs | undefined,
 					theme,
 					context.cwd,
+					context.display,
+					context.expanded,
 					context.outputPad,
 				);
 			}

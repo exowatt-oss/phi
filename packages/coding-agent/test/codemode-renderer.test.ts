@@ -25,6 +25,7 @@ function render(
 		argsComplete: true,
 		isPartial: false,
 		expanded,
+		display: "compact",
 		showImages: false,
 		isError,
 		durationMs: undefined,
@@ -32,7 +33,7 @@ function render(
 	} satisfies ToolRenderContext;
 	const component = codemodeRenderers.renderResult?.(
 		result,
-		{ expanded, isPartial: false },
+		{ expanded, display: "compact", isPartial: false },
 		theme,
 		context,
 	) as Component;

@@ -89,6 +89,8 @@ See [Sessions and Context](sessions.md) for resuming, forking, naming, and stori
   Opens the session selector.
 - `--session <path|id>`<br>
   Opens by file path, exact ID, or partial ID. Pi searches the current project first and offers to fork a cross-project match.
+- `--session-cwd <dir>`<br>
+  With `--session`: keeps the session's ID and file but runs it in `<dir>` instead of the cwd recorded in its header. A cross-project match opens in place instead of offering a fork. phi remote uses this to resume a session whose folder is gone.
 - `--session-id <id>`<br>
   Opens the exact project session ID or creates it if absent. IDs accept letters, numbers, `.`, `_`, and `-`.
 - `--fork <path|id>`<br>

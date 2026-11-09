@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
-# Build pi binaries for all platforms locally.
-# Mirrors .github/workflows/build-binaries.yml
+# Build phi binaries for all platforms locally.
+# Mirrors .github/workflows/release-binaries.yml
 #
 # Usage:
 #   ./scripts/build-binaries.sh [--skip-install] [--skip-build] [--offline-model-data] [--platform <platform>] [--out <dir>]
@@ -15,16 +15,21 @@
 #
 # Output:
 #   packages/coding-agent/binaries/
-#     pi-darwin-arm64.tar.gz
-#     pi-darwin-x64.tar.gz
-#     pi-linux-x64.tar.gz
-#     pi-linux-arm64.tar.gz
-#     pi-windows-x64.zip
-#     pi-windows-arm64.zip
+#     phi-darwin-arm64.tar.gz
+#     phi-darwin-x64.tar.gz
+#     phi-linux-x64.tar.gz
+#     phi-linux-arm64.tar.gz
+#     phi-windows-x64.zip
+#     phi-windows-arm64.zip
 
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
+
+# The CLI ships as "phi". COMPAT_BIN_NAME is symlinked next to it
+# inside the unix tarballs so existing "pi ..." muscle memory and wrappers work.
+BIN_NAME="phi"
+COMPAT_BIN_NAME="pi"
 
 SKIP_INSTALL=false
 SKIP_BUILD=false
@@ -130,9 +135,9 @@ for platform in "${PLATFORMS[@]}"; do
     # standalone binary before pi starts (see #7684). Disable cwd .env autoload so
     # project env files do not leak into pi's environment (see #10473).
     if [[ "$platform" == windows-* ]]; then
-        bun build --compile --no-compile-autoload-bunfig --no-compile-autoload-dotenv --target="$bun_target" ./dist/bun/cli.js ./src/utils/image-resize-worker.ts ./src/extensions/codemode/worker.ts --outfile "$OUTPUT_DIR/$platform/pi.exe"
+        bun build --compile --no-compile-autoload-bunfig --no-compile-autoload-dotenv --target="$bun_target" ./dist/bun/cli.js ./src/utils/image-resize-worker.ts ./src/extensions/codemode/worker.ts --outfile "$OUTPUT_DIR/$platform/$BIN_NAME.exe"
     else
-        bun build --compile --no-compile-autoload-bunfig --no-compile-autoload-dotenv --target="$bun_target" ./dist/bun/cli.js ./src/utils/image-resize-worker.ts ./src/extensions/codemode/worker.ts --outfile "$OUTPUT_DIR/$platform/pi"
+        bun build --compile --no-compile-autoload-bunfig --no-compile-autoload-dotenv --target="$bun_target" ./dist/bun/cli.js ./src/utils/image-resize-worker.ts ./src/extensions/codemode/worker.ts --outfile "$OUTPUT_DIR/$platform/$BIN_NAME"
     fi
 done
 
@@ -165,12 +170,13 @@ cd "$OUTPUT_DIR"
 for platform in "${PLATFORMS[@]}"; do
     if [[ "$platform" == windows-* ]]; then
         # Windows (zip)
-        echo "Creating pi-$platform.zip..."
-        (cd "$platform" && zip -r ../pi-$platform.zip .)
+        echo "Creating $BIN_NAME-$platform.zip..."
+        (cd "$platform" && zip -r ../$BIN_NAME-$platform.zip .)
     else
         # Unix platforms (tar.gz) - use wrapper directory for mise compatibility
-        echo "Creating pi-$platform.tar.gz..."
-        mv "$platform" pi && tar -czf pi-$platform.tar.gz pi && mv pi "$platform"
+        echo "Creating $BIN_NAME-$platform.tar.gz..."
+        ln -sf "$BIN_NAME" "$platform/$COMPAT_BIN_NAME"
+        mv "$platform" "$BIN_NAME" && tar -czf $BIN_NAME-$platform.tar.gz "$BIN_NAME" && mv "$BIN_NAME" "$platform"
     fi
 done
 
@@ -179,9 +185,9 @@ echo "==> Extracting archives for testing..."
 for platform in "${PLATFORMS[@]}"; do
     rm -rf "$platform"
     if [[ "$platform" == windows-* ]]; then
-        mkdir -p "$platform" && (cd "$platform" && unzip -q ../pi-$platform.zip)
+        mkdir -p "$platform" && (cd "$platform" && unzip -q ../$BIN_NAME-$platform.zip)
     else
-        tar -xzf pi-$platform.tar.gz && mv pi "$platform"
+        tar -xzf $BIN_NAME-$platform.tar.gz && mv "$BIN_NAME" "$platform"
     fi
 done
 
@@ -193,8 +199,8 @@ echo ""
 echo "Extracted directories for testing:"
 for platform in "${PLATFORMS[@]}"; do
     if [[ "$platform" == windows-* ]]; then
-        echo "  $OUTPUT_DIR/$platform/pi.exe"
+        echo "  $OUTPUT_DIR/$platform/$BIN_NAME.exe"
     else
-        echo "  $OUTPUT_DIR/$platform/pi"
+        echo "  $OUTPUT_DIR/$platform/$BIN_NAME"
     fi
 done

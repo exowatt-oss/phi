@@ -4,6 +4,8 @@ interface ProviderRetryOptions {
 	maxRetries?: number;
 	maxRetryDelayMs?: number;
 	signal?: AbortSignal;
+	/** Optional predicate for retry loops that also wrap stream processing. */
+	shouldRetry?: (error: unknown) => boolean;
 	/** HTTP statuses that fail at once although the default policy would retry them. */
 	noRetryStatuses?: readonly number[];
 }
@@ -22,7 +24,8 @@ function isProviderError(error: unknown): error is ProviderError {
 }
 
 /** Mirrors the pinned OpenAI/Anthropic SDK retry policy; review when either SDK is upgraded. */
-function isRetryableProviderError(error: ProviderError): boolean {
+export function isRetryableProviderError(error: unknown): error is ProviderError {
+	if (!isProviderError(error)) return false;
 	const shouldRetry = error.headers?.get("x-should-retry");
 	if (shouldRetry === "true") return true;
 	if (shouldRetry === "false") return false;
@@ -34,6 +37,12 @@ function isRetryableProviderError(error: ProviderError): boolean {
 		error.status === 429 ||
 		(typeof error.status === "number" && error.status >= 500)
 	);
+}
+
+/** Restrict a stream-recovery retry to an actual transient HTTP 5xx. */
+export function isRetryableServerError(error: unknown): error is ProviderError {
+	if (!isRetryableProviderError(error)) return false;
+	return typeof error.status === "number" && error.status >= 500 && error.status <= 599;
 }
 
 function validateServerRetryDelayMs(
@@ -104,6 +113,19 @@ function abortableSleep(ms: number, signal?: AbortSignal): Promise<void> {
  * `maxRetryDelayMs` fail immediately (60 seconds by default); set it to zero to
  * disable the limit.
  */
+export async function retryProviderRequestOnce<T>(
+	error: unknown,
+	request: () => Promise<T>,
+	options: ProviderRetryOptions = {},
+): Promise<T> {
+	if (options.signal?.aborted) throw createAbortError();
+	const retryable = options.shouldRetry ? options.shouldRetry(error) : isRetryableProviderError(error);
+	if (!retryable || !isProviderError(error)) throw error;
+	if (error.status !== undefined && options.noRetryStatuses?.includes(error.status)) throw error;
+	await abortableSleep(getRetryDelayMs(error, 0, options.maxRetryDelayMs), options.signal);
+	return request();
+}
+
 export async function retryProviderRequest<T>(
 	request: () => Promise<T>,
 	options: ProviderRetryOptions = {},
@@ -117,7 +139,8 @@ export async function retryProviderRequest<T>(
 			return await request();
 		} catch (error) {
 			if (options.signal?.aborted) throw createAbortError();
-			if (retriesRemaining <= 0 || !isProviderError(error) || !isRetryableProviderError(error)) throw error;
+			const retryable = options.shouldRetry ? options.shouldRetry(error) : isRetryableProviderError(error);
+			if (retriesRemaining <= 0 || !retryable || !isProviderError(error)) throw error;
 			if (error.status !== undefined && options.noRetryStatuses?.includes(error.status)) throw error;
 
 			const retryIndex = maxRetries - retriesRemaining;

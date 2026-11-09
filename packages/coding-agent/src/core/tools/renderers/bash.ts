@@ -10,17 +10,34 @@ import { Container, Spacer, Text } from "@earendil-works/pi-tui";
 import { keyHint } from "../../../modes/interactive/components/keybinding-hints.ts";
 import { VisualLinePreview } from "../../../modes/interactive/components/visual-truncate.ts";
 import { theme } from "../../../modes/interactive/theme/theme.ts";
-import type { ToolDefinition, ToolRenderResultOptions } from "../../extensions/types.ts";
+import type { ToolCollapsedDisplay, ToolDefinition, ToolRenderResultOptions } from "../../extensions/types.ts";
 import type { BashToolDetails } from "../bash.ts";
-import { getTextOutput, invalidArgText, startToolTimer, str, toolTimerText } from "../render-utils.ts";
+import {
+	formatToolDuration,
+	getTextOutput,
+	invalidArgText,
+	startToolTimer,
+	str,
+	toolTimerText,
+} from "../render-utils.ts";
 import { DEFAULT_MAX_BYTES, formatSize } from "../truncate.ts";
 
 const BASH_PREVIEW_LINES = 5;
 export const BASH_UPDATE_THROTTLE_MS = 100;
-function formatShellCall(args: { command?: string; timeout?: number } | undefined, prompt: string): string {
+function formatShellCall(
+	args: { command?: string; timeout?: number } | undefined,
+	prompt: string,
+	options: { display: ToolCollapsedDisplay; expanded: boolean },
+): string {
 	const command = str(args?.command);
 	const timeout = args?.timeout as number | undefined;
 	const timeoutSuffix = timeout ? theme.fg("muted", ` (timeout ${timeout}s)`) : "";
+	if (options.display === "minimal" && !options.expanded && command) {
+		const lines = command.split("\n");
+		const extraLines = lines.length - 1;
+		const extraSuffix = extraLines > 0 ? theme.fg("muted", ` (+${extraLines} lines)`) : "";
+		return theme.fg("toolTitle", theme.bold(`${prompt} ${lines[0]}`)) + extraSuffix + timeoutSuffix;
+	}
 	const commandDisplay = command === null ? invalidArgText(theme) : command ? command : theme.fg("toolOutput", "...");
 	return theme.fg("toolTitle", theme.bold(`${prompt} ${commandDisplay}`)) + timeoutSuffix;
 }
@@ -31,8 +48,10 @@ function rebuildBashResultRenderComponent(
 		details?: BashToolDetails;
 	},
 	options: ToolRenderResultOptions,
+	isError: boolean,
 	showImages: boolean,
 	timerText: string | undefined,
+	durationMs: number | undefined,
 ): void {
 	component.clear();
 
@@ -44,6 +63,18 @@ function rebuildBashResultRenderComponent(
 		if (footerStart !== -1 && output.slice(footerStart).includes(fullOutputPath)) {
 			output = output.slice(0, footerStart).trimEnd();
 		}
+	}
+
+	if (options.display === "minimal" && !options.expanded && !options.isPartial && !isError) {
+		const summary = output ? `${output.split("\n").length} lines` : "no output";
+		const duration = durationMs !== undefined ? ` · ${formatToolDuration(durationMs)}` : "";
+		const truncatedSuffix = truncation?.truncated ? " · truncated" : "";
+		const line = theme.fg("muted", `⎿ ${summary}${duration}${truncatedSuffix}`);
+		const hint = output
+			? theme.fg("muted", " (") + keyHint("app.tools.expand", "to expand") + theme.fg("muted", ")")
+			: "";
+		component.addChild(new Text(line + hint, 0, 0));
+		return;
 	}
 
 	if (output) {
@@ -59,7 +90,7 @@ function rebuildBashResultRenderComponent(
 			component.addChild(
 				new VisualLinePreview({
 					text: styledOutput,
-					maxVisualLines: BASH_PREVIEW_LINES,
+					maxVisualLines: options.collapsedLines ?? BASH_PREVIEW_LINES,
 					keep: "end",
 					formatHint: (hidden) =>
 						theme.fg("muted", `... (${hidden} earlier lines,`) +
@@ -95,13 +126,31 @@ export function createShellRenderers(prompt: string): Pick<ToolDefinition<any, a
 		renderCall(args, _theme, context) {
 			startToolTimer(context);
 			const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
-			text.setText(formatShellCall(args as { command?: string; timeout?: number } | undefined, prompt));
+			text.setText(
+				formatShellCall(args as { command?: string; timeout?: number } | undefined, prompt, {
+					display: context.display,
+					expanded: context.expanded,
+				}),
+			);
 			return text;
 		},
 		renderResult(result, options, _theme, context) {
 			const timerText = toolTimerText(context, options.isPartial);
 			const component = (context.lastComponent as Container | undefined) ?? new Container();
-			rebuildBashResultRenderComponent(component, result as any, options, context.showImages, timerText);
+			// phi's minimal summary shows the bare duration; same source order as the timer line.
+			const state = context.state;
+			const durationMs =
+				context.durationMs ??
+				(state.startedAt !== undefined ? (state.endedAt ?? Date.now()) - state.startedAt : undefined);
+			rebuildBashResultRenderComponent(
+				component,
+				result as any,
+				options,
+				context.isError,
+				context.showImages,
+				timerText,
+				durationMs,
+			);
 			component.invalidate();
 			return component;
 		},

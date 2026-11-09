@@ -1,4 +1,5 @@
 import type { Usage } from "@earendil-works/pi-ai/compat";
+import { isAutoRouted } from "./routing.ts";
 import type { SessionEntry } from "./session-manager.ts";
 
 export interface UsageTotals {
@@ -65,8 +66,11 @@ export function getUsageCostBreakdown(entries: SessionEntry[]): UsageCostBreakdo
 		let key: string | undefined;
 		let usage: Usage | undefined;
 		if (entry.type === "message" && entry.message.role === "assistant") {
-			key = `${entry.message.provider}/${entry.message.responseModel ?? entry.message.model}`;
-			usage = entry.message.usage;
+			const message = entry.message;
+			key = isAutoRouted(message)
+				? `${message.provider}/${message.model} → ${message.routing.servedModel}`
+				: `${message.provider}/${message.responseModel ?? message.model}`;
+			usage = message.usage;
 		} else if (entry.type === "usage") {
 			key = `${entry.provider}/${entry.model}`;
 			usage = entry.usage;

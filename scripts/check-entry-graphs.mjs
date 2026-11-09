@@ -38,7 +38,9 @@ const BUDGETS = {
 		"./models": {
 			// Request telemetry reaches pi-ai's telemetry.ts and pi-telemetry's root (index, noop, metrics, memory).
 			// Request identity reaches utils/identity.ts and its version constant.
-			maxFiles: 20,
+			// phi: the stream idle guard (utils/stream-idle-guard.ts) wraps every stream, and the OAuth
+			// refresh singleflight raises auth/errors.ts from auth/resolve.ts.
+			maxFiles: 22,
 			forbid: ["providers/", "models.generated.ts", "index.ts", "utils/validation.ts", "utils/typebox-helpers.ts"],
 			allow: ["packages/telemetry/src/index.ts"],
 		},
@@ -65,7 +67,9 @@ const BUDGETS = {
 			// replicatedState) reach its host runtime through the root barrel. Chord's context reaches pi-telemetry's root
 			// (index, noop, metrics, memory) for its NOOP telemetry default; harness/telemetry.ts is Durable's schema.
 			// The Harness's request identity reaches pi-ai's utils/identity.ts and its version constant.
-			maxFiles: 73,
+			// phi: utils/retry.ts classifies stream idle timeouts, which reaches utils/stream-idle-guard.ts and
+			// its utils/event-stream.ts dependency.
+			maxFiles: 75,
 			forbid: [
 				"packages/ai/src/index.ts",
 				"packages/ai/src/utils/typebox-helpers.ts",

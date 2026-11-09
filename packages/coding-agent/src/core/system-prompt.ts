@@ -3,7 +3,7 @@
  */
 
 import { getSystemMessageText } from "@earendil-works/pi-ai";
-import { getDocsPath, getExamplesPath, getReadmePath } from "../config.ts";
+import { APP_NAME, getDocsPath, getExamplesPath, getReadmePath } from "../config.ts";
 import { formatSkillsForPrompt, type Skill } from "./skills.ts";
 
 export interface BuildSystemPromptOptions {
@@ -34,6 +34,35 @@ export interface BuildSystemPromptOptions {
 	contextFiles?: Array<{ path: string; content: string }>;
 	/** Pre-loaded skills. */
 	skills?: Skill[];
+	/** Current date/time and the selected model, thinking level and speed, rendered as the `runtime` section after `cwd`. */
+	runtime?: SystemPromptRuntime;
+}
+
+export interface SystemPromptRuntime {
+	now: Date;
+	/** `provider/id` of the selected model. */
+	model?: string;
+	thinkingLevel?: string;
+	speed?: string;
+}
+
+/** Body of the `runtime` section: current date/time and, when known, the model, thinking level and speed. */
+function formatRuntime(runtime: SystemPromptRuntime | undefined): string {
+	if (!runtime) return "";
+	const date = runtime.now.toLocaleString("en-US", {
+		weekday: "long",
+		year: "numeric",
+		month: "long",
+		day: "numeric",
+		hour: "numeric",
+		minute: "2-digit",
+		timeZoneName: "short",
+	});
+	let text = `Current date and time: ${date}`;
+	if (runtime.model) {
+		text += `\nCurrent model: ${runtime.model} (thinking: ${runtime.thinkingLevel ?? "off"}, speed: ${runtime.speed ?? "standard"})`;
+	}
+	return text;
 }
 
 export type NormalizedBuildSystemPromptOptions = BuildSystemPromptOptions & {
@@ -73,6 +102,7 @@ export function normalizeBuildSystemPromptOptions(input: BuildSystemPromptOption
 		cwd: input.cwd,
 		contextFiles: (input.contextFiles ?? []).map((file) => ({ ...file })),
 		skills: (input.skills ?? []).map((skill) => ({ ...skill })),
+		runtime: input.runtime ? { ...input.runtime } : undefined,
 	};
 }
 
@@ -139,6 +169,7 @@ export function buildSystemPromptSections(input: BuildSystemPromptOptions): Syst
 		cwd,
 		contextFiles,
 		skills,
+		runtime,
 	} = options;
 
 	for (const name of Object.keys(customSections)) {
@@ -152,21 +183,20 @@ export function buildSystemPromptSections(input: BuildSystemPromptOptions): Syst
 	if (customPrompt) {
 		promptSections.preamble = customPrompt;
 	} else {
-		promptSections.preamble =
-			"You are an expert coding assistant operating inside pi, a coding agent harness. You help users by reading files, executing commands, editing code, and writing new files.";
+		promptSections.preamble = `You are an expert coding assistant operating inside ${APP_NAME}, a coding agent harness. You help users by reading files, executing commands, editing code, and writing new files.`;
 		const visibleTools = declaredTools.filter((name) => !!toolSnippets[name]);
 		const tools =
 			visibleTools.length > 0 ? visibleTools.map((name) => `- ${name}: ${toolSnippets[name]}`).join("\n") : "(none)";
 		promptSections.tools = `${tools}\n\nIn addition to the tools above, you may have access to other custom tools depending on the project.`;
 		promptSections.rules = buildRules(declaredTools, toolGuidelines, promptGuidelines);
-		promptSections.docs = `Pi documentation (read only when the user asks about pi itself, its SDK, extensions, themes, skills, or TUI):
+		promptSections.docs = `${APP_NAME} documentation (read only when the user asks about ${APP_NAME} itself, its SDK, extensions, themes, skills, or TUI):
 - Main documentation: ${getReadmePath()}
 - Additional docs: ${getDocsPath()}
 - Examples: ${getExamplesPath()} (extensions, custom tools, SDK)
-- When reading pi docs or examples, resolve docs/... under Additional docs and examples/... under Examples, not the current working directory
-- When asked about: extensions (docs/extensions.md, examples/extensions/), themes (docs/themes.md), skills (docs/skills.md), prompt templates (docs/prompt-templates.md), TUI components (docs/tui.md), keybindings (docs/keybindings.md), SDK integrations (docs/sdk.md), custom providers (docs/custom-provider.md), adding models (docs/models.md), pi packages (docs/packages.md), environment variables (docs/environment-variables.md), MCP servers (docs/mcp.md), codemode scripts and non-LLM models such as classifiers and image models (docs/codemode.md)
-- When working on pi topics, read the docs and examples, and follow .md cross-references before implementing
-- Always read pi .md files completely and follow links to related docs (e.g., tui.md for TUI API details)`;
+- When reading ${APP_NAME} docs or examples, resolve docs/... under Additional docs and examples/... under Examples, not the current working directory
+- When asked about: extensions (docs/extensions.md, examples/extensions/), themes (docs/themes.md), skills (docs/skills.md), prompt templates (docs/prompt-templates.md), TUI components (docs/tui.md), keybindings (docs/keybindings.md), SDK integrations (docs/sdk.md), custom providers (docs/custom-provider.md), adding models (docs/models.md), ${APP_NAME} packages (docs/packages.md), environment variables (docs/environment-variables.md), MCP servers (docs/mcp.md), codemode scripts and non-LLM models such as classifiers and image models (docs/codemode.md)
+- When working on ${APP_NAME} topics, read the docs and examples, and follow .md cross-references before implementing
+- Always read ${APP_NAME} .md files completely and follow links to related docs (e.g., tui.md for TUI API details)`;
 	}
 
 	if (appendSystemPrompt) promptSections.addendum = appendSystemPrompt;
@@ -181,6 +211,9 @@ export function buildSystemPromptSections(input: BuildSystemPromptOptions): Syst
 		if (skillsPrompt) promptSections.skills = skillsPrompt;
 	}
 	promptSections.cwd = cwd.replace(/\\/g, "/");
+	// phi: date/time and model state in their own section, so a change patches only this tag.
+	const runtimeText = formatRuntime(runtime);
+	if (runtimeText) promptSections.runtime = runtimeText;
 	for (const [name, content] of Object.entries(customSections)) {
 		if (content) promptSections[name] = content;
 	}

@@ -6,7 +6,15 @@
 // parsed-body edge case, and the formatProviderError compose helper.
 
 import { describe, expect, it } from "vitest";
-import { formatProviderError, MAX_PROVIDER_ERROR_BODY_CHARS, normalizeProviderError } from "../src/utils/error-body.ts";
+import {
+	attributeProviderError,
+	extractOpenAICompatibleGatewayError,
+	extractResponseModelFromError,
+	formatActionableGatewayError,
+	formatProviderError,
+	MAX_PROVIDER_ERROR_BODY_CHARS,
+	normalizeProviderError,
+} from "../src/utils/error-body.ts";
 
 describe("normalizeProviderError", () => {
 	it("extracts status and body from a Mistral-shaped error", () => {
@@ -182,6 +190,77 @@ describe("normalizeProviderError", () => {
 	});
 });
 
+describe("OpenAI-compatible gateway errors", () => {
+	it.each([502, " 502 "])("uses an OpenAI error code when the SDK has no HTTP status", (code) => {
+		const error = Object.assign(new Error("upstream failed"), {
+			code,
+			headers: new Headers({ "x-litellm-call-id": "call-1" }),
+		});
+
+		expect(normalizeProviderError(error).status).toBe(502);
+		expect(extractOpenAICompatibleGatewayError(error)).toMatchObject({ status: 502, callId: "call-1" });
+	});
+
+	it("does not treat non-HTTP numeric strings as statuses", () => {
+		const error = Object.assign(new Error("upstream failed"), { code: " 399 " });
+		expect(normalizeProviderError(error).status).toBeUndefined();
+	});
+
+	it("extracts LiteLLM routing and attempt headers without inventing fallback counts", () => {
+		const error = Object.assign(new Error("upstream failed"), {
+			status: undefined,
+			headers: new Headers({
+				"x-litellm-call-id": "call-2",
+				"x-request-id": "request-2",
+				"x-litellm-model-id": "deployment-2",
+				"x-litellm-model-name": "bedrock/anthropic.claude-sonnet",
+				"x-litellm-model-region": "us",
+				"x-litellm-attempted-retries": "2",
+				"x-litellm-max-retries": "3",
+			}),
+		});
+
+		expect(extractOpenAICompatibleGatewayError(error)).toEqual({
+			callId: "call-2",
+			requestId: "request-2",
+			upstreamDeployment: "deployment-2",
+			upstreamModel: "bedrock/anthropic.claude-sonnet",
+			allowedRegion: "us",
+			attemptedRetries: 2,
+			maxRetries: 3,
+		});
+	});
+
+	it("formats a one-line actionable headline from available metadata", () => {
+		const headline = formatActionableGatewayError(
+			{
+				status: 503,
+				callId: "call-3",
+				upstreamDeployment: "deployment-3",
+				upstreamModel: "bedrock/anthropic.claude-sonnet",
+				allowedRegion: "eu",
+				attemptedRetries: 2,
+				maxRetries: 2,
+			},
+			{ provider: "gateway", id: "example-large" },
+		);
+
+		expect(headline).toContain("gateway/example-large");
+		expect(headline).toContain("upstream status 503");
+		expect(headline).toContain("deployment deployment-3");
+		expect(headline).toContain("model bedrock/anthropic.claude-sonnet");
+		expect(headline).toContain("allowed region eu");
+		expect(headline).toContain("initial route");
+		expect(headline).not.toContain(" at deployment");
+		expect(headline).toContain("retry attempts 2/2");
+		expect(headline).toContain("retry the request or choose another model");
+		expect(headline).toContain("call ID call-3");
+		expect(headline).not.toContain("gateway dashboard");
+		expect(headline).not.toContain("fallback");
+		expect(headline).not.toContain("\n");
+	});
+});
+
 describe("formatProviderError", () => {
 	it("surfaces status and body without a prefix", () => {
 		const norm = normalizeProviderError(
@@ -222,5 +301,55 @@ describe("formatProviderError", () => {
 		const norm = normalizeProviderError({ reason: "boom" });
 
 		expect(formatProviderError(norm)).toBe('{"reason":"boom"}');
+	});
+});
+
+describe("attributeProviderError", () => {
+	const model = { provider: "gateway", id: "example-small" };
+	const body = '400: {"error":{"type":"invalid_request_error","message":"Invalid effort level"}}';
+
+	it("names the requested model and keeps the provider body intact", () => {
+		expect(attributeProviderError(body, model)).toBe(`gateway/example-small: ${body}`);
+	});
+
+	it("names the serving model too when the gateway re-routed the request", () => {
+		// The failure that motivated this: the body named `claude-fable-5`, the
+		// session had selected `gateway/example-small`, and the message read as though a
+		// model the user never picked had rejected the turn.
+		expect(attributeProviderError(body, model, "claude-fable-5")).toBe(
+			`gateway/example-small (gateway served claude-fable-5): ${body}`,
+		);
+	});
+
+	it("ignores a serving model equal to the requested one", () => {
+		expect(attributeProviderError(body, model, "example-small")).toBe(`gateway/example-small: ${body}`);
+	});
+
+	it("does not stack prefixes when a message is attributed twice", () => {
+		const once = attributeProviderError(body, model);
+		expect(attributeProviderError(once, model)).toBe(once);
+		const withServed = attributeProviderError(body, model, "claude-fable-5");
+		expect(attributeProviderError(withServed, model, "claude-fable-5")).toBe(withServed);
+	});
+});
+
+describe("extractResponseModelFromError", () => {
+	it("reads the serving model out of an OpenAI-shaped error envelope", () => {
+		const error = Object.assign(new Error("400 Invalid effort level"), {
+			error: { type: "invalid_request_error", message: "Invalid effort level", model: "claude-fable-5" },
+		});
+
+		expect(extractResponseModelFromError(error, "example-small")).toBe("claude-fable-5");
+	});
+
+	it("reads a top-level model field", () => {
+		expect(extractResponseModelFromError({ model: "claude-fable-5" }, "example-small")).toBe("claude-fable-5");
+	});
+
+	it("returns undefined for a body that names nothing, the same model, or a non-string", () => {
+		expect(extractResponseModelFromError(new Error("boom"), "example-small")).toBeUndefined();
+		expect(extractResponseModelFromError({ model: "example-small" }, "example-small")).toBeUndefined();
+		expect(extractResponseModelFromError({ model: 42 }, "example-small")).toBeUndefined();
+		expect(extractResponseModelFromError(undefined, "example-small")).toBeUndefined();
 	});
 });

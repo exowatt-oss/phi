@@ -1,6 +1,7 @@
 {
 	"name": "@earendil-works/pi-agent-core",
-	"version": "1.4.0",
+	"version": "1.4.0-exo.15",
+	"private": true,
 	"description": "General-purpose agent with transport abstraction, state management, and attachment support",
 	"type": "module",
 	"main": "./dist/index.js",
@@ -19,11 +20,11 @@
 	"scripts": {
 		"clean": "shx rm -rf dist",
 		"build": "tsc -p tsconfig.build.json",
-		"test": "vitest --run",
+		"test": "vitest --run --maxWorkers=4",
 		"prepublishOnly": "npm run build"
 	},
 	"dependencies": {
-		"@earendil-works/pi-ai": "1.4.0",
+		"@earendil-works/pi-ai": "1.4.0-exo.15",
 		"typebox": "1.3.27"
 	},
 	"keywords": [
@@ -37,9 +38,11 @@
 	"license": "MIT",
 	"repository": {
 		"type": "git",
-		"url": "git+https://github.com/earendil-works/pi.git",
+		"url": "https://github.com/exowatt-oss/phi",
 		"directory": "packages/agent"
 	},
+	"bugs": { "url": "https://github.com/exowatt-oss/phi/issues" },
+	"homepage": "https://github.com/exowatt-oss/phi",
 	"engines": {
 		"node": ">=22.19.0"
 	},

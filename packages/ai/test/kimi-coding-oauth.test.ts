@@ -258,13 +258,21 @@ describe("Kimi Code OAuth", () => {
 		// invalid_grant is not retried.
 		vi.stubGlobal(
 			"fetch",
-			vi.fn(async (): Promise<Response> => jsonResponse({ error: "invalid_grant" }, 400)),
+			vi.fn(
+				async (): Promise<Response> =>
+					jsonResponse({ error: "invalid_grant", error_description: "sentinel-kimi-token-detail" }, 400),
+			),
 		);
-		await expect(
-			kimiCodingOAuth.refresh(
+		let thrown: unknown;
+		try {
+			await kimiCodingOAuth.refresh(
 				{ type: "oauth", access: "old", refresh: "old", expires: 0 },
 				new AbortController().signal,
-			),
-		).rejects.toThrow("unauthorized");
+			);
+		} catch (error) {
+			thrown = error;
+		}
+		expect(thrown).toMatchObject({ oauthErrorCode: "invalid_grant", status: 400 });
+		expect((thrown as Error).message).not.toContain("sentinel-kimi-token-detail");
 	});
 });

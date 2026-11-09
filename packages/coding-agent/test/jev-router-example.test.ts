@@ -45,11 +45,11 @@ describe("jev-router example", () => {
 		for (const harness of harnesses.splice(0)) harness.cleanup();
 	});
 
-	/** Runs the example against a faux OpenAI Codex provider and a scripted Jev complexity rating. */
+	/** Runs the example against a faux provider and a scripted Jev complexity rating. */
 	async function setup(complex: number, tools: AgentTool[]) {
-		const codex = fauxProvider({
-			provider: "openai-codex",
-			models: ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"].map((id) => ({ id, reasoning: true })),
+		const exampleProvider = fauxProvider({
+			provider: "example",
+			models: ["large", "small", "medium"].map((id) => ({ id, reasoning: true })),
 		});
 		const typesafe = createProvider({
 			id: "typesafe",
@@ -79,7 +79,7 @@ describe("jev-router example", () => {
 			tools,
 			extensionFactories: [
 				(pi) => {
-					pi.registerProvider(codex.provider);
+					pi.registerProvider(exampleProvider.provider);
 					pi.registerProvider(typesafe);
 				},
 				jevRouter,
@@ -91,9 +91,8 @@ describe("jev-router example", () => {
 		await runtime.refresh({ allowNetwork: false });
 		await harness.session.setModel(runtime.getModel("jev", "auto")!);
 
-		const respond = (...messages: AssistantMessage[]) => codex.appendResponses(messages);
-		const dispatched = () =>
-			harness.session.messages.flatMap((m) => (m.role === "assistant" ? [m.model.replace("gpt-5.6-", "")] : []));
+		const respond = (...messages: AssistantMessage[]) => exampleProvider.appendResponses(messages);
+		const dispatched = () => harness.session.messages.flatMap((m) => (m.role === "assistant" ? [m.model] : []));
 		const phases = () =>
 			harness.sessionManager
 				.getBranch()
@@ -107,7 +106,7 @@ describe("jev-router example", () => {
 
 	const call = (tool: string) => fauxAssistantMessage(fauxToolCall(tool, { path: "a.ts" }), { stopReason: "toolUse" });
 
-	it("lets Sol make the first edit and switches to Luna for the rest", async () => {
+	it("lets the large model make the first edit and switches to medium for the rest", async () => {
 		const { harness, dispatched, respond, phases } = await setup(0.8, [createTool("read"), createTool("edit")]);
 
 		respond(call("read"), call("edit"), fauxAssistantMessage("done"));
@@ -115,13 +114,13 @@ describe("jev-router example", () => {
 		respond(fauxAssistantMessage("added"));
 		await harness.session.prompt("Also add tests.");
 
-		// Sol reads and makes the first edit; the tool-result follow-up of the same turn goes to Luna.
-		expect(dispatched()).toEqual(["sol", "sol", "luna", "luna"]);
+		// The large model reads and edits; the same-turn follow-up goes to medium.
+		expect(dispatched()).toEqual(["large", "large", "medium", "medium"]);
 		expect(phases()).toEqual(["planning", "implementation"]);
 		expect(harness.session.model).toMatchObject({ provider: "jev", id: "auto" });
 	});
 
-	it("plans on Terra and ignores failed edits", async () => {
+	it("plans on the small model and ignores failed edits", async () => {
 		const { harness, dispatched, respond, phases } = await setup(0.2, [
 			createTool("edit", true),
 			createTool("write"),
@@ -130,7 +129,7 @@ describe("jev-router example", () => {
 		respond(call("edit"), call("write"), fauxAssistantMessage("done"));
 		await harness.session.prompt("Add a verbose flag.");
 
-		expect(dispatched()).toEqual(["terra", "terra", "luna"]);
+		expect(dispatched()).toEqual(["small", "small", "medium"]);
 		expect(phases()).toEqual(["planning", "implementation"]);
 	});
 });

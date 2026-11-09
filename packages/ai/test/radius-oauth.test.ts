@@ -116,6 +116,28 @@ describe("Radius OAuth", () => {
 		expect(fetchMock).toHaveBeenCalledOnce();
 	});
 
+	it("returns structured invalid_grant without retaining the refresh response", async () => {
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async () =>
+				jsonResponse({ error: "invalid_grant", error_description: "sentinel-radius-token-detail" }, 400),
+			),
+		);
+		const oauth = createRadiusOAuth({ name: "Radius", gateway: GATEWAY });
+
+		let thrown: unknown;
+		try {
+			await oauth.refresh(
+				{ type: "oauth", access: "old", refresh: "old-refresh", expires: 0 },
+				new AbortController().signal,
+			);
+		} catch (error) {
+			thrown = error;
+		}
+		expect(thrown).toMatchObject({ oauthErrorCode: "invalid_grant", status: 400 });
+		expect((thrown as Error).message).not.toContain("sentinel-radius-token-detail");
+	});
+
 	it("discovers only the interactive browser authorization endpoint", async () => {
 		const fetchMock = vi.fn(async (input: unknown) => {
 			expect(requestUrl(input)).toBe(`${GATEWAY}/v1/oauth`);

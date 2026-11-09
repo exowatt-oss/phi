@@ -20,6 +20,7 @@ import type {
 	AssistantMessage,
 	ImageContent,
 	Model,
+	ServiceTier,
 	StopReason,
 	StreamOptions,
 	SystemMessage,
@@ -108,18 +109,19 @@ function convertToolResultOutput<TApi extends Api>(
 	return output;
 }
 
+export type OpenAIResponsesServiceTier = ResponseCreateParamsStreaming["service_tier"] | ServiceTier;
+
 export interface OpenAIResponsesStreamOptions {
 	onProviderStreamEvent?: StreamOptions["onProviderStreamEvent"];
-	serviceTier?: ResponseCreateParamsStreaming["service_tier"];
+	serviceTier?: OpenAIResponsesServiceTier;
 	grammarToolInputProperties?: ReadonlyMap<string, string>;
 	resolveServiceTier?: (
-		responseServiceTier: ResponseCreateParamsStreaming["service_tier"] | undefined,
-		requestServiceTier: ResponseCreateParamsStreaming["service_tier"] | undefined,
-	) => ResponseCreateParamsStreaming["service_tier"] | undefined;
-	applyServiceTierPricing?: (
-		usage: Usage,
-		serviceTier: ResponseCreateParamsStreaming["service_tier"] | undefined,
-	) => void;
+		responseServiceTier: OpenAIResponsesServiceTier | undefined,
+		requestServiceTier: OpenAIResponsesServiceTier | undefined,
+	) => OpenAIResponsesServiceTier | undefined;
+	applyServiceTierPricing?: (usage: Usage, serviceTier: OpenAIResponsesServiceTier | undefined) => void;
+	/** HTTP response headers to preserve for errors emitted inside an SSE stream. */
+	responseHeaders?: Headers;
 }
 
 export interface ConvertResponsesMessagesOptions {
@@ -508,6 +510,97 @@ type ResponsesOutputSlot =
 
 type ToolCallOutputSlot = Extract<ResponsesOutputSlot, { type: "toolCall" }>;
 
+type ResponsesStreamError = Error & {
+	code?: unknown;
+	status?: number;
+	headers?: Headers;
+	cause?: unknown;
+	retryable?: boolean;
+	retryableWithoutResponseId?: boolean;
+	gatewayOriginated?: boolean;
+};
+
+const RETRYABLE_RESPONSE_ERROR_CODES = new Set(["server_error", "internal_error", "api_error"]);
+const RETRYABLE_TRANSPORT_ERROR_CODES = new Set([
+	"ECONNABORTED",
+	"ECONNREFUSED",
+	"ECONNRESET",
+	"EHOSTUNREACH",
+	"EPIPE",
+	"ETIMEDOUT",
+	"EAI_AGAIN",
+	"ENETDOWN",
+	"ENETUNREACH",
+	"EHOSTDOWN",
+	"ENOTFOUND",
+	"UND_ERR_BODY_TIMEOUT",
+	"UND_ERR_CONNECT_TIMEOUT",
+	"UND_ERR_HEADERS_TIMEOUT",
+	"UND_ERR_SOCKET",
+]);
+
+function parseHttpStatusCode(value: unknown): number | undefined {
+	const text =
+		typeof value === "number"
+			? Number.isInteger(value)
+				? String(value)
+				: undefined
+			: typeof value === "string"
+				? value.trim()
+				: undefined;
+	if (text === undefined || !/^\d{3}$/.test(text)) return undefined;
+	const status = Number(text);
+	return status >= 400 && status <= 599 ? status : undefined;
+}
+
+function isRetryableResponseErrorCode(code: unknown): boolean {
+	if (typeof code === "string" && RETRYABLE_RESPONSE_ERROR_CODES.has(code.trim().toLowerCase())) return true;
+	const status = parseHttpStatusCode(code);
+	return status !== undefined && status >= 500;
+}
+
+function createResponsesStreamError(message: string, code: unknown, headers?: Headers): ResponsesStreamError {
+	const error = new Error(message) as ResponsesStreamError;
+	error.code = code;
+	error.status = parseHttpStatusCode(code);
+	error.headers = headers;
+	error.gatewayOriginated = true;
+	if (isRetryableResponseErrorCode(code)) error.retryable = true;
+	return error;
+}
+
+function markRetryableStreamError(error: unknown, headers?: Headers): unknown {
+	if (!(error instanceof Error)) return error;
+	const streamError = error as ResponsesStreamError;
+	streamError.retryable = true;
+	streamError.gatewayOriginated = true;
+	if (!("status" in streamError)) streamError.status = undefined;
+	if (!(streamError.headers instanceof Headers)) streamError.headers = headers;
+	return error;
+}
+
+function isConfidentlyRetryableTransportError(error: unknown): boolean {
+	if (!(error instanceof Error)) return false;
+	const streamError = error as ResponsesStreamError;
+	if (typeof streamError.status === "number" && streamError.status >= 500 && streamError.status <= 599) return true;
+	if (isRetryableResponseErrorCode(streamError.code)) return true;
+	if (streamError.name === "APIConnectionError" || streamError.name === "APIConnectionTimeoutError") return true;
+
+	const seen = new Set<object>();
+	let current: unknown = streamError;
+	while (typeof current === "object" && current !== null && !seen.has(current)) {
+		seen.add(current);
+		const code = (current as { code?: unknown }).code;
+		if (typeof code === "string" && RETRYABLE_TRANSPORT_ERROR_CODES.has(code)) return true;
+		current = (current as { cause?: unknown }).cause;
+	}
+	return false;
+}
+
+export function isRetryableResponsesStreamError(error: unknown): boolean {
+	return error instanceof Error && (error as ResponsesStreamError).retryable === true;
+}
+
 export async function processResponsesStream<TApi extends Api>(
 	openaiStream: AsyncIterable<ResponseStreamEvent>,
 	output: AssistantMessage,
@@ -658,6 +751,10 @@ export async function processResponsesStream<TApi extends Api>(
 				? options.resolveServiceTier(response?.service_tier, options.serviceTier)
 				: (response?.service_tier ?? options.serviceTier);
 			options.applyServiceTierPricing(output.usage, serviceTier);
+			const servedFast = serviceTier === "fast" || serviceTier === "priority" || serviceTier === "ultrafast";
+			if (options.serviceTier === "fast" || options.serviceTier === "ultrafast" || servedFast) {
+				output.speed = servedFast ? "fast" : "standard";
+			}
 		}
 		// Map status to stop reason. For incomplete responses, retain the provider's
 		// specific reason so max-output truncation and content filtering stay distinct.
@@ -674,169 +771,215 @@ export async function processResponsesStream<TApi extends Api>(
 		}
 	};
 
-	for await (const event of openaiStream) {
-		await options?.onProviderStreamEvent?.(event, model);
-		if (event.type === "response.created") {
-			output.responseId = event.response.id;
-		} else if (event.type === "response.output_item.added") {
-			createSlot(event.output_index, event.item);
-		} else if (event.type === "response.reasoning_summary_text.delta") {
-			const slot = getSlot(event.output_index, "thinking");
-			if (!slot) continue;
-			slot.block.thinking += event.delta;
-			stream.push({
-				type: "thinking_delta",
-				contentIndex: slot.contentIndex,
-				delta: event.delta,
-				partial: output,
-			});
-		} else if (event.type === "response.reasoning_summary_part.done") {
-			const slot = getSlot(event.output_index, "thinking");
-			if (!slot) continue;
-			slot.block.thinking += "\n\n";
-			stream.push({
-				type: "thinking_delta",
-				contentIndex: slot.contentIndex,
-				delta: "\n\n",
-				partial: output,
-			});
-		} else if (event.type === "response.reasoning_text.delta") {
-			const slot = getSlot(event.output_index, "thinking");
-			if (!slot) continue;
-			slot.block.thinking += event.delta;
-			stream.push({
-				type: "thinking_delta",
-				contentIndex: slot.contentIndex,
-				delta: event.delta,
-				partial: output,
-			});
-		} else if (event.type === "response.output_text.delta") {
-			const slot = getSlot(event.output_index, "text");
-			if (!slot) continue;
-			slot.block.text += event.delta;
-			stream.push({
-				type: "text_delta",
-				contentIndex: slot.contentIndex,
-				delta: event.delta,
-				partial: output,
-			});
-		} else if (event.type === "response.refusal.delta") {
-			const slot = getSlot(event.output_index, "text");
-			if (!slot) continue;
-			slot.block.text += event.delta;
-			stream.push({
-				type: "text_delta",
-				contentIndex: slot.contentIndex,
-				delta: event.delta,
-				partial: output,
-			});
-		} else if (event.type === "response.function_call_arguments.delta") {
-			const slot = getSlot(event.output_index, "toolCall");
-			if (!slot || slot.block.partialJson === undefined) continue;
-			slot.block.partialJson += event.delta;
-			slot.block.arguments = parseStreamingJson(slot.block.partialJson);
-			pushToolCallDelta(slot, event.delta);
-		} else if (event.type === "response.function_call_arguments.done") {
-			const slot = getSlot(event.output_index, "toolCall");
-			if (!slot || slot.block.partialJson === undefined) continue;
-			const previousPartialJson = slot.block.partialJson;
-			slot.block.partialJson = event.arguments;
-			slot.block.arguments = parseStreamingJson(slot.block.partialJson);
-
-			if (event.arguments.startsWith(previousPartialJson)) {
-				const delta = event.arguments.slice(previousPartialJson.length);
-				if (delta.length > 0) pushToolCallDelta(slot, delta);
+	const iterator = openaiStream[Symbol.asyncIterator]();
+	let iteratorCompleted = false;
+	try {
+		for (;;) {
+			let iteration: IteratorResult<ResponseStreamEvent>;
+			try {
+				iteration = await iterator.next();
+			} catch (error) {
+				if (isConfidentlyRetryableTransportError(error)) {
+					const streamError = markRetryableStreamError(error, options?.responseHeaders);
+					if (streamError instanceof Error && output.responseId === undefined) {
+						(streamError as ResponsesStreamError).retryableWithoutResponseId = true;
+					}
+					throw streamError;
+				}
+				throw error;
 			}
-		} else if (event.type === "response.custom_tool_call_input.delta") {
-			const slot = getSlot(event.output_index, "toolCall");
-			if (!slot || !slot.block.customInput) continue;
-			pushToolCallDelta(
-				slot,
-				appendCustomToolCallInput(slot.block, getCustomToolCallInput(slot.block) + event.delta, false),
-			);
-		} else if (event.type === "response.custom_tool_call_input.done") {
-			const slot = getSlot(event.output_index, "toolCall");
-			if (!slot || !slot.block.customInput) continue;
-			pushToolCallDelta(slot, appendCustomToolCallInput(slot.block, event.input, true));
-		} else if (event.type === "response.output_item.done") {
-			const item = event.item;
-			applyMessagePhaseStopReason(item);
-			const slot = getOrCreateSlot(event.output_index, item);
+			if (iteration.done) {
+				iteratorCompleted = true;
+				break;
+			}
+			const event = iteration.value;
+			await options?.onProviderStreamEvent?.(event, model);
+			if (event.type === "response.created") {
+				output.responseId = event.response.id;
+			} else if (event.type === "response.output_item.added") {
+				createSlot(event.output_index, event.item);
+			} else if (event.type === "response.reasoning_summary_text.delta") {
+				const slot = getSlot(event.output_index, "thinking");
+				if (!slot) continue;
+				slot.block.thinking += event.delta;
+				stream.push({
+					type: "thinking_delta",
+					contentIndex: slot.contentIndex,
+					delta: event.delta,
+					partial: output,
+				});
+			} else if (event.type === "response.reasoning_summary_part.done") {
+				const slot = getSlot(event.output_index, "thinking");
+				if (!slot) continue;
+				slot.block.thinking += "\n\n";
+				stream.push({
+					type: "thinking_delta",
+					contentIndex: slot.contentIndex,
+					delta: "\n\n",
+					partial: output,
+				});
+			} else if (event.type === "response.reasoning_text.delta") {
+				const slot = getSlot(event.output_index, "thinking");
+				if (!slot) continue;
+				slot.block.thinking += event.delta;
+				stream.push({
+					type: "thinking_delta",
+					contentIndex: slot.contentIndex,
+					delta: event.delta,
+					partial: output,
+				});
+			} else if (event.type === "response.output_text.delta") {
+				const slot = getSlot(event.output_index, "text");
+				if (!slot) continue;
+				slot.block.text += event.delta;
+				stream.push({
+					type: "text_delta",
+					contentIndex: slot.contentIndex,
+					delta: event.delta,
+					partial: output,
+				});
+			} else if (event.type === "response.refusal.delta") {
+				const slot = getSlot(event.output_index, "text");
+				if (!slot) continue;
+				slot.block.text += event.delta;
+				stream.push({
+					type: "text_delta",
+					contentIndex: slot.contentIndex,
+					delta: event.delta,
+					partial: output,
+				});
+			} else if (event.type === "response.function_call_arguments.delta") {
+				const slot = getSlot(event.output_index, "toolCall");
+				if (!slot || slot.block.partialJson === undefined) continue;
+				slot.block.partialJson += event.delta;
+				slot.block.arguments = parseStreamingJson(slot.block.partialJson);
+				pushToolCallDelta(slot, event.delta);
+			} else if (event.type === "response.function_call_arguments.done") {
+				const slot = getSlot(event.output_index, "toolCall");
+				if (!slot || slot.block.partialJson === undefined) continue;
+				const previousPartialJson = slot.block.partialJson;
+				slot.block.partialJson = event.arguments;
+				slot.block.arguments = parseStreamingJson(slot.block.partialJson);
 
-			if (item.type === "reasoning" && slot?.type === "thinking") {
-				const summaryText = item.summary?.map((s) => s.text).join("\n\n") || "";
-				const contentText = item.content?.map((c) => c.text).join("\n\n") || "";
-				slot.block.thinking = summaryText || contentText || slot.block.thinking;
-				slot.block.thinkingSignature = JSON.stringify(item);
-				reasoningBlocksById.set(item.id, slot.block);
-				stream.push({
-					type: "thinking_end",
-					contentIndex: slot.contentIndex,
-					content: slot.block.thinking,
-					partial: output,
-				});
-				outputSlots.delete(event.output_index);
-			} else if (item.type === "message" && slot?.type === "text") {
-				slot.block.text = item.content?.map((c) => (c.type === "output_text" ? c.text : c.refusal)).join("") || "";
-				slot.block.textSignature = encodeTextSignatureV1(item.id, item.phase ?? undefined);
-				stream.push({
-					type: "text_end",
-					contentIndex: slot.contentIndex,
-					content: slot.block.text,
-					partial: output,
-				});
-				outputSlots.delete(event.output_index);
-			} else if (
-				item.type === "function_call" &&
-				slot?.type === "toolCall" &&
-				slot.block.partialJson !== undefined
-			) {
-				Object.assign(slot.block, parseToolCallArguments(item.arguments || slot.block.partialJson));
-				if (item.namespace !== undefined) slot.block.namespace = item.namespace;
-				// Finalize in-place and strip the scratch buffer so replay only
-				// carries parsed arguments.
-				delete slot.block.partialJson;
-				stream.push({
-					type: "toolcall_end",
-					contentIndex: slot.contentIndex,
-					toolCall: slot.block,
-					partial: output,
-				});
-				outputSlots.delete(event.output_index);
-			} else if (item.type === "custom_tool_call" && slot?.type === "toolCall" && slot.block.customInput) {
+				if (event.arguments.startsWith(previousPartialJson)) {
+					const delta = event.arguments.slice(previousPartialJson.length);
+					if (delta.length > 0) pushToolCallDelta(slot, delta);
+				}
+			} else if (event.type === "response.custom_tool_call_input.delta") {
+				const slot = getSlot(event.output_index, "toolCall");
+				if (!slot || !slot.block.customInput) continue;
 				pushToolCallDelta(
 					slot,
-					appendCustomToolCallInput(slot.block, item.input ?? getCustomToolCallInput(slot.block), true),
+					appendCustomToolCallInput(slot.block, getCustomToolCallInput(slot.block) + event.delta, false),
 				);
-				if (item.namespace !== undefined) slot.block.namespace = item.namespace;
-				delete slot.block.customInput;
-				stream.push({
-					type: "toolcall_end",
-					contentIndex: slot.contentIndex,
-					toolCall: slot.block,
-					partial: output,
-				});
-				outputSlots.delete(event.output_index);
+			} else if (event.type === "response.custom_tool_call_input.done") {
+				const slot = getSlot(event.output_index, "toolCall");
+				if (!slot || !slot.block.customInput) continue;
+				pushToolCallDelta(slot, appendCustomToolCallInput(slot.block, event.input, true));
+			} else if (event.type === "response.output_item.done") {
+				const item = event.item;
+				applyMessagePhaseStopReason(item);
+				const slot = getOrCreateSlot(event.output_index, item);
+
+				if (item.type === "reasoning" && slot?.type === "thinking") {
+					const summaryText = item.summary?.map((s) => s.text).join("\n\n") || "";
+					const contentText = item.content?.map((c) => c.text).join("\n\n") || "";
+					slot.block.thinking = summaryText || contentText || slot.block.thinking;
+					slot.block.thinkingSignature = JSON.stringify(item);
+					reasoningBlocksById.set(item.id, slot.block);
+					stream.push({
+						type: "thinking_end",
+						contentIndex: slot.contentIndex,
+						content: slot.block.thinking,
+						partial: output,
+					});
+					outputSlots.delete(event.output_index);
+				} else if (item.type === "message" && slot?.type === "text") {
+					slot.block.text =
+						item.content?.map((c) => (c.type === "output_text" ? c.text : c.refusal)).join("") || "";
+					slot.block.textSignature = encodeTextSignatureV1(item.id, item.phase ?? undefined);
+					stream.push({
+						type: "text_end",
+						contentIndex: slot.contentIndex,
+						content: slot.block.text,
+						partial: output,
+					});
+					outputSlots.delete(event.output_index);
+				} else if (
+					item.type === "function_call" &&
+					slot?.type === "toolCall" &&
+					slot.block.partialJson !== undefined
+				) {
+					Object.assign(slot.block, parseToolCallArguments(item.arguments || slot.block.partialJson));
+					if (item.namespace !== undefined) slot.block.namespace = item.namespace;
+					// Finalize in-place and strip the scratch buffer so replay only
+					// carries parsed arguments.
+					delete slot.block.partialJson;
+					stream.push({
+						type: "toolcall_end",
+						contentIndex: slot.contentIndex,
+						toolCall: slot.block,
+						partial: output,
+					});
+					outputSlots.delete(event.output_index);
+				} else if (item.type === "custom_tool_call" && slot?.type === "toolCall" && slot.block.customInput) {
+					pushToolCallDelta(
+						slot,
+						appendCustomToolCallInput(slot.block, item.input ?? getCustomToolCallInput(slot.block), true),
+					);
+					if (item.namespace !== undefined) slot.block.namespace = item.namespace;
+					delete slot.block.customInput;
+					stream.push({
+						type: "toolcall_end",
+						contentIndex: slot.contentIndex,
+						toolCall: slot.block,
+						partial: output,
+					});
+					outputSlots.delete(event.output_index);
+				}
+			} else if (event.type === "response.completed" || event.type === "response.incomplete") {
+				finalizeResponse(event.response);
+				break;
+			} else if (event.type === "error") {
+				throw createResponsesStreamError(
+					`Error Code ${event.code}: ${event.message}` || "Unknown error",
+					event.code,
+					options?.responseHeaders,
+				);
+			} else if (event.type === "response.failed") {
+				sawTerminalResponseEvent = true;
+				if (event.response?.id) output.responseId = event.response.id;
+				output.rawStopReason = event.response?.status;
+				const error = event.response?.error;
+				const details = event.response?.incomplete_details;
+				const msg = error
+					? `${error.code || "unknown"}: ${error.message || "no message"}`
+					: details?.reason
+						? `incomplete: ${details.reason}`
+						: "Unknown error (no error details in response)";
+				throw createResponsesStreamError(msg, error?.code, options?.responseHeaders);
 			}
-		} else if (event.type === "response.completed" || event.type === "response.incomplete") {
-			finalizeResponse(event.response);
-		} else if (event.type === "error") {
-			throw new Error(`Error Code ${event.code}: ${event.message}` || "Unknown error");
-		} else if (event.type === "response.failed") {
-			sawTerminalResponseEvent = true;
-			output.rawStopReason = event.response?.status;
-			const error = event.response?.error;
-			const details = event.response?.incomplete_details;
-			const msg = error
-				? `${error.code || "unknown"}: ${error.message || "no message"}`
-				: details?.reason
-					? `incomplete: ${details.reason}`
-					: "Unknown error (no error details in response)";
-			throw new Error(msg);
 		}
-	}
-	if (!sawTerminalResponseEvent) {
-		throw new Error("OpenAI Responses stream ended before a terminal response event");
+		if (!sawTerminalResponseEvent) {
+			const error = createResponsesStreamError(
+				"OpenAI Responses stream ended before a terminal response event",
+				undefined,
+				options?.responseHeaders,
+			);
+			if (output.content.length === 0) {
+				error.retryable = true;
+				error.retryableWithoutResponseId = true;
+			}
+			throw error;
+		}
+	} finally {
+		if (!iteratorCompleted && typeof iterator.return === "function") {
+			try {
+				await iterator.return();
+			} catch {
+				// Preserve the stream error that caused the retry decision.
+			}
+		}
 	}
 	// The agent runs every tool call in the final message. Refuse to hand over calls whose
 	// output_item.done never arrived: their arguments may be cut off or mixed up, e.g. when a

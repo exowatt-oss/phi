@@ -114,6 +114,15 @@
                   "cost": {
                     "$ref": "#/$defs/ModelCost"
                   },
+                  "compaction": {
+                    "type": "object",
+                    "properties": {
+                      "softCeilingTokens": {
+                        "description": "Caps the context window this model's compaction thresholds use, in tokens; overrides the compaction.softCeilingTokens setting. A non-negative integer; 0 uses the raw window. Invalid values are ignored."
+                      }
+                    },
+                    "description": "Per-model compaction settings."
+                  },
                   "promptCache": {
                     "$ref": "#/$defs/ModelPromptCache",
                     "description": "Best-effort prompt cache lifetime in seconds for the short and long retention tiers. Pi warms only tiers with a known lifetime."
@@ -212,6 +221,10 @@
                       "minLength": 1,
                       "description": "Display name, also matched by --model patterns."
                     },
+                    "api": {
+                      "type": "string",
+                      "minLength": 1
+                    },
                     "reasoning": {
                       "type": "boolean",
                       "description": "Whether the model supports thinking."
@@ -297,6 +310,15 @@
                       "type": "number",
                       "exclusiveMinimum": 0,
                       "description": "Context window in tokens."
+                    },
+                    "compaction": {
+                      "type": "object",
+                      "properties": {
+                        "softCeilingTokens": {
+                          "description": "Caps the context window this model's compaction thresholds use, in tokens; overrides the compaction.softCeilingTokens setting. A non-negative integer; 0 uses the raw window. Invalid values are ignored."
+                        }
+                      },
+                      "description": "Per-model compaction settings."
                     },
                     "maxTokens": {
                       "type": "number",
@@ -520,6 +542,11 @@
         "supportsReasoningEffort": {
           "type": "boolean",
           "description": "Whether the provider supports reasoning_effort. Default: auto-detected from URL."
+        },
+        "sendReasoningEffortOff": {
+          "type": "boolean",
+          "description": "Whether to send reasoning_effort with the thinkingLevelMap \"off\" value when thinking is off, instead of omitting the field. Set it only for a model whose own endpoint needs an explicit off value; a gateway that re-maps onto an upstream with a different vocabulary rejects it.",
+          "default": false
         },
         "supportsUsageInStreaming": {
           "type": "boolean",
@@ -1036,6 +1063,23 @@
           "description": "Whether the model accepts prompt_cache_options. Older OpenAI models reject the parameter.",
           "default": false
         },
+        "supportsExplicitPromptCacheBreakpoints": {
+          "type": "boolean",
+          "description": "Whether the model accepts OpenAI GPT-5.6+ explicit prompt cache breakpoints on input content. Default: follows supportsExplicitPromptCacheMode."
+        },
+        "fastServiceTier": {
+          "type": "string",
+          "description": "Wire service_tier sent when the session asks for the fast tier, and read back as fast. Default: \"ultrafast\" for GPT-6 Astra on Amazon Bedrock /openai/v1 endpoints; otherwise unset, so fast goes out as \"fast\"."
+        },
+        "fastServiceTierCostMultiplier": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "description": "Multiplier applied to every cost rate when a response is served at fastServiceTier. Default: 6 for Bedrock GPT-6 Astra UltraFast; 2 otherwise."
+        },
+        "sortToolSchemaKeys": {
+          "type": "boolean",
+          "description": "Recursively sort the keys of tool JSON schemas before sending, so Amazon Bedrock renders the same prompt prefix before and after the first tool call. Default: true for Amazon Bedrock /openai/v1 endpoints, false otherwise."
+        },
         "supportsMidConvoEffort": {
           "type": "boolean",
           "description": "Whether thinking level changes are sent inside the conversation instead of changing the request's effort, so a change keeps the prompt cache. Used by the anthropic-messages and openai-responses APIs.",
@@ -1107,6 +1151,15 @@
           },
           "maxItems": 3,
           "description": "Models Anthropic accepts for server-side refusal fallback, with local pricing metadata for returned fallback responses. When absent or empty, callers must omit fallbacks; Anthropic rejects the field for models with no permitted fallback targets."
+        },
+        "supportsFastMode": {
+          "type": "boolean",
+          "description": "Whether the model accepts Anthropic fast mode (speed: \"fast\" with the fast-mode-2026-02-01 beta). When false, a fast service tier is ignored for this model. Default: true for first-party Claude Opus 5.5, Opus 5, and Opus 4.8; false otherwise."
+        },
+        "fastModeCostMultiplier": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "description": "Multiplier applied to every cost rate when a response reports usage.speed \"fast\". Default: 2."
         },
         "imageInput": {
           "anyOf": [

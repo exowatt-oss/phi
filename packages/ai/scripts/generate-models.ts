@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "fs";
 import { dirname, join, resolve } from "path";
 import { fileURLToPath } from "url";
 import { getEffortThinkingLevelMap, type ModelsDevReasoningOption } from "./models-dev-reasoning-options.ts";
@@ -648,6 +648,17 @@ function isAnthropicAdaptiveThinkingModel(modelId: string): boolean {
 	);
 }
 
+/**
+ * Claude Fable 5 proper, excluding the 5.1 refresh, across every id spelling the
+ * catalog carries: bare (`claude-fable-5`), gateway-prefixed
+ * (`anthropic/claude-fable-5`, `us.anthropic.claude-fable-5`) and suffixed
+ * (`anthropic/claude-fable-5:batch`). The negative lookahead is what keeps
+ * `claude-fable-5-1` / `claude-fable-5.1` out.
+ */
+function isAnthropicLowEffortOnlyModel(modelId: string): boolean {
+	return /claude-fable-5(?![.\-]?\d)/.test(modelId.toLowerCase());
+}
+
 function isAnthropicTemperatureUnsupportedModel(modelId: string): boolean {
 	const id = modelId.toLowerCase();
 	return (
@@ -828,6 +839,25 @@ function applyOpenAICompletionsCompatMetadata(model: Model<Api>): void {
 	if (Object.keys(model.compat).length === 0) {
 		delete model.compat;
 	}
+}
+
+/**
+ * Opt a model into sending `reasoning_effort: <thinkingLevelMap.off>` when
+ * thinking is off.
+ *
+ * The openai-completions provider omits the field by default, because an "off"
+ * value is provider-specific vocabulary and a gateway model group that re-maps
+ * onto an upstream which does not share it answers 400. But a model whose
+ * catalog entry spells its own off value out is exactly the case where the
+ * value is right and the endpoint reading it is the one it was written for —
+ * and for some of them (groq's qwen3.6-27b, whose every other level is null)
+ * that value is the only thinking control they have. Omitting it there would
+ * silently remove the control rather than harden anything.
+ */
+function applySendReasoningEffortOffMetadata(model: Model<Api>): void {
+	if (model.api !== "openai-completions") return;
+	if (typeof model.thinkingLevelMap?.off !== "string") return;
+	mergeOpenAICompletionsCompat(model, { sendReasoningEffortOff: true });
 }
 
 function applyAnthropicMessagesCompatMetadata(model: Model<Api>): void {
@@ -1137,6 +1167,30 @@ function applyThinkingLevelMetadata(model: Model<any>): void {
 	}
 	if (model.id.includes("fable-5")) {
 		mergeThinkingLevelMap(model, { off: null, xhigh: "xhigh", max: "max" });
+	}
+	if (isAnthropicLowEffortOnlyModel(model.id)) {
+		// Claude Fable 5 (the original, NOT the 5.1 refresh) accepts exactly one
+		// adaptive effort value. Verified 2026-09-12 against api.anthropic.com with a
+		// one-token prompt per level: `output_config.effort: "low"` and adaptive
+		// thinking with no `output_config` at all both answer 200, while "medium",
+		// "high", "xhigh" and "max" all answer `400 invalid_request_error: Invalid
+		// effort level`. (`claude-fable-5-1` and `claude-opus-5` accept all five, so
+		// this is the model, not the account or the beta headers.)
+		//
+		// So the entry above is wrong for it twice over: it claims xhigh/max, and by
+		// leaving medium/high absent it declares them "passes through unchanged".
+		// Both reach the wire as effort values the model rejects — which is what a
+		// turn rerouted onto Fable 5 at medium/high hit. medium and up now clamp down
+		// to "low" instead of 400ing.
+		mergeThinkingLevelMap(model, {
+			off: null,
+			minimal: "low",
+			low: "low",
+			medium: null,
+			high: null,
+			xhigh: null,
+			max: null,
+		});
 	}
 	if (model.api === "anthropic-messages" && isAnthropicAdaptiveThinkingModel(model.id)) {
 		mergeAnthropicMessagesCompat(model, { forceAdaptiveThinking: true });
@@ -1718,6 +1772,8 @@ function processFireworksModels(provider: ModelsDevProvider | undefined): Model<
 			maxTokens: model.limit?.output || 4096,
 		};
 
+		// Every Fireworks GLM model and router (glm-5p2, glm-5p3, glm-5p3-flash, glm-*-latest) uses the
+		// OpenAI-compatible API (phi: GLM 5.3 fell back to the Anthropic endpoint after 5.2 left the catalog).
 		if (modelId.includes("glm-")) {
 			models.push({
 				...common,
@@ -3381,6 +3437,9 @@ async function generateModels() {
 		applyAnthropicMessagesCompatMetadata(model);
 		applyModelsDevReasoningOptionMetadata(model);
 		applyThinkingLevelMetadata(model);
+		// After applyThinkingLevelMetadata: the thinking level map it merges is the
+		// input this reads.
+		applySendReasoningEffortOffMetadata(model);
 		applyStrictToolCompatMetadata(model);
 		applyOpenAIGrammarToolCompatMetadata(model);
 		applyOpenAIToolSearchMetadata(model);
@@ -3571,13 +3630,18 @@ async function generateModels() {
 			}
 
 			const hadPreviousData = existsSync(dataDir);
-			if (hadPreviousData) renameSync(dataDir, previousDataDir);
+			// Copy, not rename: the committed data dir sits in a lower overlayfs layer in
+			// container builds, and renaming such a directory fails with EXDEV.
+			if (hadPreviousData) {
+				cpSync(dataDir, previousDataDir, { recursive: true });
+				rmSync(dataDir, { recursive: true, force: true });
+			}
 			try {
 				renameSync(stagedDataDir, dataDir);
 				validateGeneratedModelData(packageRoot);
 			} catch (error) {
 				rmSync(dataDir, { recursive: true, force: true });
-				if (hadPreviousData && existsSync(previousDataDir)) renameSync(previousDataDir, dataDir);
+				if (hadPreviousData && existsSync(previousDataDir)) cpSync(previousDataDir, dataDir, { recursive: true });
 				throw error;
 			}
 			restoreGeneratedCatalog = undefined;

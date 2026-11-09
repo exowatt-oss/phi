@@ -1,9 +1,8 @@
 import { setKeybindings, type TUI } from "@earendil-works/pi-tui";
 import { beforeAll, beforeEach, describe, expect, test, vi } from "vitest";
 import { KeybindingsManager } from "../src/core/keybindings.ts";
-import { McpManagerView } from "../src/extensions/mcp/ui.ts";
 import { LoginDialogComponent } from "../src/modes/interactive/components/login-dialog.ts";
-import { initTheme, theme } from "../src/modes/interactive/theme/theme.ts";
+import { initTheme } from "../src/modes/interactive/theme/theme.ts";
 import { stripAnsi } from "../src/utils/ansi.ts";
 
 const { copyToClipboard } = vi.hoisted(() => ({ copyToClipboard: vi.fn(async (_text: string) => {}) }));
@@ -46,15 +45,5 @@ describe("sign-in URL copy key", () => {
 		dialog.showDeviceCode({ userCode: "ABCD", verificationUri: "https://example.invalid/device" });
 		dialog.handleInput(CTRL_X);
 		expect(copyToClipboard).not.toHaveBeenCalled();
-	});
-
-	test("MCP sign-in screen copies the authorization URL", async () => {
-		const view = new McpManagerView(tui, theme, new KeybindingsManager());
-		void view.redirectUrl("Sign in to issues", URL, new AbortController().signal);
-		expect(rendered(view)).toContain("ctrl+x to copy");
-
-		view.handleInput(CTRL_X);
-		await vi.waitFor(() => expect(rendered(view)).toContain("Copied URL to clipboard"));
-		expect(copyToClipboard).toHaveBeenCalledWith(URL);
 	});
 });

@@ -219,7 +219,7 @@ describe("state cells", () => {
 		assert.ok(taskAborted);
 	});
 
-	it("re-entrant writes publish in adoption order; derivations never go stale (Sol #3)", async () => {
+	it("re-entrant writes publish in adoption order; derivations never go stale (review #3)", async () => {
 		const host = createHost({ self: { kind: "host" }, onError: () => {} });
 		const Echo = local("t.reentrant", {
 			version: 1,
