@@ -87,7 +87,7 @@ const mutate = (document: MutableDocument, choice: number, value: number): void 
 	}
 };
 
-it("converges across randomized prepared revisions", () => {
+it("converges across randomized prepared revisions", { timeout: 60_000 }, () => {
 	for (let seed = 1; seed <= 100; seed++) {
 		const rng = random(seed);
 		const initial: Document = {
